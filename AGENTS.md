@@ -19,22 +19,12 @@ npm run fix      # every fixer, in the one order that works; run before check
 - **Never add a check outside `npm run check`.** `.github/workflows/ci.yml` says so in its first
   comment: a gate people run and a gate CI runs must not disagree, or "green" means two things.
   Steps are the `GATE` array in `tools/gate.mjs`, fixers are `FIX`. Adding one means editing that
-  array. The one deliberate exception is `.github/workflows/commitlint.yml`, which checks a commit
-  range rather than the tree; that file's own header says why it cannot be a step.
-- **What the workflow this replaced had, and does not have now**, listed so nobody re-adds it. A
-  **matrix** of cargo commands is the `GATE` array, and its `fail-fast: false` is the property that
-  every step runs after one fails, which the array already has. A **build cache** is not a check,
-  and is kept — see `ci.yml`, where `build-std` is why it matters most here. **Skipping CI on
-  README-only changes** is deliberately not carried over: a README is Markdown, and prettier,
-  markdownlint and cspell all read it, so that `paths-ignore` would skip three of this gate's steps
-  on exactly the changes those steps exist to catch — and it would be a second rule for what gets
-  checked, sitting next to the one in `GATE`.
-- **Every step runs even after one fails**, so one run reports everything wrong rather than making
-  you fix problems one at a time. The summary line names how many steps ran, so don't quote that
-  number anywhere — including here.
-- **A step passes or fails on its exit code alone.** The holes are known and deliberate: `rustfmt`
-  reports unusable config and still exits 0, and Cargo reports a missing resolver the same way. A
-  green exit is not proof the tool was satisfied.
+  array. There is no `paths-ignore` on the workflow either, because a README is Markdown and three
+  of this gate's steps read it.
+- **Every step runs even after one fails, and a step passes or fails on its exit code alone.** Both
+  properties, what each one costs, and the holes they leave are written out in CONTRIBUTING.md; read
+  them before adding a step. The summary line names how many steps ran, so don't quote that number
+  anywhere — including here.
 - `check` and `fix` **refuse to start** unless the installed Node tooling matches
   `package-lock.json` _by content_. Comparing timestamps instead reported a stale tree after every
   branch switch, which is the false alarm that teaches people to ignore the message. Run
@@ -76,8 +66,8 @@ node --test "tools/**/*.test.mjs"   # what the gate's test step runs
 - `rust-toolchain.toml` pins the nightly **exactly**, along with the components and the target the
   gate needs. It has to be nightly at all: `-Z build-std` and `-Z stack-protector=all` in
   `.cargo/config.toml` are refused by stable Cargo. Updating the pin is its own task with its own
-  commit — the point of pinning is that a gate failure is attributable to your change, never to a
-  nightly that moved a flag. Nightly moves every six weeks, so expect to do this.
+  commit — the point of pinning is that a gate failure is attributable to your change.
+  CONTRIBUTING.md has the procedure and the cadence.
 - **`tools/` has no dependencies on purpose**, because a tool guarding the project's dependency
   policy should not be the first thing to bend it. Everything in it is a Node built-in.
 
@@ -98,24 +88,15 @@ After re-running the generator, run `npm run check` before committing and put ba
 missing. The generator is told about the gate, CI and the agent file but not about a lints block, a
 pinned channel or a documentation comment, so nothing it does will tell you they were dropped.
 
-**The `[lints]` blocks are the dangerous ones, and not for the reason you would guess.** Take them
-out and the gate does not go red — it goes quietly weaker. Measured: with the blocks removed,
-`cargo clippy -- -D warnings` on this crate is silent, because there are no lints left to warn.
-Pedantic clippy and `missing_docs` would simply stop being checked, on the firmware and on every
-module added later, and no run would report it. That is the sharpest instance of the rule above — a
-green exit is not proof the tool was satisfied — and the reason to check `git diff Cargo.toml` after
-generating rather than trusting the summary line.
+**Two rows in that table are not what they look like.** Take the `[lints]` blocks out and the gate
+does not go red — it goes quietly weaker, because with them removed `cargo clippy -- -D warnings` is
+silent: there are no lints left to warn. That is the sharpest instance of the rule above, and the
+reason to read `git diff Cargo.toml` after generating rather than trusting the summary line. Take
+`rust-toolchain.toml` out instead and it does go red, because a machine that has never built this
+project then has no `cargo fmt` or `cargo clippy` to run.
 
-`rust-toolchain.toml` is the one that does go red: without `components = ["rustfmt", "clippy"]`, a
-machine that has never built this project has no `cargo fmt` or `cargo clippy` to run, and CI is
-where that first shows up.
-
-**The `-o ci` flag is the dangerous one.** Re-running the generator recreates
-`.github/workflows/rust_ci.yml`, which builds with `dtolnay/rust-toolchain` on `stable`. This
-project cannot be built on stable — `-Z build-std` and `-Z stack-protector=all` in
-`.cargo/config.toml` are refused — so the regenerated workflow fails, and it fails _beside_ a
-passing `ci.yml` rather than replacing it. Delete it every time. Two workflows both running on a
-pull request is the symptom.
+CONTRIBUTING.md carries the procedure for both, and the third trap: `-o ci` recreates
+`.github/workflows/rust_ci.yml`, which builds on a toolchain this project cannot use.
 
 What the generator will _not_ overwrite, and which you should keep an eye on: everything else —
 `tools/`, `package.json` and the rest of the Node tooling, `.gitattributes`, `.editorconfig`,
@@ -138,10 +119,8 @@ this file.
   instead of hard-coding them in source.
 - Logging uses `defmt`; the default filter is `DEFMT_LOG=info` in `.cargo/config.toml` and can be
   overridden from the environment.
-- `cargo run` uses `espflash` as configured in `.cargo/config.toml`. This path flashes through the
-  board's serial/USB bootloader connection.
-- If flashing fails, check bootloader mode, serial-port permissions, the selected port when multiple
-  boards are connected, and that the `--chip` in `.cargo/config.toml` matches the target.
+- Running it on a board, and what to check when flashing fails, is in
+  [README.md](README.md#on-the-board).
 
 ## Formatting ownership
 
@@ -176,12 +155,11 @@ part of the reasoning; read them before changing what reads what.
 
 ## What this repository cannot check, and should not pretend to
 
-- **The firmware has no test target.** `cargo test` cannot work here: `cargo clippy --all-targets`
-  was measured failing with `can't find crate for test`, because a bare-metal `#![no_std]`
-  `#![no_main]` binary has no test harness. Real testing means a harness on hardware or a simulator,
-  which is its own piece of tooling. The gate's `test` step covers the orchestrator, and says so in
-  its own comment. Nothing in this repository verifies the firmware _behaves_; only a device or a
-  simulator does that, and a change that needs it says so in its pull request's _Verified_ section.
+- **The firmware has no test target**, because a bare-metal `#![no_std]` `#![no_main]` binary has no
+  test harness to build — `cargo clippy --all-targets` was measured failing with
+  `can't find crate for test`. The gate's `test` step covers the orchestrator instead. What closes
+  that gap, and why only a device or a simulator can, is in
+  [README.md](README.md#a-green-gate-does-not-mean-the-firmware-works).
 - **`--all-features` is not a second configuration to keep green.** There is one feature set, chosen
   by the generator. The day a `Cargo.toml` gains a feature that changes what is built, the gate
   needs a step that builds both.
