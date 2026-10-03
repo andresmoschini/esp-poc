@@ -1,9 +1,12 @@
 # Contributing
 
-Firmware proof of concept for the `esp32c6`, plus the tooling around it. The rules that an agent
-cannot infer from the code are in [AGENTS.md](AGENTS.md); this file is the process around them.
+Firmware proof of concept for the `esp32c6`, plus the tooling around it.
 
-## Before you commit
+Two files, one job each. The **README** is for arriving: what the project is, what you need, how to
+get it onto a board. This file is for changing it. The rules an agent cannot infer from the code are
+in [AGENTS.md](AGENTS.md); this is the process around them.
+
+## The gate
 
 ```sh
 npm run fix      # every fixer, in the one order that works
@@ -17,23 +20,6 @@ There is **no pre-commit hook**, which is a choice rather than an omission: a ho
 whole gate turns a five-second commit into a two-minute one, and a hook is the wrong place for a
 check that takes minutes. The cost of that choice is that CI reports a broken commit after it exists
 rather than before, so a red build costs a rewrite rather than a fix.
-
-## Working on the chip
-
-```sh
-cargo run                          # build, flash and monitor over the USB bootloader
-DEFMT_LOG=debug cargo run          # more of defmt's output
-```
-
-`cargo run` uses `espflash` as configured in `.cargo/config.toml` — there is no separate flash
-command, and no `-p` to remember, because there is one binary.
-
-If flashing fails, check bootloader mode, serial-port permissions, which port is selected when
-several boards are attached, and that `--chip` matches the target in `.cargo/config.toml`.
-
-**A green gate says the firmware compiles and is lint-clean. It does not say it works.** Nothing in
-this repository can check that; only the chip can. A change that touches what the firmware does says
-so in its pull request's _Verified_ section, with what the serial monitor showed.
 
 ## Adding a step to the gate
 
@@ -107,7 +93,11 @@ list.
 - **The closing keyword goes in the pull request body, never in a commit message.** Only the body
   shows the link before the merge, a wrong number is an edit rather than a history rewrite, and no
   single commit is "the" one closing work that took several.
-- A commit should leave the gate green, and nothing stops a commit that does not.
+- **A commit should leave the gate green, and nothing stops a commit that does not.**
+- **_Verified_ means what was observed, not that the gate passed.** The gate cannot see the firmware
+  run — [why is in the README](README.md#a-green-gate-does-not-mean-the-firmware-works) — so a
+  change that touches what the firmware does says what the board or the simulator showed. "Builds"
+  is not verification, and neither is a green summary line.
 
 One template, `.github/pull_request_template.md`, because this repository has one shape of change.
 Four sections; a section with nothing to say says **"None."** rather than being deleted, because a

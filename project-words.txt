@@ -18,6 +18,7 @@ msvc
 riscv
 rustflag
 rustflags
+uart
 
 # Espressif crates and the names they are reached by
 defmt
