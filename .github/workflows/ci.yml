@@ -7,6 +7,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run the gate by hand. Carried over from the workflow this file replaces, and it earns its place
+  # twice over: to check a branch before it is pushed, and to check the repository against a nightly
+  # that has not been released yet, which is the one case where the pin in rust-toolchain.toml is
+  # stale on purpose rather than by accident.
+  workflow_dispatch:
 
 # The gate only reads the repository.
 permissions:
@@ -16,6 +21,13 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Without this, cargo decides from whether it thinks it has a terminal, and in CI it does not — so
+  # a clippy diagnostic arrives as an undifferentiated wall of `--> src/bin/main.rs:44:9`. The gate
+  # runs three cargo steps that can each produce a page of those, and a gate you cannot read is a
+  # gate nobody fixes.
+  CARGO_TERM_COLOR: always
 
 jobs:
   gate:
@@ -38,6 +50,20 @@ jobs:
       # as deprecated.
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
+
+      # The cache this project needs most, and the reason is `build-std` in .cargo/config.toml. The
+      # standard library is compiled from source, so an uncached run builds 152 crates for the chip —
+      # `core` itself included — and leaves roughly 360 MB under target/. That is paid on every single
+      # run otherwise, and paid twice over because the gate builds in both the debug and release
+      # profiles.
+      #
+      # No `toolchain:` input is given on purpose. rust-cache reads rust-toolchain.toml when the input
+      # is absent, and giving it a channel as well means two places deciding which compiler runs —
+      # which is the disagreement this repository's gate exists to prevent. The pin is also what makes
+      # the cache key correct: the key includes the compiler version, so a nightly bump misses the
+      # cache rather than restoring artifacts built by a different rustc.
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2.9.2
 
       - name: Install the Node tooling
         run: npm run setup

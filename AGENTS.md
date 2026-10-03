@@ -21,6 +21,14 @@ npm run fix      # every fixer, in the one order that works; run before check
   Steps are the `GATE` array in `tools/gate.mjs`, fixers are `FIX`. Adding one means editing that
   array. The one deliberate exception is `.github/workflows/commitlint.yml`, which checks a commit
   range rather than the tree; that file's own header says why it cannot be a step.
+- **What the workflow this replaced had, and does not have now**, listed so nobody re-adds it. A
+  **matrix** of cargo commands is the `GATE` array, and its `fail-fast: false` is the property that
+  every step runs after one fails, which the array already has. A **build cache** is not a check,
+  and is kept — see `ci.yml`, where `build-std` is why it matters most here. **Skipping CI on
+  README-only changes** is deliberately not carried over: a README is Markdown, and prettier,
+  markdownlint and cspell all read it, so that `paths-ignore` would skip three of this gate's steps
+  on exactly the changes those steps exist to catch — and it would be a second rule for what gets
+  checked, sitting next to the one in `GATE`.
 - **Every step runs even after one fails**, so one run reports everything wrong rather than making
   you fix problems one at a time. The summary line names how many steps ran, so don't quote that
   number anywhere — including here.
