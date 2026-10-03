@@ -1,0 +1,10 @@
+# Installed by `npm run setup` and pinned by package-lock.json. Prettier skips it on its own; naming it
+# here means a future change to how prettier resolves its ignores cannot turn the gate's slowest step
+# into a check of 280 third-party packages.
+node_modules/
+
+# Generated: cargo build and cargo doc write binaries, HTML, CSS and JavaScript in here.
+target/
+
+# npm owns this file and rewrites it; formatting it would create churn on every install.
+package-lock.json

@@ -1,0 +1,38 @@
+# One rule decides line endings for everything Git considers text.
+#
+# eol=lf matters as much as text=auto. On its own, text=auto normalizes to LF inside the repository
+# but checks out with the platform default, which is CRLF on Windows. That silently breaks every tracked
+# file without an explicit rule: a fresh clone on Windows gets CRLF copies of files whose tools expect
+# LF, and the gate's `eol` step then rewrites them one at a time.
+#
+# Because this covers every path, per-type "text eol=lf" lines are redundant and are not listed. Only
+# genuine exceptions appear below.
+* text=auto eol=lf
+
+# The one place CRLF is correct: the Windows batch interpreter requires it.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Files Git must not treat as text. "binary" is shorthand for "-text -diff": no line-ending conversion,
+# and no attempt to show a textual diff.
+#
+# The firmware image is the one artifact this repository produces, and it is the one a CI build can
+# attach to a release.
+*.elf   binary
+*.bin   binary
+*.map   binary
+
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.pdf   binary
+
+# Diff drivers change how a change is displayed, not how it is stored, so these are unaffected by the
+# rule above and still carry their weight: Git uses them to label hunks with the enclosing function or
+# section.
+*.rs       diff=rust
+*.toml     diff=toml
+*.json     diff=json
+*.mjs      diff=javascript
+*.yml      diff=yaml
+Cargo.lock diff=toml

@@ -1,0 +1,58 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+charset = utf-8
+
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.{bat,cmd}]
+# The one exception to the rule above, and it is here to agree with `*.bat text eol=crlf` and
+# `*.cmd text eol=crlf` in .gitattributes rather than to add a rule of its own: the Windows batch
+# interpreter does not run a file whose lines end in a bare LF. Measured: with this section absent,
+# `editorconfig-checker -fix` rewrites a batch file to LF and `git add` then answers `fatal: CRLF
+# would be replaced by LF`, so the fixer was the thing breaking the file it was checking. That is also
+# the one case the gate's `eol` step exists for, and it cannot be tested while the two configurations
+# disagree.
+end_of_line = crlf
+
+[*.toml]
+indent_style = space
+indent_size = 2
+
+[*.{json,jsonc}]
+indent_style = space
+indent_size = 2
+
+[*.{yaml,yml}]
+indent_style = space
+indent_size = 2
+
+[*.{md,markdown,rst,txt}]
+indent_style = space
+indent_size = 2
+# Markdown preserve line breaks
+max_line_length = off
+
+[{Makefile,makefile,*.make}]
+indent_style = tab
+
+[{Dockerfile,docker-compose.*,*.dockerfile}]
+indent_style = space
+indent_size = 2
+
+[.github/**]
+indent_style = space
+indent_size = 2
+
+[.{editorconfig,gitignore,gitattributes}]
+indent_style = space
+indent_size = 2
+
+[*.{mjs,cjs,js,jsx,ts,tsx}]
+indent_style = space
+indent_size = 2

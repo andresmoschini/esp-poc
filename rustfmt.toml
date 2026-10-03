@@ -1,0 +1,15 @@
+# Deliberately close to stock. The options worth adding — group_imports, imports_granularity — are
+# nightly-only, and using them would mean opting the formatter's behavior to a channel this project
+# already has to follow for `-Z build-std` and `-Z stack-protector`. Spending the reproducibility that
+# pinning the toolchain buys in order to sort imports is the wrong trade here.
+
+# Never infer line endings from the file being formatted. .gitattributes and .editorconfig both say
+# LF; leaving rustfmt on "Auto" would let a stray CRLF file keep its endings and disagree with them.
+newline_style = "Unix"
+
+# Stated rather than left implicit because it is the project's line width, shared with the Markdown
+# and JSON formatter. 100 is also rustfmt's default, so this changes nothing on its own.
+max_width = 100
+
+# Indentation is left at rustfmt's defaults (4 spaces, no hard tabs), which already match the [*.rs]
+# section of .editorconfig.

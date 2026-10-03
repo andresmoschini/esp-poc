@@ -1,0 +1,51 @@
+# Commit messages are checked here rather than in the quality gate, and the reason is the difference
+# in what each one can see.
+#
+# Every step of `npm run check` answers a question about the tree as it is right now, and answers it the
+# same way on a fresh clone as on a contributor's laptop. A commit message is not in the tree: the only
+# place the history exists is the difference against some other commit, so checking it needs a range —
+# `origin/main..HEAD` — which is a different fact about a different object. Adding it to the gate would
+# either make `npm run check` mean something different in CI than it does locally, or give it a fallback
+# that checks nothing.
+#
+# The two are still one answer to one question. The gate says the code is right; this says the commit
+# says what the code is. A commit that fails here was never committable by the repository's own rules,
+# so rebase rather than amend if it is in someone else's history.
+name: Commit messages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commitlint:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The range this workflow checks is the commits a pull request adds, so the base has to be
+          # present as a ref rather than as a shallow boundary.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install the Node tooling
+        run: npm run setup
+
+      - name: Check the commit messages
+        # `from` is left at its default, which is the last commit on the base branch, so the same
+        # command is right on a pull request and on a push to main.
+        run: npm exec -- commitlint --from origin/${{ github.base_ref || 'main' }} --to HEAD

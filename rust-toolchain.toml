@@ -1,4 +1,17 @@
+# The channel is nightly and the reason is in `.cargo/config.toml`, not a preference: the HAL's stack
+# smashing protection is a `-Z` rustflag and the standard library is rebuilt from source, both of which
+# stable Cargo refuses. So there is no stable toolchain this project can use, and the "pin exactly, so
+# a gate failure is attributable to your change" argument applies with more force than usual here: a
+# nightly release that moves a `-Z` flag breaks the build outright, and CI cannot be the place that finds
+# out.
+#
+# Nightly moves every six weeks, so this file needs revisiting on that cadence. It is its own task, with
+# its own commit, for the same reason the toolchain is pinned: the point of pinning is that a gate
+# failure is attributable to a change made here.
 [toolchain]
-channel    = "nightly"
-components = ["rust-src"]
-targets = ["riscv32imac-unknown-none-elf"]
+channel    = "nightly-2026-10-02"
+# `rustfmt` and `clippy` are what the gate's `fmt` and `clippy` steps run, and `rust-src` is what
+# `[unstable] build-std` reads. All three are named here rather than added by hand so that `rustup
+# toolchain install` — which is all CI does — produces a tree the gate can run on.
+components = ["rust-src", "rustfmt", "clippy"]
+targets    = ["riscv32imac-unknown-none-elf"]

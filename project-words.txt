@@ -1,0 +1,43 @@
+# Words this project uses that no dictionary knows. One per line, sorted, case as written.
+#
+# Add a word here only after checking it is not simply misspelled, and only if an existing dictionary
+# does not already cover it: every entry is a word the spell checker will stop questioning forever.
+# Prefer adding a dictionary to `cspell.jsonc` when one exists for the domain, unless it is a large
+# dictionary pulled in for a single word.
+#
+# The lower-case spelling is the one to add. cspell matches a lower-case entry whatever case it meets
+# it in, so one entry covers `imac` and `IMAC`; an entry written with capitals covers only itself.
+
+# The silicon and the toolchain around it
+codegen
+datasheet
+devkitc
+imac
+microcontroller
+msvc
+riscv
+rustflag
+rustflags
+
+# Espressif crates and the names they are reached by
+defmt
+espflash
+espressif
+linkall
+tdefmt
+tlinkall
+wokwi
+
+# Git's line-ending rules
+safecrlf
+
+# Repository automation
+commitlint
+commitlintrc
+dtolnay
+editorconfig
+markdownlint
+mjs
+nvmrc
+prettier
+xtask

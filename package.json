@@ -1,0 +1,22 @@
+{
+  "name": "esp-poc-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Development tooling for the esp-poc repository. The project itself is Rust; see Cargo.toml.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup": "node tools/gate.mjs setup",
+    "check": "node tools/gate.mjs check",
+    "fix": "node tools/gate.mjs fix"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.2.2",
+    "@commitlint/config-conventional": "21.2.2",
+    "cspell": "10.1.1",
+    "editorconfig-checker": "6.2.0",
+    "markdownlint-cli2": "0.23.2",
+    "prettier": "3.9.6"
+  }
+}

@@ -1,3 +1,6 @@
+//! Tells the linker where `defmt`'s linker script and the HAL's aggregate linker script are, and turns
+//! the linker's bare "undefined symbol" messages into the sentence that says what to do about them.
+
 fn main() {
     linker_be_nice();
     println!("cargo:rustc-link-arg=-Tdefmt.x");

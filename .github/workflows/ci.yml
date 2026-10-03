@@ -1,0 +1,46 @@
+# CI runs the quality gate and nothing else. If this file ever grows a check of its own, the gate a
+# person runs before committing and the gate CI runs can disagree, and then "green" means two
+# different things.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The gate only reads the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch makes the previous run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Quality gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          # The version comes from .nvmrc so it is pinned in one place, the same way the Rust toolchain
+          # is.
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Reads rust-toolchain.toml and installs exactly what it names: the pinned nightly, the
+      # components the gate's fmt and clippy steps run, and the chip's target. Spelled out rather than
+      # left to the toolchain being installed on first use, because rustup now reports that behavior
+      # as deprecated.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install the Node tooling
+        run: npm run setup
+
+      - name: Run the quality gate
+        run: npm run check

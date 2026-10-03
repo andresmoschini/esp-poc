@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "esbenp.prettier-vscode",
+    "EditorConfig.EditorConfig",
+    "DavidAnson.vscode-markdownlint",
+    "streetsidesoftware.code-spell-checker",
+    "tamasfe.even-better-toml",
+    "Wokwi.wokwi-vscode",
+    "fill-labs.dependi"
+  ]
+}

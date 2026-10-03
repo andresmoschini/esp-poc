@@ -1,0 +1,21 @@
+{
+  // Markdown has two owners here, and they do not overlap.
+  //
+  // Prettier owns anything it can rewrite: line width, blank lines around headings and lists, list
+  // markers, emphasis style, code fence style, trailing newlines. Running the equivalent markdownlint
+  // rules as well would mean two configurations for one invariant.
+  //
+  // markdownlint owns what prettier cannot express: structure and semantics. Heading levels that skip,
+  // duplicate headings, bare URLs, code fences with no language, a file that does not start with a
+  // top-level heading. Those are left at their defaults on purpose — with markdownlint's "consistent"
+  // defaults, prettier's canonical output already satisfies them, so pre-silencing them would only
+  // hide a real disagreement if one ever appeared.
+  "config": {
+    // Off because prettier's printWidth of 100 already guarantees the limit by construction.
+    // This is not a relaxation: markdownlint cannot rewrap prose, so keeping it would mean re-cutting
+    // paragraphs by hand while prettier did the same job automatically.
+    "MD013": false,
+  },
+  "globs": ["**/*.md"],
+  "gitignore": true,
+}

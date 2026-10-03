@@ -2,8 +2,17 @@
 debug/
 target/
 
+# Node tooling for the quality gate: installed by `npm run setup`, pinned by package-lock.json.
+# Everything else in this file's absence would be a gate failure rather than an inconvenience, because
+# markdownlint, cspell and editorconfig-checker all read tracked files, so this line is load-bearing
+# rather than cosmetic.
+node_modules/
+.cspellcache
+
 # Editor configuration
-.vscode/
+# .vscode/ is NOT ignored, and deliberately so: the formatter and linter settings in it are how the
+# editor and `npm run check` end up reading the same configuration. .zed/, .helix/ and .nvim.lua are
+# still ignored because there is no equivalent to check in.
 .zed/
 .helix/
 .nvim.lua

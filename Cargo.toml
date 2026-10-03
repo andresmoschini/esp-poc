@@ -1,3 +1,41 @@
+# Lints are declared in the manifest rather than passed on the command line, for two reasons: rust-analyzer
+# then shows the same ones the gate enforces while you are editing, and a linter permitted here is a
+# decision somebody wrote down rather than an `#[allow]` scattered through generated code.
+#
+# They sit at "warn" locally; `npm run check` runs clippy with `-D warnings`, so anything that warns
+# fails the gate. To permit one, add it below with a comment saying why.
+[lints.clippy]
+# priority = -1 lets an individual lint added below override the group; Cargo rejects the combination
+# without it.
+pedantic = { level = "warn", priority = -1 }
+
+# Off, and this is the one lint in the group that is systematically wrong for this codebase.
+#
+# esp-hal reserves a peripheral by moving it out of `Peripherals`, and the idiom is a binding whose
+# only job is to be that move: `let _gpio24 = peripherals.GPIO24;`. The lint is correct that the
+# binding has no effect — the peripherals are dropped at the end of `main` either way — and wrong
+# about what the line is for. It is generated into `src/bin/main.rs` by esp-generate, so an `#[allow]`
+# at the use site would be erased on the next regeneration; the only place a permission survives is
+# here.
+no_effect_underscore_binding = "allow"
+
+[lints.rust]
+# Every public item needs a doc comment. In this crate that currently means the crate roots — the
+# firmware has no public API — so the lint reads as three demands to document a file rather than as a
+# rule about an API. It is kept because the first library module written here is exactly the case it
+# was for, and deleting the lint later is easier to notice than adding it.
+missing_docs = "warn"
+
+[lints.rustdoc]
+# Set to "deny" rather than "warn" so a broken intra-doc link fails `npm run check` on its own: the
+# doc step needs no -D flag, which is the same reason these are not in [lints.rust].
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
+invalid_html_tags = "deny"
+bare_urls = "deny"
+
 [package]
 edition      = "2024"
 name         = "esp-poc"
