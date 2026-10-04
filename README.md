@@ -91,8 +91,8 @@ was measured failing with `can't find crate for test`, since a bare-metal binary
 to build. Testing on-device or in a simulator is a separate piece of tooling that does not exist
 here yet.
 
-So the gate's `test` step runs the tests the _orchestrator_ has, and the way to find out whether the
-firmware behaves is to run it — on the board or in the simulator — and say what you saw.
+So the way to find out whether the firmware behaves is to run it — on the board or in the simulator
+— and say what you saw.
 
 Wi-Fi makes that sharper rather than softer. A green gate has never seen a radio, a DHCP server or
 an access point, so none of the following is a claim this repository makes:
@@ -102,9 +102,25 @@ an access point, so none of the following is a claim this repository makes:
 - that DHCP returns an address, and which one;
 - that the stack keeps running, and reconnects when the link drops.
 
-What _is_ verified is the part the gate can see: it builds for the chip in both profiles, it is
-lint-clean, and the credentials are read from the environment and land in the image (checked by
-looking for them in the ELF).
+What _is_ verified is the part the gate can see: it builds for the chip in both profiles, and it is
+lint-clean. The credentials are compiled in from `.cargo/local.toml`, and nothing checks that they
+reached the image — `option_env!` makes it a question the compiler answers by building.
+
+### What the tests do and do not cover
+
+Two test steps, and the difference between them is the whole story:
+
+- `test` runs the tests of this repository's own automation, in Node.
+- `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
+  that decides rather than talks to hardware: how an address is written, and what a failed join
+  says.
+
+The split is not a preference. `src/wifi.rs` and `src/bin/main.rs` both depend on `esp-hal`, which
+exists only for this chip, so neither can be compiled for a host at all — a test on them needs a
+board. Anything testable therefore has to be in something that builds without them, which is what
+`crates/poc-report` is for, and what makes `poc-report` the only crate in the tree with no
+dependencies of its own. Logic that belongs next to hardware rather than in that crate is untested,
+and stays that way until a board or a simulator can run it.
 
 ## The gate
 
@@ -126,6 +142,7 @@ step fails, how to add one, and which files esp-generate will overwrite.
 | `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it      |
 | `src/wifi.rs`                       | the proof of concept: join a network over DHCP and print the address   |
 | `src/lib.rs`                        | the crate root, and which nightly features the firmware needs          |
+| `crates/poc-report/`                | what the firmware says about the network — the only part with tests    |
 | `build.rs`                          | linker scripts, and what to do about each undefined symbol             |
 | `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy |
 | `Cargo.toml`                        | dependencies and the `[lints]` the gate enforces                       |

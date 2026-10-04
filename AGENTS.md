@@ -63,6 +63,10 @@ cargo doc --no-deps          # what the gate's doc step runs
 node --test "tools/**/*.test.mjs"   # what the gate's test step runs
 ```
 
+The gate's `test-firmware` step is the one command here that is not worth writing out by hand: it
+runs Cargo from outside the repository, and the reason why is longer than the command.
+`npm run check` runs it.
+
 - `rust-toolchain.toml` pins the nightly **exactly**, along with the components and the target the
   gate needs. It has to be nightly at all: `-Z build-std` and `-Z stack-protector=all` in
   `.cargo/config.toml` are refused by stable Cargo. Updating the pin is its own task with its own
@@ -75,29 +79,30 @@ node --test "tools/**/*.test.mjs"   # what the gate's test step runs
 
 The generator wrote these files, and it will overwrite them:
 
-| File                                                   | What has been added since                                                     |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `Cargo.toml`                                           | the `[lints]` blocks — removing them does **not** fail the gate               |
-| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`                             |
-| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                               |
-| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                              |
-| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                       |
-| `.cargo/config.toml`                                   | `alloc` in `build-std`, and a second `include` for the untracked `local.toml` |
-| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                    |
+| File                                                   | What has been added since                                                              |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `Cargo.toml`                                           | the `[lints]` and `[workspace]` blocks, and the path dependency on `crates/poc-report` |
+| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`                                      |
+| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                                        |
+| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                                       |
+| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                                |
+| `.cargo/config.toml`                                   | `alloc` in `build-std`, and a second `include` for the untracked `local.toml`          |
+| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                             |
 
 After re-running the generator, run `npm run check` before committing and put back what it reports
 missing. The generator is told about the gate, CI and the agent file but not about a lints block, a
 pinned channel or a documentation comment, so nothing it does will tell you they were dropped.
 
-**Three rows in that table are not what they look like.** Take the `[lints]` blocks out and the gate
-does not go red — it goes quietly weaker, because with them removed `cargo clippy -- -D warnings` is
-silent: there are no lints left to warn. That is the sharpest instance of the rule above, and the
-reason to read `git diff Cargo.toml` after generating rather than trusting the summary line. Take
-`rust-toolchain.toml` out instead and it does go red, because a machine that has never built this
-project then has no `cargo fmt` or `cargo clippy` to run. And `build-std = ["core"]` does go red,
-but with a message that says nothing about Wi-Fi: the radio driver allocates, so the firmware needs
-`alloc`, and without it every crate that does fails with `duplicate lang item in crate core`. The
-generator only writes that `alloc` when it is given `-o alloc`, so that is the option to pass.
+**Three rows in that table are not what they look like**, and they hide five traps between them.
+Take the `[lints]` blocks out and the gate does not go red — it goes quietly weaker, because with
+them removed `cargo clippy -- -D warnings` is silent: there are no lints left to warn. That is the
+sharpest instance of the rule above, and the reason to read `git diff Cargo.toml` after generating
+rather than trusting the summary line. Take `rust-toolchain.toml` out instead and it does go red,
+because a machine that has never built this project then has no `cargo fmt` or `cargo clippy` to
+run. And `build-std = ["core"]` does go red, but with a message that says nothing about Wi-Fi: the
+radio driver allocates, so the firmware needs `alloc`, and without it every crate that does fails
+with `duplicate lang item in crate core`. The generator only writes that `alloc` when it is given
+`-o alloc`, so that is the option to pass.
 
 The `include` line is the fourth trap, and the quietest: regenerating rewrites
 `include = ["esp-config.toml"]`, which silently drops `local.toml`, and nothing goes red — the build
@@ -105,7 +110,13 @@ still succeeds and the firmware simply stops joining networks, saying it has no 
 second entry back. Credentials belong in `local.toml` and nowhere else: they are compiled into the
 image, so a tracked file would put the password in the repository as well.
 
-CONTRIBUTING.md carries the procedure for both, and the third trap: `-o ci` recreates
+The `[workspace]` block is the fifth, and the only loud one: regenerating drops it along with the
+path dependency on `crates/poc-report`, so the firmware stops compiling with
+`error[E0432]: unresolved import poc_report`. Loud is good — it is the failure mode you would rather
+have — but it fails at the build step with a message about an import rather than about a manifest,
+so `git diff Cargo.toml` is still the faster way to see it.
+
+CONTRIBUTING.md carries the procedure for all of them, and the third trap: `-o ci` recreates
 `.github/workflows/rust_ci.yml`, which builds on a toolchain this project cannot use.
 
 What the generator will _not_ overwrite, and which you should keep an eye on: everything else —
@@ -178,11 +189,21 @@ part of the reasoning; read them before changing what reads what.
 
 ## What this repository cannot check, and should not pretend to
 
-- **The firmware has no test target**, because a bare-metal `#![no_std]` `#![no_main]` binary has no
-  test harness to build — `cargo clippy --all-targets` was measured failing with
-  `can't find crate for test`. The gate's `test` step covers the orchestrator instead. What closes
-  that gap, and why only a device or a simulator can, is in
-  [README.md](README.md#a-green-gate-does-not-mean-the-firmware-works).
+- **The firmware has no test target of its own**, because a bare-metal `#![no_std]` `#![no_main]`
+  binary has no test harness to build — `cargo clippy --all-targets` was measured failing with
+  `can't find crate for test`. `src/wifi.rs` and `src/bin/main.rs` cannot be compiled for a host
+  either, since both depend on `esp-hal`, so a test on them needs a board. What _is_ testable is the
+  part that decides rather than talks to hardware, and it lives in `crates/poc-report` so that the
+  gate's `test-firmware` step can run it on the host: no dependencies, `#![no_std]`, buildable for
+  both targets. **Put logic there when it is worth testing, and expect it not to be there** — logic
+  that needs the radio stays in `src/wifi.rs` untested, because moving it would mean moving the
+  hardware it is about.
+- **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
+  `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
+  firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing
+  them — so neither can be overridden from the command line or from a closer file. Run from an empty
+  directory with `--manifest-path`, they are simply not in play. `tools/lib/firmware-tests.mjs` says
+  so where the step is; do not "simplify" it into a plain `cargo test`.
 - **`--all-features` is not a second configuration to keep green.** There is one feature set, chosen
   by the generator. The day a `Cargo.toml` gains a feature that changes what is built, the gate
   needs a step that builds both.

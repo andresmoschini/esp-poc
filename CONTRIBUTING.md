@@ -55,17 +55,19 @@ stale one can fail to link rather than fail loudly, so `cargo clean` first if an
 ## Re-running esp-generate
 
 The generator owns `Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`, `build.rs`, `src/`,
-`wokwi.toml`, `diagram.json`, `.vscode/` and `.github/workflows/`, and it will overwrite them. Five
+`wokwi.toml`, `diagram.json`, `.vscode/` and `.github/workflows/`, and it will overwrite them. Six
 things have been added to those files by hand, and nothing the generator does will tell you they
 were gone:
 
 1. the `[lints]` blocks in `Cargo.toml` — removing these does not fail the gate, it makes the gate
    quieter while checking less (see below)
-2. the exact channel, and `rustfmt`, `clippy` and `rust-src`, in `rust-toolchain.toml`
-3. a crate-level `//!` doc comment in `build.rs`, `src/lib.rs` and `src/bin/main.rs`
-4. the formatter settings in `.vscode/settings.json` and the extension list in
+2. the `[workspace]` block in `Cargo.toml` and the path dependency on `crates/poc-report` — removing
+   these fails loudly, at the build step, with `error[E0432]: unresolved import poc_report`
+3. the exact channel, and `rustfmt`, `clippy` and `rust-src`, in `rust-toolchain.toml`
+4. a crate-level `//!` doc comment in `build.rs`, `src/lib.rs` and `src/bin/main.rs`
+5. the formatter settings in `.vscode/settings.json` and the extension list in
    `.vscode/extensions.json`
-5. prettier's reformatting of `.vscode/*.json`, which the generator writes with trailing commas
+6. prettier's reformatting of `.vscode/*.json`, which the generator writes with trailing commas
 
 **Delete `.github/workflows/rust_ci.yml` if it comes back.** The `-o ci` flag makes the generator
 recreate it, and it builds on `stable` — which cannot build this project, because `-Z build-std` and
