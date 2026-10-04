@@ -8,6 +8,12 @@
 // not: a packet that is not an answer, a stratum that means the server is not answering, a timestamp
 // from a server whose clock never worked. A packet off the network is untrusted input, and none of
 // it can be checked on a board without a server to send it.
+//
+// One rule for every test in this file, learned the hard way: build the packet from the *fields* on
+// the wire, never from the numbers the code under test produces. The first version of `reply` below
+// wrote the timestamp with the same misunderstanding the reader had — all eight bytes as seconds — so
+// twenty tests agreed with a bug that a real server's first reply exposed. An encoder and a decoder
+// written from the same idea check each other's arithmetic and neither one's idea of the format.
 
 use poc_report::{Clock, Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
 
@@ -15,7 +21,7 @@ use poc_report::{Clock, Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
 const NONCE: u32 = 0x0BAD_F00D;
 
 /// Seconds between the NTP epoch and the Unix one, restated because every timestamp below is built
-/// by adding it to a date, and the whole of the 2036 argument is about this number.
+/// by adding it to a date, and reading one is a subtraction of it.
 const NTP_TO_UNIX: u64 = 2_208_988_800;
 
 /// Seconds since the Unix epoch for a date and a time, written the slow way.
@@ -38,12 +44,33 @@ fn epoch_secs(year: u64, month: u64, day: u64, hour: u64, minute: u64, second: u
     days * 86_400 + hour * 3_600 + minute * 60 + second
 }
 
+/// The 8 bytes of an NTP timestamp for a date, as a server would put them on the wire: 32 bits of
+/// whole seconds since 1900, then 32 bits of the fraction of a second.
+///
+/// The fraction is a parameter because that is the whole point — the reader has to drop it, and a
+/// helper that always wrote zero would not notice either way. The seconds are the count, and the
+/// count is put in the *first* four bytes, which is the mistake this file now exists to catch.
+fn timestamp_bytes(epoch_secs: u64, fraction: u32) -> [u8; 8] {
+    let seconds = u32::try_from(epoch_secs + NTP_TO_UNIX).expect("a date that era 0 can express");
+
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&seconds.to_be_bytes());
+    bytes[4..].copy_from_slice(&fraction.to_be_bytes());
+
+    bytes
+}
+
 /// A well-formed reply: version 4, mode 4, stratum 2, no leap second, the nonce echoed, and a
-/// timestamp of the moment given.
+/// timestamp of the moment given at a fraction of a second past it.
 ///
 /// Every test that is not about one of those fields starts from this and changes one thing, so that
 /// a failure names the field rather than the packet.
 fn reply(epoch_secs: u64) -> Vec<u8> {
+    reply_at(epoch_secs, 0)
+}
+
+/// As [`reply`], at a named fraction of a second.
+fn reply_at(epoch_secs: u64, fraction: u32) -> Vec<u8> {
     let request = sntp_request(NONCE);
     let mut packet = vec![0; SNTP_LEN];
 
@@ -54,9 +81,7 @@ fn reply(epoch_secs: u64) -> Vec<u8> {
     // What a server does with a request: the client's timestamp is copied into the originate field
     // and its own goes in the transmit field.
     packet[24..32].copy_from_slice(&request[40..48]);
-
-    let since_1900 = (epoch_secs + NTP_TO_UNIX).to_be_bytes();
-    packet[40..48].copy_from_slice(&since_1900);
+    packet[40..48].copy_from_slice(&timestamp_bytes(epoch_secs, fraction));
 
     packet
 }
@@ -83,48 +108,67 @@ fn a_reply_carries_the_time_the_server_gave() {
     assert_eq!(answer.leap, Leap::Normal);
 }
 
-/// The time is a count of seconds since 1970, and this is the whole reason for reading eight bytes
-/// rather than four: NTP counts from 1900 in a 136-year era, and a 32-bit reading lands in 2036
-/// while a 64-bit one does not care. The two cases are 2036 and 2037 because the rollover is
-/// between them.
+/// The second half of a timestamp is a fraction, and adding it to the seconds is a bug that looks
+/// like a server sending nonsense: a real reply of 2026-10-04 12:24:25.292 came back as the year
+/// 544426464172, which is `0xEE6CC3F9_4ABFCE7E` read as one number.
+///
+/// Every fraction from nothing to almost a whole second has to leave the reading untouched, and the
+/// ones at the ends are where a decoder that rounds or that shifts by a byte would show it.
 #[test]
-fn a_time_past_the_2036_rollover_is_still_a_time() {
-    for year in [2035, 2036, 2037, 2100] {
-        let moment = epoch_secs(year, 6, 15, 12, 0, 0);
+fn the_fraction_of_a_second_is_not_part_of_the_seconds() {
+    let moment = epoch_secs(2026, 10, 4, 12, 24, 25);
 
-        let answer = sntp_reply(&reply(moment), NONCE).expect("a well-formed reply");
+    for fraction in [0, 1, 0x4000_0000, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF] {
+        let answer = sntp_reply(&reply_at(moment, fraction), NONCE).expect("a well-formed reply");
 
         assert_eq!(
             answer.epoch_secs, moment,
-            "the year {} was not read back",
-            year
+            "a fraction of {fraction:#010x} moved the time"
         );
     }
 }
 
-/// The timestamp is 64 bits and the era is in the top half, so a reading that only looked at the
-/// bottom four would be a date in the far past rather than an error. Moving the era by hand is what
-/// makes that case reachable: the seconds within the era are unchanged here and only the top half
-/// moves, which is the difference between a date in 2030 and the same date 136 years later.
+/// The whole timestamp from a real reply, byte for byte, because a test built from the same idea as
+/// the code cannot catch the code being wrong about the idea. These are the eight bytes a server on a
+/// home connection sent on 2026-10-04: seconds `0xEE6CC3F9` and a fraction of 0.292.
 #[test]
-fn a_timestamp_in_a_later_era_keeps_its_era() {
-    // A date whose seconds still fit in 32 bits, so that the packet below starts in era zero and
-    // the era has to be put there on purpose.
-    let moment = epoch_secs(2030, 6, 15, 12, 0, 0);
-    assert!(
-        moment + NTP_TO_UNIX < 1 << 32,
-        "the test date is not in the first era"
-    );
+fn a_reply_captured_from_a_real_server_reads_as_the_day_it_was_asked_for() {
+    let mut packet = reply(0);
 
-    let mut packet = reply(moment);
-    packet[40..44].copy_from_slice(&1u32.to_be_bytes());
+    // 0xEE6CC3F9 seconds since 1900 is 2026-10-04 12:24:25 UTC, and the low half is a fifth of a
+    // second rather than 1_254_084_222 seconds.
+    packet[40..48].copy_from_slice(&[0xEE, 0x6C, 0xC3, 0xF9, 0x4A, 0xBF, 0xCE, 0x7E]);
 
     let answer = sntp_reply(&packet, NONCE).expect("a well-formed reply");
 
     assert_eq!(
-        answer.epoch_secs,
-        moment + (1 << 32),
-        "the era was dropped instead of added"
+        Clock::utc(answer.epoch_secs).to_string(),
+        "2026-10-04 12:24:25",
+        "a packet from a real server read as something else",
+    );
+}
+
+/// Era 0 ends on 2036-02-07, and the seconds field uses all 32 bits long before that — a 2026 date is
+/// past 2^31 seconds since 1900, so its top bit is set and is not a flag of anything. Both ends of
+/// era 0 are pinned here because a decoder that treated the top bit as an era number, or that read
+/// five bytes, would be right in the middle of the range and wrong at both ends.
+#[test]
+fn the_ends_of_the_first_era_are_readable() {
+    // The first readable moment of era 0 is 1970-01-01 itself: the seconds field holds the count
+    // since 1900, and 2 208 988 800 of them is the Unix epoch. A second earlier is a time before it,
+    // which is a refusal rather than a reading.
+    let mut packet = reply(0);
+    packet[40..44].copy_from_slice(&u32::try_from(NTP_TO_UNIX).unwrap().to_be_bytes());
+    packet[44..48].copy_from_slice(&[0; 4]);
+    assert_eq!(sntp_reply(&packet, NONCE).map(|a| a.epoch_secs), Ok(0));
+
+    // The last second era 0 can express is all ones, which is also the value this refuses as a
+    // server with no clock, so the last readable moment is the second before it.
+    let last = epoch_secs(2036, 2, 7, 6, 28, 14);
+    assert_eq!(
+        sntp_reply(&reply(last), NONCE).map(|a| a.epoch_secs),
+        Ok(last),
+        "the end of era 0 did not read back",
     );
 }
 
@@ -231,30 +275,41 @@ fn a_packet_longer_than_a_header_is_still_a_time() {
 /// number would be a date in the year 584 billion.
 #[test]
 fn a_server_with_no_time_is_refused() {
-    let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
-    packet[40..48].copy_from_slice(&[0xFF; 8]);
+    // A zero seconds field is what RFC 5905 defines as unknown or unsynchronized time, and an
+    // all-ones one is what several implementations send for a clock they have never set. Neither is
+    // a reading: the first is 1900, the second the last second era 0 can express.
+    for field in [[0; 4], [0xFF; 4]] {
+        let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
+        packet[40..44].copy_from_slice(&field);
+        packet[44..48].copy_from_slice(&[0; 4]);
 
-    assert_eq!(sntp_reply(&packet, NONCE), Err(Refusal::NoTime));
+        assert_eq!(
+            sntp_reply(&packet, NONCE),
+            Err(Refusal::NoTime),
+            "{field:02x?}"
+        );
+    }
 }
 
 /// A server whose clock never worked reports a time before 1970, and there is no epoch to count it
 /// from. Rendering one anyway would produce a date in 1899 that looks like a reading.
 #[test]
 fn a_time_before_the_epoch_is_refused() {
-    // 1900-01-01 itself, the NTP epoch: one second before it there is nothing at all, so the first
-    // count of seconds is the one that cannot be subtracted.
-    let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
-    packet[40..48].copy_from_slice(&1u64.to_be_bytes());
+    let ntp_epoch = u32::try_from(NTP_TO_UNIX).unwrap();
 
+    // 1900-01-01 itself, the NTP epoch: there is no time at all before it, so a count of one second
+    // is the first that cannot be turned into seconds since 1970.
+    let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
+    packet[40..44].copy_from_slice(&1u32.to_be_bytes());
     assert_eq!(sntp_reply(&packet, NONCE), Err(Refusal::BeforeTheEpoch));
 
-    // One second later there is still nothing before the epoch, and a second after that there is.
+    // A second before the Unix epoch is still before it, and a second after is 1970-01-01T00:00:01Z.
     let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
-    packet[40..48].copy_from_slice(&(NTP_TO_UNIX - 1).to_be_bytes());
+    packet[40..44].copy_from_slice(&(ntp_epoch - 1).to_be_bytes());
     assert_eq!(sntp_reply(&packet, NONCE), Err(Refusal::BeforeTheEpoch));
 
     let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
-    packet[40..48].copy_from_slice(&NTP_TO_UNIX.to_be_bytes());
+    packet[40..44].copy_from_slice(&ntp_epoch.to_be_bytes());
     assert_eq!(sntp_reply(&packet, NONCE).map(|a| a.epoch_secs), Ok(0));
 }
 

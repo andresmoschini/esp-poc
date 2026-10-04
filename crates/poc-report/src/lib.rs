@@ -393,10 +393,10 @@ pub enum Refusal {
     /// repeats one that was already answered.
     NotOurs,
 
-    /// The timestamp is all ones, which is how a server writes down that it has no time.
+    /// The timestamp is zero or all ones, which is how a server writes down that it has no time.
     NoTime,
 
-    /// The time is before 1970, so there is no epoch to count from.
+    /// The time is before 1970, so there is no epoch to count it from.
     BeforeTheEpoch,
 }
 
@@ -472,18 +472,36 @@ pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
         return Err(Refusal::NotOurs);
     }
 
-    let mut timestamp = [0; 8];
-    timestamp.copy_from_slice(&header[TRANSMIT..TRANSMIT + 8]);
-    let seconds_since_1900 = u64::from_be_bytes(timestamp);
+    // Half of a 64-bit timestamp is a fraction and not a count of seconds. The layout is 32 bits of
+    // whole seconds since 1900 followed by 32 bits of the fraction of a second, and reading all
+    // eight bytes as one number multiplies the seconds by 2^32 — which on a real board turns
+    // 2026-10-04 into the year 544426464172.
+    //
+    // The fraction is dropped rather than rounded: the reading is then the second the server was in,
+    // and a rounding rule that could go either way is not worth having in a clock that prints whole
+    // seconds anyway. The cost is up to one second behind the server.
+    let seconds = u32::from_be_bytes([
+        header[TRANSMIT],
+        header[TRANSMIT + 1],
+        header[TRANSMIT + 2],
+        header[TRANSMIT + 3],
+    ]);
 
-    if seconds_since_1900 == u64::MAX {
+    // Two ways of saying there is no time here. A zero is what the RFC defines as unknown or
+    // unsynchronized, and an all-ones seconds field is what several implementations send for a clock
+    // they have never set — which is also the last second era 0 can express, so neither reading is a
+    // time worth setting a clock from either way.
+    if seconds == 0 || seconds == u32::MAX {
         return Err(Refusal::NoTime);
     }
 
-    // All eight bytes are the count of seconds: the top half is which 136-year era of NTP time this
-    // is, so reading only the bottom four — as a 32-bit implementation has to — is what makes a
-    // reading wrong in 2036 rather than before it.
-    let epoch_secs = seconds_since_1900
+    // The era is not in the packet. RFC 5905 gives the 128-bit *date* format a 32-bit era number, but
+    // the header's 64-bit timestamp is era-relative: era 0 counts from 1900-01-01 and its seconds
+    // field uses all 32 bits — a 2026 date is past 2^31, so the top bit is set and is not a flag of
+    // anything. Era 0 ends on 2036-02-07, and this reads era 0, which is the only era it can: the
+    // RFC's own rule is that a client already set within 68 years of its server is right even across
+    // the boundary, and a chip with no clock is not set within 68 years of anything.
+    let epoch_secs = u64::from(seconds)
         .checked_sub(NTP_TO_UNIX)
         .ok_or(Refusal::BeforeTheEpoch)?;
 
