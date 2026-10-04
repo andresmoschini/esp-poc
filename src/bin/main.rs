@@ -66,13 +66,28 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    // Join the network in the background. `_stack` is what the next step of the proof of concept
+    // Join the network in the background. The stack is what the next step of the proof of concept
     // needs — an SNTP request over it — and `None` here only means there were no credentials in the
-    // environment this was compiled from.
-    let _stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
+    // environment this was compiled from. It is `Copy`, so the loop below can read the address out
+    // of it without taking it away from whoever needs it next.
+    let stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
 
     loop {
-        info!("Hello world!");
+        // Reading the configuration is a lookup, not a wait: it answers with whatever DHCP has
+        // produced so far, and with nothing until it has. That is why this loop is not blocked on
+        // the network and why it starts printing a bare greeting.
+        if let Some(stack) = stack
+            && let Some(config) = stack.config_v4()
+        {
+            info!(
+                "Hello world! {}/{}",
+                config.address.address(),
+                config.address.prefix_len()
+            );
+        } else {
+            info!("Hello world!");
+        }
+
         Timer::after(Duration::from_millis(500)).await;
     }
 
