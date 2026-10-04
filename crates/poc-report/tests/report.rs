@@ -8,7 +8,11 @@
 
 use std::fmt::Write as _;
 
-use poc_report::{Address, Failure, Reason};
+use poc_report::{Address, Clock, Failure, Reason};
+
+/// Seconds in a day, restated from the library because the wrapping is the property under test and
+/// naming it here is what keeps the numbers below readable.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Renders a value the way the firmware's `Display2Format` does on the chip.
 ///
@@ -164,4 +168,39 @@ fn a_failure_without_a_signal_keeps_the_reason_verbatim() {
         render(&Reason::SecurityRefused),
         "a failure with no signal should read as its reason does",
     );
+}
+
+/// The time of day is written the way a person writes it, which is three two-digit fields and a colon
+/// between each of them.
+#[test]
+fn a_clock_is_written_as_a_time_of_day() {
+    assert_eq!(render(&Clock::since_boot(0)), "00:00:00");
+    assert_eq!(render(&Clock::since_boot(45)), "00:00:45");
+    assert_eq!(render(&Clock::since_boot(3_661)), "01:01:01");
+}
+
+/// Every field is two digits wide, always: the greeting prints twice a second, and a reading whose
+/// shape changes with its value is a log that is hard to read and harder to grep.
+#[test]
+fn a_clock_pads_every_field_to_two_digits() {
+    assert_eq!(render(&Clock::since_boot(3_723)), "01:02:03");
+    assert_eq!(render(&Clock::since_boot(86_399)), "23:59:59");
+}
+
+/// The chip's clock starts at zero when the firmware starts, so a day of running time has to print as
+/// zero rather than as 86.401, and the largest number of seconds there is still has to land inside a
+/// day. Wrapping is what makes the reading a shape rather than a measurement — it is wrong until
+/// there is a network time source, and pretending otherwise would be the part that misleads.
+#[test]
+fn a_clock_wraps_at_midnight() {
+    assert_eq!(render(&Clock::since_boot(SECONDS_PER_DAY)), "00:00:00");
+    assert_eq!(render(&Clock::since_boot(2 * SECONDS_PER_DAY)), "00:00:00");
+    assert_eq!(
+        render(&Clock::since_boot(SECONDS_PER_DAY + 3_723)),
+        "01:02:03"
+    );
+
+    // The largest count of seconds there is, which is not a round number of days and so lands
+    // wherever the arithmetic puts it — as long as it lands inside the day.
+    assert_eq!(render(&Clock::since_boot(u64::MAX)), "07:00:15");
 }

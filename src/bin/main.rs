@@ -16,14 +16,14 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::main;
 use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
-use poc_report::Address;
+use poc_report::{Address, Clock};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -74,6 +74,12 @@ async fn main(spawner: Spawner) -> ! {
     let stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
 
     loop {
+        // The chip has no battery-backed clock, so the only time it can tell is how long it has been
+        // running. Printing it next to the greeting is what shows what is still missing: a time that
+        // counts from boot rather than from midnight. `poc-report` does the arithmetic and the
+        // wrapping, and `tests/report.rs` checks them where they can actually be run.
+        let now = Clock::since_boot(Instant::now().as_secs());
+
         // Reading the configuration is a lookup, not a wait: it answers with whatever DHCP has
         // produced so far, and with nothing until it has. That is why this loop is not blocked on
         // the network and why it starts printing a bare greeting.
@@ -81,14 +87,15 @@ async fn main(spawner: Spawner) -> ! {
             && let Some(config) = stack.config_v4()
         {
             info!(
-                "Hello world! {}",
+                "Hello world! {} from {}",
+                defmt::Display2Format(&now),
                 defmt::Display2Format(&Address {
                     ip: config.address.address(),
                     prefix_len: config.address.prefix_len(),
-                })
+                }),
             );
         } else {
-            info!("Hello world!");
+            info!("Hello world! {}", defmt::Display2Format(&now));
         }
 
         Timer::after(Duration::from_millis(500)).await;

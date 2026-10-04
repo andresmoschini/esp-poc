@@ -1,10 +1,12 @@
-//! What the firmware has to say about the network, decided here and printed there.
+//! What the firmware has to say, decided here and printed there.
 //!
-//! Two decisions live in this crate. The first is how an address is written: the greeting in
+//! Three decisions live in this crate. The first is how an address is written: the greeting in
 //! `src/bin/main.rs` and the report in `src/wifi.rs` both print one, and they used to be two pieces of
 //! formatting that could drift apart. The second is what a failed join says: the radio names about
 //! fifty reasons, and printing its own words for them answers the question "what did the hardware say"
-//! rather than the question an operator is asking, which is what to do next.
+//! rather than the question an operator is asking, which is what to do next. The third is how the
+//! chip's idea of the time of day is written, which is a sentence with arithmetic in it and so is
+//! just as easy to get subtly wrong.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs` and `src/bin/main.rs` both depend on `esp-hal`, which exists only for this chip, so
@@ -115,5 +117,47 @@ fn write_reason(reason: Reason) -> &'static str {
         Reason::NoAnswer => "the network stopped answering partway through",
         Reason::LinkLost => "the link came up and then went down",
         Reason::Other => "the radio reported a reason this firmware does not name",
+    }
+}
+
+/// Seconds in a day, which is as far as this clock goes before it starts again.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The time of day, counted from the moment the chip booted.
+///
+/// This chip has no battery-backed clock, so nothing on it knows what time it is: the only clock
+/// available is the scheduler's, and it starts at zero when the firmware starts and stops when the
+/// power goes. Reading it anyway is what makes it obvious what is missing — a wall clock needs a
+/// network time source over a link that is not up yet — and the greeting is where that belongs.
+///
+/// It is therefore written as a time of day and it is wrong by design. [`Clock::since_boot`] wraps
+/// at midnight rather than counting hours forever, so the reading is a shape and not a measurement;
+/// nothing that wants real time has it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clock {
+    /// Whole seconds of running time, counted by the chip since boot.
+    since_boot_secs: u64,
+}
+
+impl Clock {
+    /// The reading the chip can actually make, from how long it has been running.
+    ///
+    /// The arithmetic happens when the reading is printed rather than here, so there is no way for a
+    /// half-computed time of day to exist: there is a number of seconds and nothing else.
+    #[must_use]
+    pub const fn since_boot(since_boot_secs: u64) -> Self {
+        Self { since_boot_secs }
+    }
+}
+
+impl fmt::Display for Clock {
+    /// `HH:MM:SS`, zero-padded so the field widths do not jump around in a log that prints this
+    /// twice a second.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let today = self.since_boot_secs % SECONDS_PER_DAY;
+
+        let (hours, minutes, seconds) = (today / 3600, today / 60 % 60, today % 60);
+
+        write!(f, "{hours:02}:{minutes:02}:{seconds:02}")
     }
 }

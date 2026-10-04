@@ -8,8 +8,12 @@ Firmware proof of concept for the Espressif **ESP32-C6**, in bare-metal Rust: `#
 ## What it does right now
 
 Bring up the HAL at maximum CPU clock, take the pins the module reserves so they cannot be used by
-accident, then join a Wi-Fi network and print the address DHCP hands out — next to a line of
-`Hello world!` every 500 ms, which keeps printing while the radio does its work.
+accident, then join a Wi-Fi network and print the address DHCP hands out — next to the time of day,
+twice a second, which keeps printing while the radio does its work.
+
+There is no battery-backed clock on this chip, so the time it prints is how long it has been running
+since boot, written as `HH:MM:SS` and wrapped at midnight. It is wrong until something sets it,
+which is the thing the next step of the proof of concept is for.
 
 Wi-Fi is [`esp-radio`](https://docs.espressif.com/projects/rust/esp-radio/latest/), which on this
 chip is a device on the internal SDIO bus: there are no pins to choose. It needs a preemptive
@@ -65,9 +69,10 @@ WIFI_SSID = "your-network"
 WIFI_PASSWORD = "your-password"
 ```
 
-Without them the firmware still builds and still prints `Hello world!`; it says it has no network to
-join and stops there. That is deliberate: the gate and CI have no network to join either, and a
-firmware that only builds where a password is present is a firmware nobody else can build.
+Without them the firmware still builds and still prints `Hello world!` with the time; it says it has
+no network to join and stops there. That is deliberate: the gate and CI have no network to join
+either, and a firmware that only builds where a password is present is a firmware nobody else can
+build.
 
 The password ends up in the flash image as well as in that file, because there is nowhere else for
 it to be. Fine for a proof of concept; not fine for anything that leaves your desk.
