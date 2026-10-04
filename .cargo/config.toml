@@ -1,5 +1,9 @@
 # Keep compilation settings in this file and user/runtime settings in `esp-config.toml`.
-include = ["esp-config.toml"]
+#
+# `local.toml` is the same idea for anything that must not be committed: the Wi-Fi credentials the
+# firmware is compiled with. Cargo reads both, and a missing `include` is not an error, so a fresh
+# checkout builds without it.
+include = ["esp-config.toml", "local.toml"]
 
 [target.riscv32imac-unknown-none-elf]
 runner = "espflash flash --monitor --chip esp32c6 --log-format defmt"
@@ -15,4 +19,7 @@ rustflags = [
 target = "riscv32imac-unknown-none-elf"
 
 [unstable]
-build-std = ["core"]
+# `alloc` is here because Wi-Fi is: the radio driver and the TCP/IP stack above it both allocate.
+# Without it, Cargo builds `alloc` for the host and the firmware fails to link against two
+# definitions of `core`. The firmware was heap-free before that, and this line is what changed.
+build-std = ["core", "alloc"]

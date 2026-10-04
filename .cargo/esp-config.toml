@@ -1,3 +1,7 @@
 # Keep user/runtime configuration values in this file.
 [env]
 DEFMT_LOG="info"
+
+# The Wi-Fi credentials for the proof of concept are not here: this file is tracked, and a password
+# in a tracked file is a password in the repository. They go in `local.toml`, which is included by
+# the same `include` line and which `.gitignore` keeps out of Git.

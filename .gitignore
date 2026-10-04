@@ -2,6 +2,12 @@
 debug/
 target/
 
+# Your machine's settings, which `.cargo/config.toml` includes and this repository therefore never
+# holds. It is where the Wi-Fi credentials for the proof of concept live: the firmware has no
+# filesystem to read them from, so they are compiled into it, and a tracked file would make the
+# password a matter of record — in the repository as well as in the flash image.
+.cargo/local.toml
+
 # Node tooling for the quality gate: installed by `npm run setup`, pinned by package-lock.json.
 # Everything else in this file's absence would be a gate failure rather than an inconvenience, because
 # markdownlint, cspell and editorconfig-checker all read tracked files, so this line is load-bearing

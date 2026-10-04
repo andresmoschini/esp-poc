@@ -75,25 +75,35 @@ node --test "tools/**/*.test.mjs"   # what the gate's test step runs
 
 The generator wrote these files, and it will overwrite them:
 
-| File                                               | What has been added since                                       |
-| -------------------------------------------------- | --------------------------------------------------------------- |
-| `Cargo.toml`                                       | the `[lints]` blocks — removing them does **not** fail the gate |
-| `rust-toolchain.toml`                              | the exact pin and `rustfmt`, `clippy`, `rust-src`               |
-| `build.rs`, `src/lib.rs`, `src/bin/main.rs`        | a crate-level `//!` doc comment                                 |
-| `.vscode/settings.json`, `.vscode/extensions.json` | formatter ownership and the gate's extension set                |
-| `.github/workflows/rust_ci.yml`                    | **deleted** — replaced by `ci.yml` and `commitlint.yml`         |
-| `.cargo/config.toml`, `wokwi.toml`, `diagram.json` | nothing yet                                                     |
+| File                                                   | What has been added since                                                     |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `Cargo.toml`                                           | the `[lints]` blocks — removing them does **not** fail the gate               |
+| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`                             |
+| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                               |
+| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                              |
+| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                       |
+| `.cargo/config.toml`                                   | `alloc` in `build-std`, and a second `include` for the untracked `local.toml` |
+| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                    |
 
 After re-running the generator, run `npm run check` before committing and put back what it reports
 missing. The generator is told about the gate, CI and the agent file but not about a lints block, a
 pinned channel or a documentation comment, so nothing it does will tell you they were dropped.
 
-**Two rows in that table are not what they look like.** Take the `[lints]` blocks out and the gate
+**Three rows in that table are not what they look like.** Take the `[lints]` blocks out and the gate
 does not go red — it goes quietly weaker, because with them removed `cargo clippy -- -D warnings` is
 silent: there are no lints left to warn. That is the sharpest instance of the rule above, and the
 reason to read `git diff Cargo.toml` after generating rather than trusting the summary line. Take
 `rust-toolchain.toml` out instead and it does go red, because a machine that has never built this
-project then has no `cargo fmt` or `cargo clippy` to run.
+project then has no `cargo fmt` or `cargo clippy` to run. And `build-std = ["core"]` does go red,
+but with a message that says nothing about Wi-Fi: the radio driver allocates, so the firmware needs
+`alloc`, and without it every crate that does fails with `duplicate lang item in crate core`. The
+generator only writes that `alloc` when it is given `-o alloc`, so that is the option to pass.
+
+The `include` line is the fourth trap, and the quietest: regenerating rewrites
+`include = ["esp-config.toml"]`, which silently drops `local.toml`, and nothing goes red — the build
+still succeeds and the firmware simply stops joining networks, saying it has no credentials. Put the
+second entry back. Credentials belong in `local.toml` and nowhere else: they are compiled into the
+image, so a tracked file would put the password in the repository as well.
 
 CONTRIBUTING.md carries the procedure for both, and the third trap: `-o ci` recreates
 `.github/workflows/rust_ci.yml`, which builds on a toolchain this project cannot use.
@@ -110,17 +120,30 @@ this file.
   on selected generation options.
 - This is a `#![no_std]` / `#![no_main]` project. Avoid `std`; use `core` and embedded-friendly
   crates.
-- `alloc` is not enabled. Avoid heap-backed types such as `Vec`, `String`, `Box`, and boxed futures
-  unless you add and initialize an allocator.
+- `alloc` **is** enabled, because the Wi-Fi driver and the TCP/IP stack above it allocate: two
+  `esp_alloc::heap_allocator!` statics in `src/bin/main.rs` and `build-std = ["core", "alloc"]`.
+  Heap-backed types are therefore available; the two heaps are 64 KiB of reclaimed bootloader RAM
+  and 36 KiB of internal RAM, and that budget is the real limit, not whether a type compiles.
+- The firmware enables `esp-hal/unstable` and has to: the Wi-Fi peripheral singleton and the
+  scheduler's time driver are behind it. Every new `unstable` API used is one more thing a future
+  `esp-hal` may rename, so prefer the stable surface where one exists.
+- `esp-radio` is pinned to an exact pre-release (`=1.0.0-beta.1`) and needs `opt-level = 3` in both
+  profiles, or Wi-Fi fails to connect for reasons that look like a bug in your code. The overrides
+  are in `Cargo.toml`; do not remove them thinking they are noise.
+- Credentials are compiled in from `.cargo/local.toml`, which is untracked. Keep it that way, and
+  remember that whatever is in it also lands in the flash image.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled
   Espressif crates document crate-specific variables; keep project-specific defaults in `[env]`
   instead of hard-coding them in source.
-- Logging uses `defmt`; the default filter is `DEFMT_LOG=info` in `.cargo/config.toml` and can be
-  overridden from the environment.
+- Logging uses `defmt`; the default filter is `DEFMT_LOG=info` in the `[env]` section of
+  `.cargo/esp-config.toml` and can be overridden from the environment. `defmt`'s format strings take
+  positional or integer-named placeholders and arguments — `info!("{}", x)` — because this defmt
+  version rejects captured identifiers and `{=expr}` for anything that is not a type name.
 - Running it on a board, and what to check when flashing fails, is in
-  [README.md](README.md#on-the-board).
+  [README.md](README.md#on-the-board). What the gate cannot tell you about the radio is in
+  [README.md](README.md#a-green-gate-does-not-mean-the-firmware-works).
 
 ## Formatting ownership
 

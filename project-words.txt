@@ -18,6 +18,8 @@ msvc
 riscv
 rustflag
 rustflags
+sdio
+timg
 uart
 
 # Espressif crates and the names they are reached by
@@ -28,6 +30,12 @@ linkall
 tdefmt
 tlinkall
 wokwi
+
+# What the proof of concept speaks over the air
+dhcp
+dhcpv4
+smoltcp
+sntp
 
 # Git's line-ending rules
 safecrlf

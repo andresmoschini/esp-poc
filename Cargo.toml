@@ -47,10 +47,14 @@ name = "esp-poc"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.2.2", features = ["defmt", "esp32c6"] }
+# `unstable` is not optional for this firmware any more: the Wi-Fi peripheral singleton and the
+# scheduler's time driver are behind it, and there is no stable API for Wi-Fi on this chip.
+esp-hal = { version = "~1.2.2", features = ["defmt", "esp32c6", "unstable"] }
 
 
-defmt                  = "1.0.1"
+# `ip_in_core` is what makes `defmt` know how to print the `core::net` address types the network
+# stack hands back, which are the same types `core` uses.
+defmt                  = { version = "1.0.1", features = ["ip_in_core"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt", "esp32c6"] }
 
 critical-section = "1.2.0"
@@ -61,12 +65,45 @@ esp-backtrace = { version = "0.20.0", features = [
 ] }
 esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32c6"] }
 
+# The proof of concept: Wi-Fi.
+#
+# `esp-radio` drives the radio over SDIO on this chip, and needs three things this project did not
+# have before: a preemptive scheduler (`esp-rtos`), a heap (`esp-alloc`, which is why the firmware
+# is no longer heap-free), and an executor for the async API the driver exposes (`embassy`). The
+# TCP/IP stack that hands out the DHCP address is `embassy-net`, which runs on the same executor.
+esp-radio       = { version = "=1.0.0-beta.1", features = ["defmt", "esp32c6", "wifi"] }
+esp-rtos        = { version = "0.4.0", features = [
+  "defmt",
+  "embassy",
+  "esp-radio",
+  "esp32c6",
+] }
+esp-alloc       = { version = "0.11.0", features = ["esp32c6"] }
+embassy-executor = "0.10.0"
+embassy-net     = { version = "0.9.0", features = ["dhcpv4", "medium-ethernet"] }
+embassy-time    = "0.5.0"
+# `nightly` is what turns on `make_static!`, which is one of the reasons the toolchain is pinned
+# rather than left to track stable. The alternative is a hand-rolled macro around `StaticCell`, which
+# is what esp-hal's own examples do while their toolchain is stable.
+static_cell     = { version = "2.1.0", features = ["nightly"] }
+
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
 # The default debug profile is too slow and too big for resource-constrained devices.
 # Always build with some optimizations enabled.
 opt-level = "s"
+
+# The radio blobs are the one thing that does not work at "s": they need optimization level 2 or 3
+# whatever the profile says, and a connection that fails with no obvious reason is what you get
+# without this. It is a per-package override, so the rest of the debug build stays small.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+# Same reason, same override. Without this one the release build would be the profile where Wi-Fi
+# quietly does not work, which is the worst place for it to happen.
+[profile.release.package.esp-radio]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
