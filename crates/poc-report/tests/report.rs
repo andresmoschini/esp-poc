@@ -192,7 +192,7 @@ fn a_clock_pads_every_field_to_two_digits() {
 /// day. Wrapping is what makes the reading a shape rather than a measurement — it is wrong until
 /// there is a network time source, and pretending otherwise would be the part that misleads.
 #[test]
-fn a_clock_wraps_at_midnight() {
+fn a_clock_counting_from_boot_wraps_at_midnight() {
     assert_eq!(render(&Clock::since_boot(SECONDS_PER_DAY)), "00:00:00");
     assert_eq!(render(&Clock::since_boot(2 * SECONDS_PER_DAY)), "00:00:00");
     assert_eq!(
@@ -203,4 +203,149 @@ fn a_clock_wraps_at_midnight() {
     // The largest count of seconds there is, which is not a round number of days and so lands
     // wherever the arithmetic puts it — as long as it lands inside the day.
     assert_eq!(render(&Clock::since_boot(u64::MAX)), "07:00:15");
+}
+
+/// A real time carries the date, and not only because it is interesting: a clock that cannot say
+/// which day its hours belong to is half a clock, and the date is also what makes a reading that is
+/// a century out visible instead of plausible.
+#[test]
+fn a_synchronized_clock_carries_the_date() {
+    // The epoch itself, and the second after it: the boundary every count of seconds is measured
+    // from, and the one an off-by-one shows up on.
+    assert_eq!(render(&Clock::utc(0)), "1970-01-01 00:00:00");
+    assert_eq!(render(&Clock::utc(1)), "1970-01-01 00:00:01");
+}
+
+/// The last second of a day and the first of the next, in a year with a leap day in it: a count of
+/// seconds that is one out at the boundary is a clock that is wrong for an hour a day rather than
+/// one that is obviously broken.
+#[test]
+fn the_boundaries_of_a_day_are_where_they_are() {
+    let midnight = epoch_secs_of(2026, 10, 5);
+
+    assert_eq!(render(&Clock::utc(midnight - 1)), "2026-10-04 23:59:59");
+    assert_eq!(render(&Clock::utc(midnight)), "2026-10-05 00:00:00");
+    assert_eq!(
+        render(&Clock::utc(midnight + SECONDS_PER_DAY - 1)),
+        "2026-10-05 23:59:59"
+    );
+}
+
+/// February is 29 days in a leap year and 28 in the rest, and 2100 is the century that is divisible
+/// by four and is not a leap year. Those three facts are the whole of what a calendar gets wrong, so
+/// they are the three that are pinned: the day either side of each is the assertion, because a
+/// month length written into the arithmetic twice shows up as a date that is one day out.
+#[test]
+fn february_follows_the_leap_year_rule() {
+    assert_eq!(
+        render(&Clock::utc(epoch_secs_of(2024, 2, 29))),
+        "2024-02-29 00:00:00"
+    );
+    assert_eq!(
+        render(&Clock::utc(epoch_secs_of(2024, 3, 1))),
+        "2024-03-01 00:00:00"
+    );
+
+    // A century divisible by 400 is a leap year; one that is only divisible by four is not.
+    assert_eq!(
+        render(&Clock::utc(epoch_secs_of(2000, 2, 29))),
+        "2000-02-29 00:00:00"
+    );
+    assert_eq!(
+        render(&Clock::utc(epoch_secs_of(2100, 3, 1))),
+        "2100-03-01 00:00:00"
+    );
+}
+
+/// Every month of a year, which is the property that a month length is 30 or 31 and not 31 for all
+/// of them. One table rather than twelve tests, because the property is that the set is covered.
+#[test]
+fn every_month_has_the_length_it_has() {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut first = Clock::utc(epoch_secs_of(2025, 1, 1));
+
+    for (index, length) in LENGTHS.iter().enumerate() {
+        let month = index as u64 + 1;
+
+        assert!(
+            render(&first).starts_with(&format!("2025-{month:02}-01")),
+            "the first of month {month} rendered as {}",
+            render(&first),
+        );
+
+        // The last day of the month is the one the table names, and the first of the next month is
+        // the day after it — which is the whole claim being made here: the two are one day apart.
+        let last = Clock::utc(epoch_secs_of(2025, month, *length));
+        assert!(
+            render(&last).starts_with(&format!("2025-{month:02}-{length:02}")),
+            "the last of month {month} rendered as {}",
+            render(&last),
+        );
+
+        first = Clock::utc(epoch_secs_of(2025, month, *length) + SECONDS_PER_DAY);
+    }
+
+    assert_eq!(
+        render(&first),
+        "2026-01-01 00:00:00",
+        "after December comes January"
+    );
+}
+
+/// A count of seconds no calendar has is not a time any server would send, but it is one the firmware
+/// can be handed — from a packet that passed every other check — and printing it has to produce a
+/// date rather than an overflow panic. A panic here would be in the greeting, twice a second, and it
+/// would take the firmware down.
+#[test]
+fn an_impossible_epoch_renders_rather_than_overflowing() {
+    // The largest count there is, which in a debug build is where an unchecked addition would panic
+    // rather than wrap. The year is absurd; the point is that the arithmetic gets to the formatting.
+    let absurd = render(&Clock::utc(u64::MAX));
+
+    assert!(
+        absurd.starts_with("584"),
+        "the year is finite even though the date is absurd: {absurd}"
+    );
+    assert!(
+        absurd.contains('-') && absurd.contains(':'),
+        "a date and a time rather than a panic: {absurd}"
+    );
+}
+
+/// Days counted between two dates rather than one date at a time, because a wrong year length shows
+/// up as a whole day out and nothing else: 1970-01-01 to 2000-01-01 is 10 957 days, and 2000-01-01
+/// to 2026-10-04 is 9 773.
+#[test]
+fn days_are_counted_between_dates() {
+    assert_eq!(
+        render(&Clock::utc(10_957 * SECONDS_PER_DAY)),
+        "2000-01-01 00:00:00"
+    );
+
+    let two_thousand = 10_957 * SECONDS_PER_DAY;
+    let today = two_thousand + 9_773 * SECONDS_PER_DAY;
+
+    assert_eq!(render(&Clock::utc(today)), "2026-10-04 00:00:00");
+}
+
+/// Seconds since the epoch for a date, written the slow way.
+///
+/// This is the one piece of arithmetic in this file that does not use the implementation under test:
+/// the days in each month and the leap-year rule applied by hand, so that a mistake in
+/// `poc_report::Clock` cannot also be present in the thing that checks it.
+fn epoch_secs_of(year: u64, month: u64, day: u64) -> u64 {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut days = 0;
+    for past in 1970..year {
+        days += 365 + u64::from(past % 4 == 0 && (past % 100 != 0 || past % 400 == 0));
+    }
+    for length in LENGTHS.iter().take(month as usize - 1) {
+        days += length;
+    }
+    days += u64::from(month > 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    days += day - 1;
+
+    days * SECONDS_PER_DAY
 }

@@ -1,23 +1,30 @@
-//! What the firmware has to say, decided here and printed there.
+//! What the firmware decides for itself, decided here so that something can check it.
 //!
-//! Three decisions live in this crate. The first is how an address is written: the greeting in
-//! `src/bin/main.rs` and the report in `src/wifi.rs` both print one, and they used to be two pieces of
-//! formatting that could drift apart. The second is what a failed join says: the radio names about
-//! fifty reasons, and printing its own words for them answers the question "what did the hardware say"
-//! rather than the question an operator is asking, which is what to do next. The third is how the
-//! chip's idea of the time of day is written, which is a sentence with arithmetic in it and so is
-//! just as easy to get subtly wrong.
+//! Four decisions live in this crate, and every one of them is one the firmware would otherwise get
+//! subtly wrong and nobody would notice until it mattered:
+//!
+//! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/wifi.rs`
+//!   both print one, and they used to be two pieces of formatting that could drift apart.
+//! - What a failed join says. The radio names about fifty reasons, and printing its own words for
+//!   them answers the question "what did the hardware say" rather than the question an operator is
+//!   asking, which is what to do next.
+//! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
+//!   that cannot be checked by looking at it, and this is the only part of the firmware that knows
+//!   what day it is.
+//! - What an SNTP packet means. A packet off the network is untrusted input, and a 48-byte header
+//!   of offsets is exactly the sort of thing that is right in the common case and wrong in 2036.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
-//! `src/wifi.rs` and `src/bin/main.rs` both depend on `esp-hal`, which exists only for this chip, so
-//! neither of them can be compiled for a host — and a test on a microcontroller needs a board or a
-//! simulator, which the gate does not have. This crate is `#![no_std]` with no dependencies, so it
-//! builds for the chip and for the host alike, and `tests/report.rs` runs on whichever machine is
-//! running the gate.
+//! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs` and `src/bin/main.rs` all depend on `esp-hal` or on
+//! the network stack above it, which exist only for this chip, so none of them can be compiled for a
+//! host — and a test on a microcontroller needs a board or a simulator, which the gate does not
+//! have. This crate is `#![no_std]` with no dependencies, so it builds for the chip and for the host
+//! alike, and `tests/report.rs` and `tests/ntp.rs` run on whichever machine is running the gate.
 //!
-//! It knows nothing about Wi-Fi. `esp_radio::wifi::DisconnectReason` is translated into a [`Reason`]
-//! in `src/wifi.rs`, which is the only file allowed to depend on the radio, so that a change in the
-//! driver costs that one match arm rather than this crate's API.
+//! It knows nothing about Wi-Fi or about the network stack. `esp_radio::wifi::DisconnectReason` is
+//! translated into a [`Reason`] in `src/wifi.rs`, and an SNTP packet is read in the firmware and
+//! handed here as bytes, so that a change in either driver costs that one file rather than this
+//! crate's API.
 
 #![no_std]
 
@@ -120,44 +127,369 @@ fn write_reason(reason: Reason) -> &'static str {
     }
 }
 
-/// Seconds in a day, which is as far as this clock goes before it starts again.
+/// Seconds in a day, which is as far as [`Clock::SinceBoot`] goes before it starts again.
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// The time of day, counted from the moment the chip booted.
+/// What the firmware believes the time is, and where that belief comes from.
 ///
-/// This chip has no battery-backed clock, so nothing on it knows what time it is: the only clock
-/// available is the scheduler's, and it starts at zero when the firmware starts and stops when the
-/// power goes. Reading it anyway is what makes it obvious what is missing — a wall clock needs a
-/// network time source over a link that is not up yet — and the greeting is where that belongs.
-///
-/// It is therefore written as a time of day and it is wrong by design. [`Clock::since_boot`] wraps
-/// at midnight rather than counting hours forever, so the reading is a shape and not a measurement;
-/// nothing that wants real time has it yet.
+/// The two variants are different in kind and the difference is the point of the type. There is no
+/// battery-backed clock on this chip, so [`Self::SinceBoot`] is the only reading it can make on its
+/// own: the scheduler's counter, which starts at zero when the firmware starts. A real time has to
+/// come from the network, and until one has arrived the two are told apart by their shape rather
+/// than by anything else, which is why [`Self::Utc`] prints a date and this one does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Clock {
-    /// Whole seconds of running time, counted by the chip since boot.
-    since_boot_secs: u64,
+pub enum Clock {
+    /// How long the chip has been running, wrapped into a day.
+    ///
+    /// This is not a time of day and is not meant to read like one. It is written as `HH:MM:SS`
+    /// because that is the shape a reader of a serial log is looking for, and it wraps at midnight
+    /// rather than counting hours forever so that it cannot be mistaken for a clock that stopped.
+    SinceBoot(u64),
+
+    /// A time of day in UTC, as a count of seconds since the Unix epoch.
+    ///
+    /// UTC and nothing else: this is what a network time source hands out, and a reading that
+    /// disagrees with it by a timezone has been adjusted by somebody, which is not this crate's
+    /// business. The count is unsigned because a time before 1970 is not a time this can print,
+    /// and an SNTP server that reports one is refused rather than rendered — see [`sntp_reply`].
+    Utc(u64),
 }
 
 impl Clock {
-    /// The reading the chip can actually make, from how long it has been running.
+    /// The reading the chip can make on its own, from how long it has been running.
     ///
     /// The arithmetic happens when the reading is printed rather than here, so there is no way for a
     /// half-computed time of day to exist: there is a number of seconds and nothing else.
     #[must_use]
     pub const fn since_boot(since_boot_secs: u64) -> Self {
-        Self { since_boot_secs }
+        Self::SinceBoot(since_boot_secs)
+    }
+
+    /// A real time, from a count of seconds since 1970-01-01T00:00:00Z.
+    #[must_use]
+    pub const fn utc(epoch_secs: u64) -> Self {
+        Self::Utc(epoch_secs)
     }
 }
 
 impl fmt::Display for Clock {
-    /// `HH:MM:SS`, zero-padded so the field widths do not jump around in a log that prints this
-    /// twice a second.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let today = self.since_boot_secs % SECONDS_PER_DAY;
+        match self {
+            Self::SinceBoot(since_boot_secs) => {
+                let today = since_boot_secs % SECONDS_PER_DAY;
 
-        let (hours, minutes, seconds) = (today / 3600, today / 60 % 60, today % 60);
+                let (hours, minutes, seconds) = (today / 3600, today / 60 % 60, today % 60);
 
-        write!(f, "{hours:02}:{minutes:02}:{seconds:02}")
+                write!(f, "{hours:02}:{minutes:02}:{seconds:02}")
+            }
+            // A date as well as a time: a clock that cannot say which day the hours belong to is
+            // half a clock, and the date is the part that catches a reading that is a century out.
+            Self::Utc(epoch_secs) => {
+                let civil = civil(*epoch_secs);
+
+                write!(
+                    f,
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
+                )
+            }
+        }
     }
+}
+
+/// A date and a time of day, as the plain numbers that are written down.
+///
+/// Every field is a `u64` rather than the smallest type that holds it, so that turning a count of
+/// seconds into this is arithmetic and not a pile of conversions: `clippy`'s `cast_possible_truncation`
+/// fires on a cast that is provably in range, and the arithmetic below is easier to check for
+/// correctness than a cast is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Civil {
+    year: u64,
+    month: u64,
+    day: u64,
+    hour: u64,
+    minute: u64,
+    second: u64,
+}
+
+/// The proleptic Gregorian date and time of a count of seconds since the Unix epoch.
+///
+/// Howard Hinnant's `civil_from_days`, which is the arithmetic every calendar library ends up
+/// containing: 1970-01-01 falls 719 468 days into a cycle of 146 097 days that starts on
+/// 0000-03-01, a cycle is 400 years, and the year within one follows from the day within the year.
+///
+/// It is here rather than in the firmware because it is arithmetic that cannot be checked by
+/// looking at it. Month lengths and leap years are exactly the sort of thing that is right in the
+/// common cases and wrong in February, and `tests/report.rs` pins the ends of each of them.
+fn civil(epoch_secs: u64) -> Civil {
+    let seconds_of_day = epoch_secs % SECONDS_PER_DAY;
+
+    // 0000-03-01 is 719 468 days after 1970-01-01, which puts the epoch inside a 400-year cycle
+    // rather than at the start of one. Every count here is of a day count, and every one of them
+    // is of a non-negative number: this is only ever called with seconds since 1970.
+    let days = epoch_secs / SECONDS_PER_DAY + 719_468;
+
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+
+    // [0, 399], skipping the leap day that ends a century which is not a leap year itself.
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+
+    // [0, 365]
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+
+    // Counting months from March, which is what makes the leap day the last day of the year and
+    // removes every special case. [0, 11]
+    let month_of_year = (5 * day_of_year + 2) / 153;
+
+    let day = day_of_year - (153 * month_of_year + 2) / 5 + 1;
+    let month = if month_of_year < 10 {
+        month_of_year + 3
+    } else {
+        month_of_year - 9
+    };
+
+    // The year of the era runs from March, so January and February belong to the year after it.
+    let year = year + u64::from(month <= 2);
+
+    Civil {
+        year,
+        month,
+        day,
+        hour: seconds_of_day / 3600,
+        minute: seconds_of_day / 60 % 60,
+        second: seconds_of_day % 60,
+    }
+}
+
+/// The size of an SNTP packet: the 48-byte header of RFC 5905, with no extension fields and no
+/// authentication. A plain client sends exactly this much and a plain server answers with the same
+/// amount, which is why the receive buffer in `src/ntp.rs` is larger rather than equal: a server is
+/// allowed to send more, and a buffer that is exactly the header length drops the whole datagram.
+pub const SNTP_LEN: usize = 48;
+
+/// The leap indicator, the protocol version and the mode, packed into the first byte of the header.
+const LI_VN_MODE: usize = 0;
+
+/// How many steps the server is from a reference clock, at offset one.
+const STRATUM: usize = 1;
+
+/// Where a client puts its own timestamp, and where a server puts the time it is answering with.
+const TRANSMIT: usize = 40;
+
+/// Where a server echoes the client's timestamp back at it.
+const ORIGINATE: usize = 24;
+
+/// Mode 3: a client asking for the time.
+const MODE_CLIENT: u8 = 3;
+
+/// Mode 4: a server answering.
+const MODE_SERVER: u8 = 4;
+
+/// Version 4 of the protocol, which is the version this client speaks.
+const VERSION_4: u8 = 4;
+
+/// Seconds between the two epochs: 1900-01-01T00:00:00Z is 2 208 988 800 seconds before
+/// 1970-01-01T00:00:00Z, and an NTP timestamp counts from the first of those.
+const NTP_TO_UNIX: u64 = 2_208_988_800;
+
+/// The 48 bytes that ask a server what time it is.
+///
+/// `nonce` goes in the low half of the transmit timestamp and nowhere else. It is not a time — the
+/// chip has no time yet, which is the whole reason for the exchange — it is a value the server has
+/// to echo, so that a packet which did not answer *this* request can be told apart from one that
+/// did. See [`sntp_reply`].
+#[must_use]
+pub fn sntp_request(nonce: u32) -> [u8; SNTP_LEN] {
+    let mut packet = [0; SNTP_LEN];
+
+    // Version 4 and mode 3. The leap indicator stays at zero, which is the honest value for a
+    // client that has no clock: there is no leap second to warn about, because there is no time.
+    packet[LI_VN_MODE] = VERSION_4 << 3 | MODE_CLIENT;
+    packet[TRANSMIT + 4..TRANSMIT + 8].copy_from_slice(&nonce.to_be_bytes());
+
+    packet
+}
+
+/// What a time server said, once its packet has been read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answer {
+    /// Seconds since the Unix epoch, which is 1970-01-01T00:00:00Z.
+    ///
+    /// Not adjusted, and the reason is worth writing down: NTP counts in a timescale that includes
+    /// leap seconds and the Unix epoch does not, so the two disagree by however many leap seconds
+    /// have been inserted since 1972 — 27 when this was written, and the count only goes up. This
+    /// firmware prints what the wire says rather than guessing at the correction, because a firmware
+    /// that subtracts 27 on the strength of a number it read somewhere ages badly: the next leap
+    /// second makes it wrong, and nothing here would notice.
+    pub epoch_secs: u64,
+
+    /// How many steps the server is from a reference clock: one is a clock that is itself a
+    /// reference, such as an atomic clock or a GPS receiver, and each step above that is a machine
+    /// that took its time from one of those.
+    ///
+    /// There is no useful threshold to compare this against, and a firmware that invented one would
+    /// be guessing. What it is good for is noticing that it changed.
+    pub stratum: u8,
+
+    /// What the server says about leap seconds.
+    pub leap: Leap,
+}
+
+/// What a server says about leap seconds, in the two bits at the top of the packet's first byte.
+///
+/// Nothing is done with it: a leap second is a repeated or skipped second at the end of a UTC day,
+/// and a device whose use for its time is printing it will not notice either. It is read because it
+/// shares a byte with the version and the mode, and because "a leap second is pending tonight" is
+/// worth having in the log on the day the log looks wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leap {
+    /// No leap second is pending.
+    Normal,
+
+    /// The last minute of the day has 61 seconds: one is being added.
+    Inserted,
+
+    /// The last minute of the day has 59 seconds: one is being removed.
+    Deleted,
+}
+
+impl fmt::Display for Leap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Normal => "no leap second pending",
+            Self::Inserted => "a leap second is being added at the end of the day",
+            Self::Deleted => "a leap second is being removed at the end of the day",
+        })
+    }
+}
+
+/// Why an SNTP packet could not be turned into a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Fewer bytes than a header, so there is nothing to read.
+    Short,
+
+    /// The mode says this is not a reply to a client.
+    NotAReply,
+
+    /// The version is not one this client speaks.
+    Version,
+
+    /// Stratum 0, which is not a server that cannot answer: it is a server explaining why it will
+    /// not, in four characters of ASCII at offset twelve.
+    KissOfDeath,
+
+    /// A stratum above 15, which is not a stratum in any version of the protocol.
+    NotAServer,
+
+    /// The leap indicator says the server does not consider itself synchronized to anything.
+    Unsynchronized,
+
+    /// The packet does not echo the nonce that was sent, so it answers some other request or
+    /// repeats one that was already answered.
+    NotOurs,
+
+    /// The timestamp is all ones, which is how a server writes down that it has no time.
+    NoTime,
+
+    /// The time is before 1970, so there is no epoch to count from.
+    BeforeTheEpoch,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Short => "the packet is shorter than an SNTP header",
+            Self::NotAReply => "the packet is not a reply to a client",
+            Self::Version => "the packet is a version of SNTP this client does not speak",
+            Self::KissOfDeath => "the server will not answer this client",
+            Self::NotAServer => "the packet names a stratum no version of SNTP has",
+            Self::Unsynchronized => "the server says it is not synchronized to anything",
+            Self::NotOurs => "the packet is not an answer to this client's request",
+            Self::NoTime => "the server's packet carries no time",
+            Self::BeforeTheEpoch => {
+                "the server's time is before 1970, so there is no epoch to count it from"
+            }
+        })
+    }
+}
+
+/// Reads a reply to [`sntp_request`] and says what time it claims.
+///
+/// The checks run in the order a server would fail them, and each is a [`Refusal`] with its own
+/// sentence rather than a number: a packet off the network is untrusted input, and "the stratum is
+/// 200" does not answer "why". A refusal is not an error to recover from — the caller tries another
+/// server — which is why a wrong guess about which rule was broken is worse than admitting one was.
+///
+/// `nonce` must be the one that went into the request. Every reply that arrives on an open UDP port
+/// is checked against it, because the only thing that distinguishes this server's answer to this
+/// device's question from a packet that was already in flight is that it echoes what was sent.
+///
+/// # Errors
+///
+/// A [`Refusal`], which is one of three things: the packet is not a reply at all, the reply is one
+/// this client cannot use — the wrong version, a stratum that means no, a server that says its own
+/// clock is unsynchronized, or a timestamp that is not a time — or the reply answers some other
+/// request. The caller has nothing to do with the packet in any of those cases but wait and ask
+/// again, which is why the refusal is a named reason rather than an error to inspect.
+pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
+    let header = packet.get(..SNTP_LEN).ok_or(Refusal::Short)?;
+
+    let first = header[LI_VN_MODE];
+
+    if first & 0b0000_0111 != MODE_SERVER {
+        return Err(Refusal::NotAReply);
+    }
+
+    if first >> 3 & 0b0000_0111 != VERSION_4 {
+        return Err(Refusal::Version);
+    }
+
+    // Stratum 1 is a reference clock and 15 is the furthest a server may be from one. Anything
+    // outside that range is either a refusal in its own right or not a stratum at all.
+    let stratum = header[STRATUM];
+    match stratum {
+        0 => return Err(Refusal::KissOfDeath),
+        1..=15 => {}
+        _ => return Err(Refusal::NotAServer),
+    }
+
+    // The two bits above the version say whether the server considers its own clock sound, and a
+    // server that says it does not is not a source of time however plausible its packet looks.
+    let leap = match first >> 6 {
+        0 => Leap::Normal,
+        1 => Leap::Inserted,
+        2 => Leap::Deleted,
+        _ => return Err(Refusal::Unsynchronized),
+    };
+
+    let request = sntp_request(nonce);
+    if header[ORIGINATE..ORIGINATE + 8] != request[TRANSMIT..TRANSMIT + 8] {
+        return Err(Refusal::NotOurs);
+    }
+
+    let mut timestamp = [0; 8];
+    timestamp.copy_from_slice(&header[TRANSMIT..TRANSMIT + 8]);
+    let seconds_since_1900 = u64::from_be_bytes(timestamp);
+
+    if seconds_since_1900 == u64::MAX {
+        return Err(Refusal::NoTime);
+    }
+
+    // All eight bytes are the count of seconds: the top half is which 136-year era of NTP time this
+    // is, so reading only the bottom four — as a 32-bit implementation has to — is what makes a
+    // reading wrong in 2036 rather than before it.
+    let epoch_secs = seconds_since_1900
+        .checked_sub(NTP_TO_UNIX)
+        .ok_or(Refusal::BeforeTheEpoch)?;
+
+    Ok(Answer {
+        epoch_secs,
+        stratum,
+        leap,
+    })
 }

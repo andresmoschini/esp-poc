@@ -33,8 +33,11 @@ wokwi
 
 # What the proof of concept speaks over the air
 authmode
+datagram
 dhcp
 dhcpv4
+hinnant
+ntp
 rssi
 smoltcp
 sntp

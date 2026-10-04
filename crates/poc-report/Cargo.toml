@@ -1,9 +1,10 @@
 # The part of the firmware that does not talk to hardware, in a crate of its own so that it can be
 # tested where tests run.
 #
-# It is a separate crate because `src/wifi.rs` and `src/bin/main.rs` cannot be compiled for a host at
-# all: both depend on `esp-hal`, which exists only for this chip, and both are `#![no_std]`. Anything
-# worth testing therefore has to be in something that builds without them, and this is it.
+# It is a separate crate because nothing in `src/` can be compiled for a host at all: every module
+# there depends on `esp-hal`, on the network stack, or on a scheduler, all of which exist only for
+# this chip, and they are `#![no_std]`. Anything worth testing therefore has to be in something that
+# builds without them, and this is it.
 #
 # It has no dependencies, deliberately — not even `defmt`. The firmware logs what this crate decides
 # through `defmt`'s `Display2Format`, and the alternative was a `defmt::Format` derive, whose output

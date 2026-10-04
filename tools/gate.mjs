@@ -220,9 +220,9 @@ export const GATE = [
   {
     name: "test-firmware",
     // The tests that belong to the firmware rather than to the gate, run where they can run: on the
-    // host. `src/wifi.rs` and `src/bin/main.rs` cannot be tested at all, because compiling either one
-    // for a host pulls in `esp-hal` and fails; the logic that does not touch hardware lives in
-    // `crates/poc-report` precisely so that this step has something to run.
+    // host. Nothing in `src/` can be tested at all, because compiling any of it for a host pulls in
+    // `esp-hal` and fails; the logic that does not touch hardware lives in `crates/poc-report`
+    // precisely so that this step has something to run.
     //
     // It is the one step whose command is not written out here, because `[build] target` in
     // `.cargo/config.toml` sends `cargo test` to the microcontroller and the way back is a `--target`

@@ -8,18 +8,21 @@ Firmware proof of concept for the Espressif **ESP32-C6**, in bare-metal Rust: `#
 ## What it does right now
 
 Bring up the HAL at maximum CPU clock, take the pins the module reserves so they cannot be used by
-accident, then join a Wi-Fi network and print the address DHCP hands out — next to the time of day,
-twice a second, which keeps printing while the radio does its work.
+accident, then join a Wi-Fi network, print the address DHCP hands out, and set the clock from an
+SNTP server over that network — next to a greeting every 500 ms that shows the time as it stands.
 
-There is no battery-backed clock on this chip, so the time it prints is how long it has been running
-since boot, written as `HH:MM:SS` and wrapped at midnight. It is wrong until something sets it,
-which is the thing the next step of the proof of concept is for.
+The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
+clock, so before that the greeting prints how long it has been running since boot, wrapped into a
+day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and a reading
+with a date came from a server. The time lives in RAM, so every boot asks again. `src/ntp.rs` is the
+client; `src/clock.rs` is the one number it sets.
 
 Wi-Fi is [`esp-radio`](https://docs.espressif.com/projects/rust/esp-radio/latest/), which on this
 chip is a device on the internal SDIO bus: there are no pins to choose. It needs a preemptive
 scheduler (`esp-rtos`) and a heap, which is why the firmware is no longer heap-free, and the TCP/IP
 stack that turns a joined network into an address (`embassy-net`). `src/wifi.rs` has the whole
-sequence; `src/bin/main.rs` is the entry point that starts it.
+sequence up to the network; `src/ntp.rs` and `src/clock.rs` are what the network is for;
+`src/bin/main.rs` is the entry point that starts them and prints the result.
 
 That is still scaffolding. The point of the repository is that the scaffolding is now somewhere you
 can build something without first deciding how, and that whatever you build is checked by something
@@ -105,7 +108,8 @@ an access point, so none of the following is a claim this repository makes:
 - that the chip associates with an access point at all;
 - that the password is accepted rather than merely sent;
 - that DHCP returns an address, and which one;
-- that the stack keeps running, and reconnects when the link drops.
+- that the stack keeps running, and reconnects when the link drops;
+- that the time server answers, or that the clock it sets is right.
 
 What _is_ verified is the part the gate can see: it builds for the chip in both profiles, and it is
 lint-clean. The credentials are compiled in from `.cargo/local.toml`, and nothing checks that they
@@ -117,15 +121,16 @@ Two test steps, and the difference between them is the whole story:
 
 - `test` runs the tests of this repository's own automation, in Node.
 - `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
-  that decides rather than talks to hardware: how an address is written, and what a failed join
-  says.
+  that decides rather than talks to hardware: how an address and a time are written, what a failed
+  join says, and what an SNTP packet means.
 
-The split is not a preference. `src/wifi.rs` and `src/bin/main.rs` both depend on `esp-hal`, which
-exists only for this chip, so neither can be compiled for a host at all — a test on them needs a
-board. Anything testable therefore has to be in something that builds without them, which is what
-`crates/poc-report` is for, and what makes `poc-report` the only crate in the tree with no
-dependencies of its own. Logic that belongs next to hardware rather than in that crate is untested,
-and stays that way until a board or a simulator can run it.
+The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs` and `src/bin/main.rs` all
+depend on `esp-hal`, on the network stack, or on a scheduler that exists only for this chip, so none
+of them can be compiled for a host at all — a test on them needs a board. Anything testable
+therefore has to be in something that builds without them, which is what `crates/poc-report` is for,
+and what makes `poc-report` the only crate in the tree with no dependencies of its own. Logic that
+belongs next to hardware rather than in that crate is untested, and stays that way until a board or
+a simulator can run it.
 
 ## The gate
 
@@ -145,9 +150,11 @@ step fails, how to add one, and which files esp-generate will overwrite.
 | Path                                | Owns                                                                   |
 | ----------------------------------- | ---------------------------------------------------------------------- |
 | `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it      |
-| `src/wifi.rs`                       | the proof of concept: join a network over DHCP and print the address   |
+| `src/wifi.rs`                       | join a network over DHCP, and print the address                        |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer  |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from       |
 | `src/lib.rs`                        | the crate root, and which nightly features the firmware needs          |
-| `crates/poc-report/`                | what the firmware says about the network — the only part with tests    |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests          |
 | `build.rs`                          | linker scripts, and what to do about each undefined symbol             |
 | `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy |
 | `Cargo.toml`                        | dependencies and the `[lints]` the gate enforces                       |

@@ -1,7 +1,9 @@
 //! Firmware for the `esp32c6` proof of concept.
 //!
-//! The proof of concept is [`wifi`]: the binary in `src/bin/main.rs` brings the chip up and hands
-//! over to it. Nothing in this crate is a reusable library.
+//! The proof of concept is the network and then the time: [`wifi`] brings up the radio and hands
+//! back a stack, [`ntp`] asks a time server what time it is over that stack, and [`clock`] is where
+//! the answer is kept. The binary in `src/bin/main.rs` starts the first and prints the third. Nothing
+//! in this crate is a reusable library.
 
 #![no_std]
 // `static_cell::make_static!` is built out of `impl Trait` in a type alias, which is what the pinned
@@ -9,4 +11,6 @@
 // `StaticCell` dance that esp-hal's own examples do.
 #![feature(type_alias_impl_trait)]
 
+pub mod clock;
+pub mod ntp;
 pub mod wifi;

@@ -16,14 +16,16 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::main;
 use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
-use poc_report::{Address, Clock};
+use poc_report::Address;
+
+use esp_poc::clock;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -67,18 +69,21 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    // Join the network in the background. The stack is what the next step of the proof of concept
-    // needs — an SNTP request over it — and `None` here only means there were no credentials in the
-    // environment this was compiled from. It is `Copy`, so the loop below can read the address out
-    // of it without taking it away from whoever needs it next.
+    // Join the network in the background. The stack is what the greeting below reads the address
+    // out of, and it is `Copy`, so handing a copy to the SNTP client below leaves it here.
     let stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
 
+    // With a network, ask a time server over it what time it is. That runs in its own task and needs
+    // no answer from here: until one arrives, the greeting prints how long the chip has been up.
+    if let Some(stack) = stack {
+        esp_poc::ntp::sync(spawner, stack);
+    }
+
     loop {
-        // The chip has no battery-backed clock, so the only time it can tell is how long it has been
-        // running. Printing it next to the greeting is what shows what is still missing: a time that
-        // counts from boot rather than from midnight. `poc-report` does the arithmetic and the
-        // wrapping, and `tests/report.rs` checks them where they can actually be run.
-        let now = Clock::since_boot(Instant::now().as_secs());
+        // The chip has no battery-backed clock, so this is the time of day a time server gave it,
+        // and how long it has been running instead until one did. The reading says which of the two
+        // it is: a date means the server answered, and `HH:MM:SS` on its own means it has not.
+        let now = clock::now();
 
         // Reading the configuration is a lookup, not a wait: it answers with whatever DHCP has
         // produced so far, and with nothing until it has. That is why this loop is not blocked on

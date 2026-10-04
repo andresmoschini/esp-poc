@@ -13,8 +13,9 @@
 //!
 //! Nothing here waits for the network: [`join`] starts three tasks and returns, so the firmware
 //! keeps doing whatever it was doing while the radio does its work in the background. What
-//! `join` returns is the handle to the network stack, which is what a later step needs — an SNTP
-//! request, say — and which is `Copy`, so a task can take its own copy of it.
+//! `join` returns is the handle to the network stack, which is what the rest of the firmware needs
+//! — an SNTP client runs on it, in [`crate::ntp`] — and which is `Copy`, so a task can take its own
+//! copy of it.
 //!
 //! ## Credentials
 //!
@@ -51,9 +52,14 @@ const RETRY: Duration = Duration::from_secs(5);
 /// How many access points to name when a connection attempt fails.
 const NEIGHBORS: usize = 10;
 
-/// Sockets the network stack is sized for. The proof of concept opens none — DHCP does not use
-/// one — but the stack's storage is static and has to be sized for something.
-const SOCKETS: usize = 3;
+/// Sockets the network stack is sized for.
+///
+/// Three of them are taken before anything in this file asks for one: DHCP takes a socket when the
+/// stack is first configured, the DNS resolver takes one when the stack is built, and the SNTP
+/// client in `src/ntp.rs` takes the third. The fourth is the point — `smoltcp`'s socket set is a
+/// fixed-size array that panics when it is full rather than refusing the socket that does not fit,
+/// so this is the number that decides whether the next thing to want a socket works at all.
+const SOCKETS: usize = 4;
 
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///

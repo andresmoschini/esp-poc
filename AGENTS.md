@@ -191,13 +191,16 @@ part of the reasoning; read them before changing what reads what.
 
 - **The firmware has no test target of its own**, because a bare-metal `#![no_std]` `#![no_main]`
   binary has no test harness to build — `cargo clippy --all-targets` was measured failing with
-  `can't find crate for test`. `src/wifi.rs` and `src/bin/main.rs` cannot be compiled for a host
-  either, since both depend on `esp-hal`, so a test on them needs a board. What _is_ testable is the
-  part that decides rather than talks to hardware, and it lives in `crates/poc-report` so that the
-  gate's `test-firmware` step can run it on the host: no dependencies, `#![no_std]`, buildable for
-  both targets. **Put logic there when it is worth testing, and expect it not to be there** — logic
-  that needs the radio stays in `src/wifi.rs` untested, because moving it would mean moving the
-  hardware it is about.
+  `can't find crate for test`. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs` and `src/bin/main.rs`
+  cannot be compiled for a host either, since all four depend on `esp-hal`, on the network stack, or
+  on a scheduler that exists only for this chip, so a test on them needs a board. What _is_ testable
+  is the part that decides rather than talks to hardware, and it lives in `crates/poc-report` so
+  that the gate's `test-firmware` step can run it on the host: no dependencies, `#![no_std]`,
+  buildable for both targets. **Put logic there when it is worth testing, and expect it not to be
+  there** — logic that needs the radio stays in `src/wifi.rs` untested, and logic that needs a
+  socket or a clock stays in `src/ntp.rs` untested, because moving either would mean moving the
+  hardware it is about. What has moved out is what neither needs: the calendar arithmetic and the
+  SNTP header.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

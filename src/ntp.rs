@@ -1,0 +1,259 @@
+//! Ask a time server what time it is, and set the chip's clock from the answer.
+//!
+//! SNTP is a request and a reply over UDP port 123, and the reply is a 48-byte header that says
+//! what time the server thinks it is. There is no library for it here on purpose: the whole protocol
+//! as a plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and
+//! the parts of it that are worth checking — the offsets, the 1900 epoch, a reply that is not an
+//! answer to this request — are all decisions that a host can make and a board cannot test. Those
+//! are in `poc-report`; this file is the part that needs a network.
+//!
+//! The clock this sets does not survive a power cycle, because there is nowhere on this chip to put
+//! it that would. That is why the task keeps going after the first answer rather than stopping:
+//! every boot starts at zero again and has to ask again.
+
+use core::fmt;
+use core::net::Ipv4Addr;
+
+use defmt::{error, info, warn};
+use embassy_executor::Spawner;
+use embassy_net::dns::DnsQueryType;
+use embassy_net::udp::{PacketMetadata, RecvError, SendError, UdpSocket};
+use embassy_net::{IpAddress, Stack};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
+use poc_report::{Answer, Clock, Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
+
+use crate::clock;
+
+/// The server to ask. `pool.ntp.org` is the pool the RFC's own examples use: anycast, so the
+/// address that comes back is one of many and any of them will do.
+///
+/// Overridable at build time, because a network that does not reach the pool is common and the
+/// alternative to an override is a firmware that cannot be pointed at a server on the local network.
+const SERVER: &str = match option_env!("NTP_SERVER") {
+    Some(server) => server,
+    None => "pool.ntp.org",
+};
+
+/// Port 123, which is the only port an NTP server answers on, and the only one this sends to.
+const PORT: u16 = 123;
+
+/// How long any single step of the exchange may take.
+///
+/// Each step is timed separately rather than the exchange as a whole, so that a log that says
+/// "timed out" also says which of them did: a name that does not resolve and a reply that does not
+/// arrive are different problems, and the retry below is the same either way.
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait before asking again after a server has answered.
+///
+/// Once an hour is frequent enough that a chip left running overnight is still within a second or
+/// two by morning, and rare enough that a proof of concept is not talking to the pool more than it
+/// needs to.
+const RESYNC: Duration = Duration::from_secs(60 * 60);
+
+/// How long to wait before asking again after one did not.
+///
+/// Fifteen seconds, so a server that is merely slow is retried while the person watching the log is
+/// still watching it. Every step above has its own timeout, so this is the floor on how fast a
+/// broken network can be asked in a loop.
+const RETRY: Duration = Duration::from_secs(15);
+
+/// Receive slots for the socket's metadata. One is enough for the one server this talks to, and the
+/// second costs a few bytes.
+const SLOTS: usize = 2;
+
+/// The receive buffer, which has to be larger than [`SNTP_LEN`].
+///
+/// A server is allowed to answer with more than a bare header — extension fields, or the
+/// authentication of a newer specification — and `embassy_net` drops a datagram that does not fit
+/// rather than truncating it. A buffer the size of the header would therefore throw away exactly
+/// the replies this cannot do anything with, and 256 bytes holds every packet a plain server sends.
+const RX_LEN: usize = 256;
+
+/// Keeps the chip's clock within a drift of real time, for as long as the network is up.
+///
+/// Nothing is returned and nothing is waited for: the whole client is one task, spawned from
+/// `main` once the network stack exists, and every attempt inside it is bounded by a timeout of its
+/// own. A network that never comes up costs this task nothing but its own waiting.
+///
+/// # Panics
+///
+/// If the executor has no room left for another task. It is allocated once, at boot, so this is a
+/// fact about the size of the task pool rather than something that can happen later.
+pub fn sync(spawner: Spawner, stack: Stack<'static>) {
+    // Opened here rather than inside the task below. `make_static!` builds its type out of
+    // `impl Trait`, and a task's body is itself an opaque type to the compiler, so one inside the
+    // other is a cycle it cannot resolve (`error[E0391]`). A plain function has no such future.
+    let socket = open(stack);
+
+    spawner.spawn(keep_in_time(stack, socket).expect("keep_in_time is a task"));
+}
+
+/// Opens the one socket this client uses.
+///
+/// The buffers are statics behind `make_static!` because the socket borrows them for as long as it
+/// lives, and it is opened once for the whole life of the firmware: `embassy_net` has a fixed number
+/// of sockets and a socket set that is full panics rather than refusing, so a socket opened per
+/// attempt would be a client that works once and then stops.
+fn open(stack: Stack<'static>) -> UdpSocket<'static> {
+    let mut socket = UdpSocket::new(
+        stack,
+        static_cell::make_static!([PacketMetadata::EMPTY; SLOTS]),
+        static_cell::make_static!([0; RX_LEN]),
+        static_cell::make_static!([PacketMetadata::EMPTY; SLOTS]),
+        static_cell::make_static!([0; SNTP_LEN]),
+    );
+
+    // Bound once, to an ephemeral port, because a socket that has never been bound cannot send: the
+    // port it would send from is the one the reply has to come back to, and zero is not a port.
+    // `0` is the stack's way of saying "any free port", which is also what every NTP client wants —
+    // the server answers to wherever the request came from rather than to a fixed port.
+    socket
+        .bind(0)
+        .expect("a socket that was just created can always be bound");
+
+    socket
+}
+
+/// The task behind [`sync`].
+#[embassy_executor::task]
+async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
+    // DHCP has to finish before there is a DNS server to ask and an address to answer from.
+    //
+    // The servers that came with the DHCP lease are pushed into the resolver on the stack's next
+    // pass rather than this one, so the first attempt can lose the race with that and fail to
+    // resolve a name it would resolve a moment later. The retry below is what covers it, and the
+    // reason it is logged is what makes that visible rather than mysterious.
+    stack.wait_config_up().await;
+
+    loop {
+        let wait = match ask(&stack, &mut socket).await {
+            Ok(answer) => {
+                clock::set(answer.epoch_secs);
+
+                info!(
+                    "the clock is set to {} UTC by a stratum {} server",
+                    defmt::Display2Format(&Clock::utc(answer.epoch_secs)),
+                    answer.stratum,
+                );
+
+                // Only when there is something to say: a leap second is a fact about tonight, and
+                // "none pending" is what every other line of this log already assumes.
+                if answer.leap != Leap::Normal {
+                    warn!(
+                        "the time server says {}",
+                        defmt::Display2Format(&answer.leap)
+                    );
+                }
+
+                RESYNC
+            }
+            Err(failure) => {
+                error!(
+                    "the time server did not answer: {}",
+                    defmt::Display2Format(&failure)
+                );
+
+                RETRY
+            }
+        };
+
+        Timer::after(wait).await;
+    }
+}
+
+/// One exchange: resolve the name, send the question, read the answer, and make sense of it.
+async fn ask(stack: &Stack<'static>, socket: &mut UdpSocket<'static>) -> Result<Answer, Failure> {
+    let server = resolve(stack).await?;
+
+    // The nonce is the one piece of this exchange the chip can produce without a clock, and it is
+    // the only thing that tells this reply from a packet that was already in flight. Saturating
+    // after 49 days costs nothing: a nonce that repeats is a replay this device would have to be
+    // running for weeks with a captured packet to pull off.
+    let nonce = u32::try_from(Instant::now().as_millis()).unwrap_or(u32::MAX);
+    let request = sntp_request(nonce);
+
+    match with_timeout(TIMEOUT, socket.send_to(&request, (server, PORT))).await {
+        Err(_) => return Err(Failure::TimedOut("the request")),
+        Ok(Err(e)) => return Err(Failure::NotSent(e)),
+        Ok(Ok(())) => {}
+    }
+
+    let mut reply = [0; RX_LEN];
+    let (read, from) = match with_timeout(TIMEOUT, socket.recv_from(&mut reply)).await {
+        Err(_) => return Err(Failure::TimedOut("the answer")),
+        Ok(Err(RecvError::Truncated)) => return Err(Failure::TooLong),
+        Ok(Ok(answer)) => answer,
+    };
+
+    // The only check the reply's own contents cannot make: anything on the local network can send
+    // UDP to an open port, and a time is worth taking seriously enough to want the address checked
+    // as well as the echo.
+    if from.endpoint.addr != IpAddress::Ipv4(server) {
+        return Err(Failure::WrongServer);
+    }
+
+    sntp_reply(&reply[..read], nonce).map_err(Failure::Refused)
+}
+
+/// The address of [`SERVER`], once DHCP has given the resolver some to ask.
+async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, Failure> {
+    let found = match with_timeout(TIMEOUT, stack.dns_query(SERVER, DnsQueryType::A)).await {
+        Err(_) => return Err(Failure::TimedOut("the name lookup")),
+        Ok(Err(e)) => {
+            error!("the name of the time server did not resolve: {:?}", e);
+            return Err(Failure::NoServer);
+        }
+        Ok(Ok(found)) => found,
+    };
+
+    // An A record is a question about IPv4 and this firmware has no other protocol to send over, so
+    // an answer that is empty or IPv6-only is not a name that did not exist: it is a name this
+    // cannot be reached at.
+    match found.first() {
+        Some(IpAddress::Ipv4(address)) => Ok(*address),
+        _ => Err(Failure::NoServer),
+    }
+}
+
+/// Why one attempt to ask a time server did not produce a time.
+///
+/// Every case here is a sentence rather than a variant of somebody else's error type, because this
+/// is what ends up in the serial log and the alternatives are a `None` or a driver error that says
+/// what happened without saying what to do about it.
+enum Failure {
+    /// A step of the exchange did not finish in [`TIMEOUT`]. The name of the step is kept, because
+    /// "timed out" alone sends whoever is reading it after the network.
+    TimedOut(&'static str),
+
+    /// The server's name did not resolve to an address this firmware can send to.
+    NoServer,
+
+    /// A reply arrived from an address that was not the one that was asked.
+    WrongServer,
+
+    /// The socket would not send the request at all.
+    NotSent(SendError),
+
+    /// A reply arrived and was larger than the receive buffer.
+    TooLong,
+
+    /// A reply arrived and said something this client cannot use, which
+    /// [`poc_report::sntp_reply`] has already turned into a sentence.
+    Refused(Refusal),
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut(step) => write!(f, "{step} did not finish in time"),
+            Self::NoServer => {
+                f.write_str("the name of the time server did not resolve to an address")
+            }
+            Self::WrongServer => f.write_str("the reply came from an address that was not asked"),
+            Self::NotSent(e) => write!(f, "the socket would not send: {e:?}"),
+            Self::TooLong => f.write_str("the reply was larger than the receive buffer"),
+            Self::Refused(refused) => write!(f, "{refused}"),
+        }
+    }
+}
