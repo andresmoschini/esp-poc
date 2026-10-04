@@ -28,6 +28,70 @@ import { captureUntrimmed } from "./process.mjs";
 const CRLF = Buffer.from("\r\n");
 
 /**
+ * `check`'s step: reports every worktree copy that carries CRLF the repository does not ask for, and
+ * rewrites nothing.
+ *
+ * It is the same decision `fix` makes, asked without the writing, and it exists because `fix` alone
+ * leaves a hole: a fixer no check verifies will happily rewrite files on a schedule nothing looks at
+ * the result of. The line endings are the one property in this repository that two configurations
+ * disagree about — `.gitattributes`, matched by attribute, and `.editorconfig`, matched by glob — and
+ * `git add` is what obeys the first one. An `editorconfig` that said LF is not an answer about what
+ * Git will accept.
+ *
+ * @param {string} root Workspace root.
+ * @returns {boolean} Whether the step passed.
+ */
+export function check(root) {
+  return reportFailure(verify(root));
+}
+
+/**
+ * Reads what Git reports and throws when any of it needs rewriting.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<void>}
+ */
+async function verify(root) {
+  const records = await askGit(root);
+  const wrong = offenders(records);
+
+  if (wrong.length === 0) {
+    console.log("every file Git would stage already ends its lines the way .gitattributes asks");
+    return;
+  }
+
+  const listed = wrong.map((file) => `  ${file.relative} (${file.endings})`).join("\n");
+
+  throw new Error(
+    `gate: ${wrong.length} file(s) end their lines in a way .gitattributes does not ask for:\n` +
+      `${listed}\n\n    Run \`npm run fix\` to rewrite them.`,
+  );
+}
+
+/**
+ * The records that need rewriting before `git add` will take them.
+ *
+ * The decision needs nothing but what Git printed, so this is a function of a string rather than of
+ * the filesystem — which is what lets it be tested against records nobody had to damage a repository
+ * to produce.
+ *
+ * @param {string} records NUL-separated records, as `git ls-files --eol` printed them.
+ * @returns {Array<{relative: string, endings: string}>} What has to be rewritten.
+ */
+export function offenders(records) {
+  const wrong = [];
+
+  for (const record of records.split("\0").filter((record) => record !== "")) {
+    const file = parse(record);
+    if (needsRewrite(file.endings, file.wantsCrlf)) {
+      wrong.push({ relative: file.relative, endings: file.endings });
+    }
+  }
+
+  return wrong;
+}
+
+/**
  * `fix`'s step: rewrites every worktree copy that carries CRLF the repository does not ask for.
  *
  * It sits beside `editorconfig` rather than inside it, and last rather than first.

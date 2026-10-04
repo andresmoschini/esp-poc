@@ -23,6 +23,7 @@ use esp_hal::main;
 use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
+use poc_report::Address;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -80,9 +81,11 @@ async fn main(spawner: Spawner) -> ! {
             && let Some(config) = stack.config_v4()
         {
             info!(
-                "Hello world! {}/{}",
-                config.address.address(),
-                config.address.prefix_len()
+                "Hello world! {}",
+                defmt::Display2Format(&Address {
+                    ip: config.address.address(),
+                    prefix_len: config.address.prefix_len(),
+                })
             );
         } else {
             info!("Hello world!");

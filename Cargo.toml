@@ -36,6 +36,18 @@ invalid_rust_codeblocks = "deny"
 invalid_html_tags = "deny"
 bare_urls = "deny"
 
+# The one crate in the tree that can be tested: no dependencies, `#![no_std]`, and nothing in it that
+# needs a chip. It is a member rather than a module because `src/wifi.rs` and `src/bin/main.rs` cannot
+# be compiled for a host — both depend on `esp-hal` — so a test on them would need a board. The gate's
+# `test-firmware` step builds this crate for the host and runs `tests/report.rs` there.
+#
+# This block is not esp-generate's. See CONTRIBUTING.md, "Re-running esp-generate": regenerating
+# rewrites this file, and a manifest without the workspace still builds the firmware — the failure is
+# that the crate stops being a member, the firmware loses its dependency on it, and both parts of the
+# gate stop running any tests at all.
+[workspace]
+members = ["crates/poc-report"]
+
 [package]
 edition      = "2024"
 name         = "esp-poc"
@@ -86,6 +98,11 @@ embassy-time    = "0.5.0"
 # rather than left to track stable. The alternative is a hand-rolled macro around `StaticCell`, which
 # is what esp-hal's own examples do while their toolchain is stable.
 static_cell     = { version = "2.1.0", features = ["nightly"] }
+
+# The sentences the firmware prints about the network, and the address it prints them with. The only
+# dependency here that is not firmware: it has none of its own, which is what lets it be built for the
+# host and tested there. See `crates/poc-report`.
+poc-report = { path = "crates/poc-report" }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

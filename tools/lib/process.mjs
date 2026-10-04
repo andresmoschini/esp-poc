@@ -8,17 +8,18 @@
 import { spawn } from "node:child_process";
 
 /**
- * Runs `program` with `args` from `root`, inheriting the child's stdio so its progress streams to
- * the operator as it happens. Used for the gate steps, which are worth watching live.
+ * Runs `program` with `args` from `cwd`, inheriting the child's stdio so its progress streams to the
+ * operator as it happens. Used for the gate steps, which are worth watching live.
  *
- * @param {string} root Workspace root.
+ * @param {string} root Workspace root, which is where the child runs unless `cwd` says otherwise.
  * @param {string} program Executable name, resolved through `PATH`.
  * @param {string[]} args Arguments passed to `program`.
+ * @param {string} [cwd] Directory to run from, for the one step that must not be run from the root.
  * @returns {Promise<boolean>} Whether it exited successfully.
  */
-export function runVisible(root, program, args) {
+export function runVisible(root, program, args, cwd = root) {
   return new Promise((resolve) => {
-    const child = spawn(program, args, { cwd: root, stdio: "inherit" });
+    const child = spawn(program, args, { cwd, stdio: "inherit" });
 
     child.on("error", (error) => {
       process.stderr.write(`gate: could not run \`${program}\`: ${error.message}\n`);

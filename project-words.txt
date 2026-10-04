@@ -32,8 +32,10 @@ tlinkall
 wokwi
 
 # What the proof of concept speaks over the air
+authmode
 dhcp
 dhcpv4
+rssi
 smoltcp
 sntp
 

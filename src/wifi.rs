@@ -34,9 +34,10 @@ use embassy_time::{Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
-    AuthenticationMethodConfig, Config, ControllerConfig, Interface, Password, Ssid,
-    WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
+    AuthenticationMethodConfig, Config, ConnectionError, ControllerConfig, DisconnectReason,
+    Interface, Password, Ssid, WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
 };
+use poc_report::{Address, Failure, Reason};
 
 /// The SSID of the network to join, read from the environment when this was compiled.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
@@ -159,13 +160,92 @@ async fn keep_joined(mut controller: WifiController<'static>) {
                 }
             }
             Err(e) => {
-                error!("could not join: {:?}", e);
+                report(&e);
                 list_neighbors(&mut controller).await;
             }
         }
 
         Timer::after(RETRY).await;
     }
+}
+
+/// Says why the last attempt to join did not work.
+///
+/// A disconnected station is reported by the radio as a numbered reason out of about fifty, which
+/// answers "what did the hardware say" and leaves "what do I do about it" to whoever is reading the
+/// serial output. This translates the ones that come up in practice and keeps the rest, because a
+/// wrong guess is worse than an honest unknown: two of these look alike in the radio's words and want
+/// opposite fixes — a refused password is a typo, and a network that stops answering is a station too
+/// far away.
+///
+/// `poc_report` decides the wording and is tested on the host; the radio's own words are still printed
+/// underneath for anything this does not name.
+fn report(error: &ConnectionError) {
+    match error {
+        ConnectionError::Failed(info) => error!(
+            "could not join {}: {} ({:?})",
+            info.ssid,
+            defmt::Display2Format(&Failure {
+                reason: named(info.reason),
+                signal: measured(info.rssi),
+            }),
+            info.reason,
+        ),
+        other => error!("could not join: {:?}", other),
+    }
+}
+
+/// The cause, in as few words as the radio's fifty reasons allow.
+///
+/// Everything not named here is [`Reason::Other`]: the enum is `#[non_exhaustive]`, so a reason added
+/// upstream lands there rather than failing to build, and this is the place to teach the firmware a
+/// new one.
+fn named(reason: DisconnectReason) -> Reason {
+    match reason {
+        // Nothing answered with this name at all: the network is not there, the name is wrong, or the
+        // station is out of range. The scan printed after a failure is what tells those apart.
+        DisconnectReason::NoAccessPointFound
+        | DisconnectReason::NoAccessPointFoundInRssiThreshold
+        | DisconnectReason::BeaconTimeout => Reason::NoSuchNetwork,
+
+        // The network was heard and said no. A refused PSK is the usual answer, and a WPA3-only
+        // network is the other one worth suspecting before the password.
+        DisconnectReason::NoAccessPointFoundWithCompatibleSecurity
+        | DisconnectReason::NoAccessPointFoundInAuthmodeThreshold
+        | DisconnectReason::AuthenticationFailed
+        | DisconnectReason::FourWayHandshakeTimeout
+        | DisconnectReason::MicFailure
+        | DisconnectReason::IeIn4wayDiffers
+        | DisconnectReason::_802_1xAuthenticationFailed
+        | DisconnectReason::CipherSuiteRejected
+        | DisconnectReason::BadCipherOrAkm => Reason::SecurityRefused,
+
+        // The exchange began and the other end went quiet. From the station's side this is what being
+        // too far away looks like: the beacons arrive, the handshake does not.
+        DisconnectReason::AuthenticationExpired
+        | DisconnectReason::HandshakeTimeout
+        | DisconnectReason::Timeout => Reason::NoAnswer,
+
+        // It was up, and then it was not.
+        DisconnectReason::DisassociatedDueToInactivity
+        | DisconnectReason::AuthenticationLeave
+        | DisconnectReason::AssociationLeave
+        | DisconnectReason::PeerInitiated
+        | DisconnectReason::AccessPointInitiatedDisassociation => Reason::LinkLost,
+
+        // The enum is `#[non_exhaustive]`: a reason this build has never heard of is reported rather
+        // than guessed at.
+        _ => Reason::Other,
+    }
+}
+
+/// The signal the radio last measured, or `None` when it reported none.
+///
+/// The driver fills in `-128` when it has no reading, which is a number that would be printed as
+/// though it had been measured — and a station that appears to have heard the network at -128 dBm is
+/// a contradiction worth not printing.
+fn measured(rssi: i8) -> Option<i8> {
+    (rssi > -128).then_some(rssi)
 }
 
 /// Names the access points the radio can hear, and how loudly.
@@ -200,9 +280,11 @@ async fn report_address(stack: Stack<'static>) {
     // `core::net` — the same types everything else on the chip uses, and the ones `defmt` prints.
     if let Some(config) = stack.config_v4() {
         info!(
-            "address {}/{}",
-            config.address.address(),
-            config.address.prefix_len()
+            "address {}",
+            defmt::Display2Format(&Address {
+                ip: config.address.address(),
+                prefix_len: config.address.prefix_len(),
+            })
         );
 
         if let Some(gateway) = config.gateway {

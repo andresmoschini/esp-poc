@@ -1,0 +1,34 @@
+# The part of the firmware that does not talk to hardware, in a crate of its own so that it can be
+# tested where tests run.
+#
+# It is a separate crate because `src/wifi.rs` and `src/bin/main.rs` cannot be compiled for a host at
+# all: both depend on `esp-hal`, which exists only for this chip, and both are `#![no_std]`. Anything
+# worth testing therefore has to be in something that builds without them, and this is it.
+#
+# It has no dependencies, deliberately — not even `defmt`. The firmware logs what this crate decides
+# through `defmt`'s `Display2Format`, and the alternative was a `defmt::Format` derive, whose output
+# can only be read back by a `defmt` logger. `core::fmt` renders the same sentence and a test can
+# assert on it.
+#
+# The lints are spelled out rather than inherited from the workspace, because esp-generate rewrites
+# the root `Cargo.toml` and this crate is not its business; see CONTRIBUTING.md.
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[lints.rust]
+# Every public item here is something the firmware logs, and a sentence with no explanation above it
+# is the kind of thing that gets deleted by whoever did not write it.
+missing_docs = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+bare_urls = "deny"
+
+[package]
+name = "poc-report"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false

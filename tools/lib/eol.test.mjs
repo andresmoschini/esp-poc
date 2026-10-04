@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { needsRewrite, parse, toLf } from "./eol.mjs";
+import { needsRewrite, offenders, parse, toLf } from "./eol.mjs";
 
 // A tracked file whose worktree copy has been written on Windows is rewritten: Git reports `crlf`,
 // and the rule asks for `lf`.
@@ -110,4 +110,53 @@ test("an empty file stays empty", () => {
 
   assert.equal(fixed.length, 0);
   assert.equal(lines, 0);
+});
+
+// What the `check` step reports is what the `fix` step rewrites, and both decide from the same
+// function: a record named here and not rewritten there would be a check that passes on a repository
+// `fix` is still changing, which is the gap the check was added to close.
+const lf = "i/lf    w/lf    attr/text=auto eol=lf\tsrc/wifi.rs";
+const crlf = "i/lf    w/crlf  attr/text=auto eol=lf\tsrc/bin/main.rs";
+const mixed = "i/lf    w/mixed attr/text=auto eol=lf\tREADME.md";
+const batch = "i/crlf  w/crlf  attr/text eol=crlf\ttools/build.cmd";
+const binary = "i/none  w/-text attr/\tfirmware.elf";
+
+test("a copy carrying CRLF is one the check reports", () => {
+  assert.deepEqual(offenders(crlf), [{ relative: "src/bin/main.rs", endings: "crlf" }]);
+});
+
+// A mixed copy has no one ending left to keep, so it is reported under the endings Git gave it
+// rather than being passed over as "not CRLF".
+test("a copy carrying both endings is reported as mixed", () => {
+  assert.deepEqual(offenders(mixed), [{ relative: "README.md", endings: "mixed" }]);
+});
+
+// The batch file is CRLF on purpose, and `.gitattributes` is what says so. Reporting it would make
+// the step fail on the one file whose endings are correct.
+test("a copy .gitattributes wants in CRLF is not reported", () => {
+  assert.deepEqual(offenders(batch), []);
+});
+
+// A file already correct, and one Git calls binary, are both left out: the first needs nothing and the
+// second is not a decision this code gets to make.
+test("a correct copy and a binary one are not reported", () => {
+  assert.deepEqual(offenders(`${lf}\0${binary}`), []);
+});
+
+// Records arrive NUL-separated and the paths among them are what the operator is given, so only the
+// offending ones are listed and in the order Git reported them.
+test("only the offending records are reported, in order", () => {
+  const records = [lf, crlf, batch, mixed, binary].join("\0");
+
+  assert.deepEqual(
+    offenders(records).map((file) => file.relative),
+    ["src/bin/main.rs", "README.md"],
+  );
+});
+
+// Git reports nothing at all for a repository with no files, which is a clean answer rather than a
+// missing one.
+test("no records is nothing to report", () => {
+  assert.deepEqual(offenders(""), []);
+  assert.deepEqual(offenders("\0"), []);
 });

@@ -38,7 +38,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { toolEntryPoint } from "./lib/npm-tool.mjs";
-import { fix as eolFix } from "./lib/eol.mjs";
+import { check as eolCheck, fix as eolFix } from "./lib/eol.mjs";
+import { isEntryPoint } from "./lib/entry-point.mjs";
+import { firmwareTests } from "./lib/firmware-tests.mjs";
+import { installedLockfile, nodeToolingState } from "./lib/tooling.mjs";
 
 // The npm executable.
 //
@@ -69,8 +72,12 @@ const toolStep = (packageName, args) => ({ kind: "tool", packageName, args });
 /**
  * A function of this repository's own code, given the workspace root.
  *
- * @param {(root: string) => boolean} fn What running this step does.
- * @returns {{kind: "here", fn: (root: string) => boolean}} The step's action.
+ * It may answer with a promise, because one of these steps has to work out what to run before it runs
+ * it: the firmware tests are named after a target triple that is a property of the machine rather
+ * than of this file.
+ *
+ * @param {(root: string) => boolean | Promise<boolean>} fn What running this step does.
+ * @returns {{kind: "here", fn: (root: string) => boolean | Promise<boolean>}} The step's action.
  */
 const hereStep = (fn) => ({ kind: "here", fn });
 
@@ -85,7 +92,7 @@ const hereStep = (fn) => ({ kind: "here", fn });
 // same way. In both cases the tool knows something is wrong, says so, and the gate does not notice.
 // Closing that would mean matching on the text the tools print, which is brittle in a different and
 // less obvious way.
-const GATE = [
+export const GATE = [
   {
     name: "fmt",
     action: spawnStep("cargo", ["fmt", "--all", "--check"]),
@@ -120,6 +127,17 @@ const GATE = [
     // this tool reads it as plain JSON and answers `invalid character '/'` on a comment — so it lives
     // here and in AGENTS.md instead.
     action: toolStep("editorconfig-checker", []),
+  },
+  {
+    name: "eol",
+    // `editorconfig` above answers from `.editorconfig`, matched by glob. This one answers from
+    // `.gitattributes`, matched by attribute, and the party that has to agree with it is `git add`:
+    // with `core.safecrlf` on, a file whose worktree copy is CRLF is one Git refuses rather than
+    // converts. An `.editorconfig` that says LF is not an answer about what Git will accept.
+    //
+    // `*.bat` and `*.cmd` are the live case for the disagreement — both configurations ask for CRLF
+    // on purpose, and only Git's answer is asked about them.
+    action: hereStep(eolCheck),
   },
   {
     name: "cspell",
@@ -186,17 +204,31 @@ const GATE = [
   },
   {
     name: "test",
-    // The firmware itself has no runnable test target, and that is not an oversight to be fixed here.
-    // A test on `esp-poc` means building a test harness for `riscv32imac-unknown-none-elf` and running
-    // it on hardware or on a simulator, which is a different kind of tooling from a formatter. So the
-    // gate's `test` step runs the tests this repository does have: the orchestrator above, which is
-    // where the parsing and rewriting logic lives. Node's own runner is a built-in, so this adds no
-    // dependency either.
+    // The tests of this repository's own automation: the parsing and the rewriting that turn what a
+    // tool prints into a verdict, which is the only code in the tree that decides something rather
+    // than delegating. Node's own runner is a built-in, so this adds no dependency.
+    //
+    // The firmware's tests are the step after this one, and they are not here because a test on
+    // `esp-poc` means a test harness for a microcontroller, which needs a board or a simulator: a
+    // different kind of tooling from a formatter, and not something CI can run.
     //
     // The glob is spelled out rather than given as `tools`, because `--test` treats a bare directory as
     // a module to execute rather than as something to search — measured, it fails trying to resolve
     // the directory itself as a module.
     action: spawnStep(process.execPath, ["--test", "tools/**/*.test.mjs"]),
+  },
+  {
+    name: "test-firmware",
+    // The tests that belong to the firmware rather than to the gate, run where they can run: on the
+    // host. `src/wifi.rs` and `src/bin/main.rs` cannot be tested at all, because compiling either one
+    // for a host pulls in `esp-hal` and fails; the logic that does not touch hardware lives in
+    // `crates/poc-report` precisely so that this step has something to run.
+    //
+    // It is the one step whose command is not written out here, because `[build] target` in
+    // `.cargo/config.toml` sends `cargo test` to the microcontroller and the way back is a `--target`
+    // that is a property of the machine rather than of this file. `tools/lib/firmware-tests.mjs`
+    // works it out from `rustc -vV`, and says there why it is not written down.
+    action: hereStep(firmwareTests),
   },
 ];
 
@@ -214,7 +246,7 @@ const GATE = [
 // unattended. Run it by hand:
 //
 //     cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
-const FIX = [
+export const FIX = [
   {
     name: "fmt",
     action: spawnStep("cargo", ["fmt", "--all"]),
@@ -245,7 +277,11 @@ const FIX = [
   },
 ];
 
-main();
+// Only when this file is the program. The tests import it to reach `GATE` and `FIX` and re-run these
+// steps by hand, and a module that dispatched on import would have a test run spawn the whole gate.
+if (isEntryPoint(process.argv[1], fileURLToPath(import.meta.url))) {
+  main();
+}
 
 /**
  * Reads the command and dispatches to it.
@@ -459,66 +495,6 @@ async function runSetup() {
 
   console.log("\nNode tooling installed");
   return 0;
-}
-
-/**
- * Where `setup` records the lockfile it installed from.
- *
- * It lives inside `node_modules` so that it shares that directory's lifetime: `npm ci` deletes the
- * tree before reinstalling, and this record goes with it.
- *
- * @param {string} root Workspace root.
- * @returns {string} Absolute path to the record.
- */
-function installedLockfile(root) {
-  return path.join(root, "node_modules", ".esp-poc-installed-lockfile.json");
-}
-
-/**
- * Checks that the Node tooling is installed and matches `package-lock.json`.
- *
- * The comparison is by content, not by timestamp. Git rewrites `package-lock.json` on checkout even
- * when its content is identical, so comparing modification times reported a stale tree after every
- * branch switch and every step of a rebase — a false alarm that costs a reinstall to clear and
- * teaches people to ignore the message. Content answers the question actually being asked, and
- * reading two files of about 130 KB costs nothing measurable next to the checks that follow.
- *
- * @param {string} root Workspace root.
- * @returns {string | undefined} What is wrong, or `undefined` when the tooling is usable.
- */
-function nodeToolingState(root) {
-  const lockfile = path.join(root, "package-lock.json");
-  const installed = installedLockfile(root);
-
-  if (!fs.existsSync(installed)) {
-    return `gate: the Node tooling is not installed.\n\n    ${installed} does not exist.`;
-  }
-
-  const wanted = readFile(lockfile);
-  const have = readFile(installed);
-
-  if (wanted !== undefined && have !== undefined && wanted.equals(have)) {
-    return undefined;
-  }
-
-  return (
-    `gate: the installed Node tooling does not match the lockfile.\n\n    ${lockfile} has changed ` +
-    `since it was installed.`
-  );
-}
-
-/**
- * Contents of `filePath`, or `undefined` when it could not be read.
- *
- * @param {string} filePath File to read.
- * @returns {Buffer | undefined} Its contents.
- */
-function readFile(filePath) {
-  try {
-    return fs.readFileSync(filePath);
-  } catch {
-    return undefined;
-  }
 }
 
 /**
