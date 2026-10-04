@@ -23,9 +23,8 @@ use esp_hal::main;
 use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
-use poc_report::Address;
 
-use esp_poc::clock;
+use esp_poc::status;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -80,28 +79,15 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     loop {
-        // The chip has no battery-backed clock, so this is the time of day a time server gave it,
-        // and how long it has been running instead until one did. The reading says which of the two
-        // it is: a date means the server answered, and `HH:MM:SS` on its own means it has not.
-        let now = clock::now();
-
-        // Reading the configuration is a lookup, not a wait: it answers with whatever DHCP has
-        // produced so far, and with nothing until it has. That is why this loop is not blocked on
-        // the network and why it starts printing a bare greeting.
-        if let Some(stack) = stack
-            && let Some(config) = stack.config_v4()
-        {
-            info!(
-                "Hello world! {} from {}",
-                defmt::Display2Format(&now),
-                defmt::Display2Format(&Address {
-                    ip: config.address.address(),
-                    prefix_len: config.address.prefix_len(),
-                }),
-            );
-        } else {
-            info!("Hello world! {}", defmt::Display2Format(&now));
-        }
+        // One call, one line, and every fact on it comes from a different task: the radio's state
+        // from `wifi`, the time and where it came from from `clock`, and the address from the
+        // network stack. `src/status.rs` is what puts them together, and `poc-report` decides how
+        // they read — which is why the wording of this line is something a host can test and not
+        // something assembled here.
+        info!(
+            "Hello world! {}",
+            defmt::Display2Format(&status::report(stack))
+        );
 
         Timer::after(Duration::from_millis(500)).await;
     }

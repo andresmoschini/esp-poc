@@ -10,17 +10,23 @@
 //! The clock this sets does not survive a power cycle, because there is nowhere on this chip to put
 //! it that would. That is why the task keeps going after the first answer rather than stopping:
 //! every boot starts at zero again and has to ask again.
+//!
+//! A failed attempt is not only logged: it is also handed to [`clock::report_failure`], which is what
+//! the greeting's state line reads to explain a time that is still counting from boot. The words for
+//! it live in `poc-report` with the rest of the sentences, and are tested on the host; what the
+//! driver said underneath stays in this file's log.
 
-use core::fmt;
 use core::net::Ipv4Addr;
 
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
-use embassy_net::udp::{PacketMetadata, RecvError, SendError, UdpSocket};
+use embassy_net::udp::{PacketMetadata, RecvError, UdpSocket};
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use poc_report::{Answer, Clock, Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
+use poc_report::{
+    Answer, Clock, Leap, Obstruction, SNTP_LEN, STALE_AFTER_SECS, sntp_reply, sntp_request,
+};
 
 use crate::clock;
 
@@ -46,10 +52,13 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait before asking again after a server has answered.
 ///
-/// Once an hour is frequent enough that a chip left running overnight is still within a second or
-/// two by morning, and rare enough that a proof of concept is not talking to the pool more than it
+/// Once an hour, and it is [`STALE_AFTER_SECS`] rather than a number written here: that is how old an
+/// answer has to be before the state line stops calling the time it set current, and a resync
+/// interval longer than that would leave the clock calling itself confirmed when nothing has
+/// confirmed it. Frequent enough that a chip left running overnight is still within a second or two
+/// by morning, and rare enough that a proof of concept is not talking to the pool more than it
 /// needs to.
-const RESYNC: Duration = Duration::from_secs(60 * 60);
+const RESYNC: Duration = Duration::from_secs(STALE_AFTER_SECS);
 
 /// How long to wait before asking again after one did not.
 ///
@@ -129,7 +138,10 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
     loop {
         let wait = match ask(&stack, &mut socket).await {
             Ok(answer) => {
-                clock::set(answer.epoch_secs);
+                // The stratum comes with the time rather than being logged beside it: the state line
+                // reports where the clock was set from, and an answer published without it is an
+                // answer published half of.
+                clock::set(answer.epoch_secs, answer.stratum);
 
                 info!(
                     "the clock is set to {} UTC by a stratum {} server",
@@ -148,11 +160,16 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
 
                 RESYNC
             }
-            Err(failure) => {
+            Err(obstruction) => {
                 error!(
                     "the time server did not answer: {}",
-                    defmt::Display2Format(&failure)
+                    defmt::Display2Format(&obstruction)
                 );
+
+                // Also given to the clock, which is what keeps saying why the time on the greeting is
+                // not a real one. It is published whether or not anybody is watching this log: the
+                // reader who is not watching is the one the state line is for.
+                clock::report_failure(obstruction);
 
                 RETRY
             }
@@ -163,7 +180,10 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
 }
 
 /// One exchange: resolve the name, send the question, read the answer, and make sense of it.
-async fn ask(stack: &Stack<'static>, socket: &mut UdpSocket<'static>) -> Result<Answer, Failure> {
+async fn ask(
+    stack: &Stack<'static>,
+    socket: &mut UdpSocket<'static>,
+) -> Result<Answer, Obstruction> {
     let server = resolve(stack).await?;
 
     // The nonce is the one piece of this exchange the chip can produce without a clock, and it is
@@ -174,15 +194,22 @@ async fn ask(stack: &Stack<'static>, socket: &mut UdpSocket<'static>) -> Result<
     let request = sntp_request(nonce);
 
     match with_timeout(TIMEOUT, socket.send_to(&request, (server, PORT))).await {
-        Err(_) => return Err(Failure::TimedOut("the request")),
-        Ok(Err(e)) => return Err(Failure::NotSent(e)),
+        Err(_) => return Err(Obstruction::RequestTimedOut),
+        // The driver's own words are logged here rather than carried into the state line: a state
+        // line is printed twice a second for as long as this keeps failing, and what went wrong with
+        // a socket belongs in the log next to the error rather than in the sentence forever.
+        Ok(Err(e)) => {
+            error!("the socket would not send the request: {:?}", e);
+
+            return Err(Obstruction::WouldNotSend);
+        }
         Ok(Ok(())) => {}
     }
 
     let mut reply = [0; RX_LEN];
     let (read, from) = match with_timeout(TIMEOUT, socket.recv_from(&mut reply)).await {
-        Err(_) => return Err(Failure::TimedOut("the answer")),
-        Ok(Err(RecvError::Truncated)) => return Err(Failure::TooLong),
+        Err(_) => return Err(Obstruction::AnswerTimedOut),
+        Ok(Err(RecvError::Truncated)) => return Err(Obstruction::TooLong),
         Ok(Ok(answer)) => answer,
     };
 
@@ -190,19 +217,20 @@ async fn ask(stack: &Stack<'static>, socket: &mut UdpSocket<'static>) -> Result<
     // UDP to an open port, and a time is worth taking seriously enough to want the address checked
     // as well as the echo.
     if from.endpoint.addr != IpAddress::Ipv4(server) {
-        return Err(Failure::WrongServer);
+        return Err(Obstruction::Stranger);
     }
 
-    sntp_reply(&reply[..read], nonce).map_err(Failure::Refused)
+    sntp_reply(&reply[..read], nonce).map_err(Obstruction::Refused)
 }
 
 /// The address of [`SERVER`], once DHCP has given the resolver some to ask.
-async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, Failure> {
+async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, Obstruction> {
     let found = match with_timeout(TIMEOUT, stack.dns_query(SERVER, DnsQueryType::A)).await {
-        Err(_) => return Err(Failure::TimedOut("the name lookup")),
+        Err(_) => return Err(Obstruction::LookupTimedOut),
         Ok(Err(e)) => {
             error!("the name of the time server did not resolve: {:?}", e);
-            return Err(Failure::NoServer);
+
+            return Err(Obstruction::NoServer);
         }
         Ok(Ok(found)) => found,
     };
@@ -212,48 +240,6 @@ async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, Failure> {
     // cannot be reached at.
     match found.first() {
         Some(IpAddress::Ipv4(address)) => Ok(*address),
-        _ => Err(Failure::NoServer),
-    }
-}
-
-/// Why one attempt to ask a time server did not produce a time.
-///
-/// Every case here is a sentence rather than a variant of somebody else's error type, because this
-/// is what ends up in the serial log and the alternatives are a `None` or a driver error that says
-/// what happened without saying what to do about it.
-enum Failure {
-    /// A step of the exchange did not finish in [`TIMEOUT`]. The name of the step is kept, because
-    /// "timed out" alone sends whoever is reading it after the network.
-    TimedOut(&'static str),
-
-    /// The server's name did not resolve to an address this firmware can send to.
-    NoServer,
-
-    /// A reply arrived from an address that was not the one that was asked.
-    WrongServer,
-
-    /// The socket would not send the request at all.
-    NotSent(SendError),
-
-    /// A reply arrived and was larger than the receive buffer.
-    TooLong,
-
-    /// A reply arrived and said something this client cannot use, which
-    /// [`poc_report::sntp_reply`] has already turned into a sentence.
-    Refused(Refusal),
-}
-
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TimedOut(step) => write!(f, "{step} did not finish in time"),
-            Self::NoServer => {
-                f.write_str("the name of the time server did not resolve to an address")
-            }
-            Self::WrongServer => f.write_str("the reply came from an address that was not asked"),
-            Self::NotSent(e) => write!(f, "the socket would not send: {e:?}"),
-            Self::TooLong => f.write_str("the reply was larger than the receive buffer"),
-            Self::Refused(refused) => write!(f, "{refused}"),
-        }
+        _ => Err(Obstruction::NoServer),
     }
 }

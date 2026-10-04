@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use poc_report::{Address, Clock, Failure, Reason};
+use poc_report::{Address, Clock, JoinFailure, Reason};
 
 /// Seconds in a day, restated from the library because the wrapping is the property under test and
 /// naming it here is what keeps the numbers below readable.
@@ -118,7 +118,7 @@ fn the_reasons_are_distinguishable() {
 /// station that cannot be heard.
 #[test]
 fn a_failure_prints_the_signal_it_has() {
-    let failure = Failure {
+    let failure = JoinFailure {
         reason: Reason::NoAnswer,
         signal: Some(-81),
     };
@@ -133,7 +133,7 @@ fn a_failure_prints_the_signal_it_has() {
 /// when the access point is too far away, and a firmware that hid the sign would hide the diagnosis.
 #[test]
 fn a_weak_signal_is_not_hidden() {
-    let failure = Failure {
+    let failure = JoinFailure {
         reason: Reason::NoAnswer,
         signal: Some(-81),
     };
@@ -146,7 +146,7 @@ fn a_weak_signal_is_not_hidden() {
 /// sends whoever is reading it after a hardware problem that is not there.
 #[test]
 fn a_failure_without_a_signal_does_not_invent_one() {
-    let failure = Failure {
+    let failure = JoinFailure {
         reason: Reason::NoSuchNetwork,
         signal: None,
     };
@@ -158,7 +158,7 @@ fn a_failure_without_a_signal_does_not_invent_one() {
 /// the serial output sees when the radio never measured anything.
 #[test]
 fn a_failure_without_a_signal_keeps_the_reason_verbatim() {
-    let failure = Failure {
+    let failure = JoinFailure {
         reason: Reason::SecurityRefused,
         signal: None,
     };

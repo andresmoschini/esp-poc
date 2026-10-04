@@ -9,20 +9,44 @@ Firmware proof of concept for the Espressif **ESP32-C6**, in bare-metal Rust: `#
 
 Bring up the HAL at maximum CPU clock, take the pins the module reserves so they cannot be used by
 accident, then join a Wi-Fi network, print the address DHCP hands out, and set the clock from an
-SNTP server over that network — next to a greeting every 500 ms that shows the time as it stands.
+SNTP server over that network — and every 500 ms print one line that says all of it:
+
+```text
+Hello world! 2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined
+```
+
+It reads as the time and where it came from, then the address, then the state of the radio — the
+last because it is what a reader looks for when one of the first two is wrong. The line is a single
+`Status` in [`crates/poc-report`](crates/poc-report), so its order and its wording are things the
+gate can check rather than things assembled next to the printer.
+
+It also says when something is wrong, and what:
+
+| What the line says                                                                       | What it means                                                             |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `00:00:42 (counting from boot: nothing has answered yet)`                                | no server has answered yet                                                |
+| `00:01:03 (counting from boot: the time server's answer did not arrive)`                 | the last attempt, and the step of it that failed                          |
+| `2026-10-04 18:22:31 UTC (from a stratum 2 server, last confirmed 1 hour 5 minutes ago)` | a real time, from a server, and nobody has confirmed it since             |
+| `wifi: joined`                                                                           | the station is on the network                                             |
+| `wifi: joining`                                                                          | an attempt is in progress or due                                          |
+| `wifi: not joined: nothing with that name was heard (signal -81 dBm)`                    | the last failure, in words and with the signal that separates two of them |
+| `wifi: nothing to join: no credentials were compiled in`                                 | a build with no `WIFI_SSID`, which is what the gate and CI are            |
 
 The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
 clock, so before that the greeting prints how long it has been running since boot, wrapped into a
 day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and a reading
-with a date came from a server. The time lives in RAM, so every boot asks again. `src/ntp.rs` is the
-client; `src/clock.rs` is the one number it sets.
+with a date came from a server. Between two answers the clock keeps moving on its own crystal, so a
+reading nobody has confirmed for an hour says how long ago that was. The time lives in RAM, so every
+boot asks again. `src/ntp.rs` is the client; `src/clock.rs` is the one number it sets and the three
+facts about where it came from.
 
 Wi-Fi is [`esp-radio`](https://docs.espressif.com/projects/rust/esp-radio/latest/), which on this
 chip is a device on the internal SDIO bus: there are no pins to choose. It needs a preemptive
 scheduler (`esp-rtos`) and a heap, which is why the firmware is no longer heap-free, and the TCP/IP
 stack that turns a joined network into an address (`embassy-net`). `src/wifi.rs` has the whole
-sequence up to the network; `src/ntp.rs` and `src/clock.rs` are what the network is for;
-`src/bin/main.rs` is the entry point that starts them and prints the result.
+sequence up to the network and publishes what the radio is doing; `src/ntp.rs` and `src/clock.rs`
+are what the network is for; `src/status.rs` is the one place that asks all three and puts the
+answers together; `src/bin/main.rs` is the entry point that starts them and prints the result.
 
 That is still scaffolding. The point of the repository is that the scaffolding is now somewhere you
 can build something without first deciding how, and that whatever you build is checked by something
@@ -72,10 +96,10 @@ WIFI_SSID = "your-network"
 WIFI_PASSWORD = "your-password"
 ```
 
-Without them the firmware still builds and still prints `Hello world!` with the time; it says it has
-no network to join and stops there. That is deliberate: the gate and CI have no network to join
-either, and a firmware that only builds where a password is present is a firmware nobody else can
-build.
+Without them the firmware still builds and still prints the line above — with `no address yet` and
+`wifi: nothing to join: no credentials were compiled in` on it. That is deliberate: the gate and CI
+have no network to join either, and a firmware that only builds where a password is present is a
+firmware nobody else can build.
 
 The password ends up in the flash image as well as in that file, because there is nowhere else for
 it to be. Fine for a proof of concept; not fine for anything that leaves your desk.
@@ -109,7 +133,10 @@ an access point, so none of the following is a claim this repository makes:
 - that the password is accepted rather than merely sent;
 - that DHCP returns an address, and which one;
 - that the stack keeps running, and reconnects when the link drops;
-- that the time server answers, or that the clock it sets is right.
+- that the time server answers, or that the clock it sets is right;
+- that the state line describes the radio rather than the last thing this firmware decided the radio
+  was doing — it reports what was published, and what was published is only ever one task's word
+  about what another task did.
 
 What _is_ verified is the part the gate can see: it builds for the chip in both profiles, and it is
 lint-clean. The credentials are compiled in from `.cargo/local.toml`, and nothing checks that they
@@ -122,15 +149,23 @@ Two test steps, and the difference between them is the whole story:
 - `test` runs the tests of this repository's own automation, in Node.
 - `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
   that decides rather than talks to hardware: how an address and a time are written, what a failed
-  join says, and what an SNTP packet means.
+  join says, what an SNTP packet means, what the radio is doing, and what the line the firmware
+  prints twice a second reads.
 
-The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs` and `src/bin/main.rs` all
-depend on `esp-hal`, on the network stack, or on a scheduler that exists only for this chip, so none
-of them can be compiled for a host at all — a test on them needs a board. Anything testable
-therefore has to be in something that builds without them, which is what `crates/poc-report` is for,
-and what makes `poc-report` the only crate in the tree with no dependencies of its own. Logic that
-belongs next to hardware rather than in that crate is untested, and stays that way until a board or
-a simulator can run it.
+The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
+`src/bin/main.rs` all depend on `esp-hal`, on the network stack, or on a scheduler that exists only
+for this chip, so none of them can be compiled for a host at all — a test on them needs a board.
+Anything testable therefore has to be in something that builds without them, which is what
+`crates/poc-report` is for, and what makes `poc-report` the only crate in the tree with no
+dependencies of its own. Logic that belongs next to hardware rather than in that crate is untested,
+and stays that way until a board or a simulator can run it.
+
+What that buys, and what it does not, is worth being specific about. The line the firmware prints is
+a `Status` in `poc-report`, so its wording, its order and the decision of when a time has gone stale
+are all checked on the host. What publishes the state — the radio writing a word another task reads,
+and the clock remembering which server set it and when — is the same encoding, so the words and the
+values they stand for cannot drift apart. None of it can check that the value published is the one
+the radio meant: that is still only knowable from the board.
 
 ## The gate
 
@@ -150,9 +185,10 @@ step fails, how to add one, and which files esp-generate will overwrite.
 | Path                                | Owns                                                                   |
 | ----------------------------------- | ---------------------------------------------------------------------- |
 | `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it      |
-| `src/wifi.rs`                       | join a network over DHCP, and print the address                        |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing          |
 | `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer  |
 | `src/clock.rs`                      | the one number that says what time it is, and where it came from       |
+| `src/status.rs`                     | the three answers the state line is made of                            |
 | `src/lib.rs`                        | the crate root, and which nightly features the firmware needs          |
 | `crates/poc-report/`                | what the firmware decides and says — the only part with tests          |
 | `build.rs`                          | linker scripts, and what to do about each undefined symbol             |

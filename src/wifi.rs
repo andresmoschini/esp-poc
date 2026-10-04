@@ -17,6 +17,18 @@
 //! — an SNTP client runs on it, in [`crate::ntp`] — and which is `Copy`, so a task can take its own
 //! copy of it.
 //!
+//! ## Saying what the radio is doing
+//!
+//! The radio runs in a task and the greeting runs in another one, so nothing here can return the
+//! state of the link to it. Instead this file publishes it as a [`Link`] — what it is doing, and why
+//! it stopped if it did — and [`link`] hands it to [`crate::status`], which prints it twice a
+//! second. A build with no credentials says so on that line, rather than leaving a reader to work
+//! out from a missing address that nothing was ever attempted.
+//!
+//! The state is published as one word rather than as the enum itself because this core has 32-bit
+//! atomics and no 64-bit ones, and because a value published as several words is a value whose parts
+//! can be read at different moments. [`Link::to_word`] is the other end of that.
+//!
 //! ## Credentials
 //!
 //! The SSID and password are compiled in from the `WIFI_SSID` and `WIFI_PASSWORD` environment
@@ -28,9 +40,11 @@
 //! still has to build, because the gate and CI are such a build. There, [`join`] says so and
 //! returns `None`, and the rest of the firmware runs exactly as it did before Wi-Fi existed.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use defmt::{error, info};
 use embassy_executor::Spawner;
-use embassy_net::{Runner, Stack, StackResources};
+use embassy_net::{Runner, Stack, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
@@ -38,7 +52,7 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ConnectionError, ControllerConfig, DisconnectReason,
     Interface, Password, Ssid, WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
 };
-use poc_report::{Address, Failure, Reason};
+use poc_report::{Address, JoinFailure, Link, Reason};
 
 /// The SSID of the network to join, read from the environment when this was compiled.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
@@ -61,20 +75,42 @@ const NEIGHBORS: usize = 10;
 /// so this is the number that decides whether the next thing to want a socket works at all.
 const SOCKETS: usize = 4;
 
+/// What the radio is doing, published for [`link`] to read.
+///
+/// One atomic rather than a lock around a [`Link`]: the greeting reads this from a different task
+/// than the one that writes it, twice a second, and a lock to protect one small answer is a lock
+/// the radio could block on while it is trying to join. The word is written whole, so a reader sees
+/// a state the writer had finished rather than half of an answer.
+///
+/// It starts as [`Link::Joining`] because that is the state this chip is in from the moment it
+/// starts: the radio is expected to be trying, and `join` replaces this with something more specific
+/// within a few lines of returning.
+static LINK: AtomicU32 = AtomicU32::new(Link::Joining.to_word());
+
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///
 /// The stack is returned immediately rather than once DHCP has produced an address, because the
 /// address arrives in the `report_address` task and the caller has no reason to wait for it:
 /// everything this function starts runs in its own task. `None` means there was no network to join,
 /// either because no credentials were compiled in or because the radio refused to start; in both
-/// cases the rest of the firmware is unaffected.
+/// cases the rest of the firmware is unaffected, and what went wrong is on the state line.
 ///
 /// # Panics
 ///
 /// If the executor has no room left for another task. All three are allocated once, at boot, so
 /// this is a fact about the size of the task pool rather than something that can happen later.
 pub fn join(spawner: Spawner, device: WIFI<'static>) -> Option<Stack<'static>> {
-    let (ssid, password) = credentials()?;
+    let (ssid, password) = match credentials() {
+        Ok(credentials) => credentials,
+        Err(link) => {
+            // Published rather than only logged, because the greeting reads this long after the
+            // boot that caused it, and a reader working backwards from a missing address is being
+            // asked to guess.
+            publish(link);
+
+            return None;
+        }
+    };
 
     info!("joining {}", ssid);
 
@@ -95,6 +131,9 @@ pub fn join(spawner: Spawner, device: WIFI<'static>) -> Option<Stack<'static>> {
         Ok(controller) => controller,
         Err(e) => {
             error!("the radio did not start: {:?}", e);
+
+            publish(Link::NoRadio);
+
             return None;
         }
     };
@@ -118,15 +157,52 @@ pub fn join(spawner: Spawner, device: WIFI<'static>) -> Option<Stack<'static>> {
     Some(stack)
 }
 
-/// The credentials to join with, or `None` if there are none to use.
+/// What the radio is doing right now, as of the last thing this file published.
+///
+/// Never waits and never fails, which is what lets the greeting call it twice a second without
+/// knowing anything about the radio. Six of the seven states it can be in were only ever decided in
+/// this file's own task: what the hardware said is here, and so is what to do about it.
+#[must_use]
+pub fn link() -> Link {
+    Link::from_word(LINK.load(Ordering::Acquire))
+}
+
+/// Records what the radio is doing, for [`link`] to read.
+///
+/// One whole word, so there is no order to get right between two halves of an answer. Release and
+/// acquire rather than `Relaxed` because the word is written by the radio's task and read by the
+/// greeting's, and the chip has one core: this is the ordering that makes the write visible.
+fn publish(link: Link) {
+    LINK.store(link.to_word(), Ordering::Release);
+}
+
+/// The address in a stack's IPv4 configuration, in the form the firmware prints.
+///
+/// In one place because the greeting in `src/bin/main.rs` and the report below both print an
+/// address, and two places turning one configuration into an [`Address`] are two places that can
+/// print two different ones.
+#[must_use]
+pub fn address(config: &StaticConfigV4) -> Address {
+    // `embassy-net` speaks in `smoltcp`'s address types, which since `smoltcp` 0.13 are the ones in
+    // `core::net` — the same types everything else on the chip uses, and the ones `defmt` prints.
+    Address {
+        ip: config.address.address(),
+        prefix_len: config.address.prefix_len(),
+    }
+}
+
+/// The credentials to join with, or the [`Link`] that says why there are none to use.
 ///
 /// [`SSID`] is what says whether there are credentials at all: a build with no `WIFI_SSID`
-/// compiled in has no network to join, which is the normal state of the gate and of CI.
-fn credentials() -> Option<(Ssid, Password)> {
-    let ssid = SSID?;
+/// compiled in has no network to join, which is the normal state of the gate and of CI. The two
+/// answers are different states because they are different problems — one is a build with nothing to
+/// try, the other is a build with something in it the radio will not accept — and a reader who
+/// cannot tell them apart will look in the wrong place.
+fn credentials() -> Result<(Ssid, Password), Link> {
+    let ssid = SSID.ok_or(Link::NoNetwork)?;
     let password = PASSWORD.unwrap_or_default();
 
-    Some((
+    Ok((
         usable("SSID", Ssid::try_from(ssid))?,
         usable("password", Password::try_from(password))?,
     ))
@@ -134,16 +210,16 @@ fn credentials() -> Option<(Ssid, Password)> {
 
 /// Reports a credential the radio cannot use, and gives up on it.
 ///
-/// Both values are compiled in, so this is a mistake in the environment the firmware was built
-/// from rather than anything that can be recovered from at runtime.
-fn usable<T>(what: &str, parsed: Result<T, WifiError>) -> Option<T> {
-    match parsed {
-        Ok(value) => Some(value),
-        Err(e) => {
-            error!("the {} is not usable: {:?}", what, e);
-            None
-        }
-    }
+/// Both values are compiled in, so this is a mistake in the environment the firmware was built from
+/// rather than anything that can be recovered from at runtime. The [`Link`] it answers with is the
+/// one the state line prints and this line is about, so the two cannot disagree about what went
+/// wrong.
+fn usable<T>(what: &str, parsed: Result<T, WifiError>) -> Result<T, Link> {
+    parsed.map_err(|e| {
+        error!("the {} is not usable: {:?}", what, e);
+
+        Link::UnusableCredential
+    })
 }
 
 /// Keeps the station joined, and joins again when the link drops.
@@ -154,9 +230,15 @@ fn usable<T>(what: &str, parsed: Result<T, WifiError>) -> Option<T> {
 #[embassy_executor::task]
 async fn keep_joined(mut controller: WifiController<'static>) {
     loop {
+        // Published before the attempt rather than after it: an attempt takes seconds, and a state
+        // line that still says "joined" for as long as one takes is wrong for as long as one takes.
+        publish(Link::Joining);
+
         match controller.connect_async().await {
             Ok(joined) => {
                 info!("joined {}", joined.ssid);
+
+                publish(Link::Joined);
 
                 // This is where the time until the link drops is spent. After a failed attempt there
                 // is nothing to wait for: the controller knows it is not connected, and refuses to
@@ -164,6 +246,10 @@ async fn keep_joined(mut controller: WifiController<'static>) {
                 if let Err(e) = controller.wait_for_disconnect_async().await {
                     error!("lost the link: {:?}", e);
                 }
+
+                // The link is down from here until the next attempt starts, and the retry below would
+                // otherwise spend five seconds of it claiming that this chip is on a network.
+                publish(Link::Joining);
             }
             Err(e) => {
                 report(&e);
@@ -175,7 +261,7 @@ async fn keep_joined(mut controller: WifiController<'static>) {
     }
 }
 
-/// Says why the last attempt to join did not work.
+/// Says why the last attempt to join did not work, and publishes it.
 ///
 /// A disconnected station is reported by the radio as a numbered reason out of about fifty, which
 /// answers "what did the hardware say" and leaves "what do I do about it" to whoever is reading the
@@ -185,19 +271,37 @@ async fn keep_joined(mut controller: WifiController<'static>) {
 /// far away.
 ///
 /// `poc_report` decides the wording and is tested on the host; the radio's own words are still printed
-/// underneath for anything this does not name.
-fn report(error: &ConnectionError) {
-    match error {
-        ConnectionError::Failed(info) => error!(
-            "could not join {}: {} ({:?})",
-            info.ssid,
-            defmt::Display2Format(&Failure {
+/// underneath for anything this does not name. Published rather than only printed, because the last
+/// failure is what the greeting keeps saying for as long as the link is down — which, with the retry
+/// above, is most of the time on a network that is not there.
+fn report(failure: &ConnectionError) {
+    match failure {
+        ConnectionError::Failed(info) => {
+            let failure = JoinFailure {
                 reason: named(info.reason),
                 signal: measured(info.rssi),
-            }),
-            info.reason,
-        ),
-        other => error!("could not join: {:?}", other),
+            };
+
+            publish(Link::Failed(failure));
+
+            error!(
+                "could not join {}: {} ({:?})",
+                info.ssid,
+                defmt::Display2Format(&failure),
+                info.reason,
+            );
+        }
+        // Not a join at all, so there is no network name and no signal to report either: whatever the
+        // radio said is in the line below, and the state line says only that the attempt did not work
+        // and that this firmware has no name for why.
+        other => {
+            publish(Link::Failed(JoinFailure {
+                reason: Reason::Other,
+                signal: None,
+            }));
+
+            error!("could not join: {:?}", other);
+        }
     }
 }
 
@@ -282,16 +386,10 @@ async fn run_stack(mut runner: Runner<'static, Interface>) {
 async fn report_address(stack: Stack<'static>) {
     stack.wait_config_up().await;
 
-    // `embassy-net` speaks in `smoltcp`'s address types, which since `smoltcp` 0.13 are the ones in
-    // `core::net` — the same types everything else on the chip uses, and the ones `defmt` prints.
     if let Some(config) = stack.config_v4() {
-        info!(
-            "address {}",
-            defmt::Display2Format(&Address {
-                ip: config.address.address(),
-                prefix_len: config.address.prefix_len(),
-            })
-        );
+        // Printed by `address`, the same function the greeting reads the address with, so this task
+        // and the state line cannot end up naming two different networks.
+        info!("address {}", defmt::Display2Format(&address(&config)));
 
         if let Some(gateway) = config.gateway {
             info!("gateway {}", gateway);
