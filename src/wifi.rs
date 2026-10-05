@@ -324,12 +324,20 @@ fn named(reason: DisconnectReason) -> Reason {
         DisconnectReason::NoAccessPointFoundWithCompatibleSecurity
         | DisconnectReason::NoAccessPointFoundInAuthmodeThreshold
         | DisconnectReason::AuthenticationFailed
-        | DisconnectReason::FourWayHandshakeTimeout
         | DisconnectReason::MicFailure
         | DisconnectReason::IeIn4wayDiffers
         | DisconnectReason::_802_1xAuthenticationFailed
         | DisconnectReason::CipherSuiteRejected
         | DisconnectReason::BadCipherOrAkm => Reason::SecurityRefused,
+
+        // A handshake that started and stopped. This one was grouped with the refusals above, which
+        // made the firmware say the network rejected the password when the radio had reported only
+        // that the exchange ran out of time — seen on a board, at a signal too strong for range to
+        // explain, where the sentence was the one thing in the log that was certainly wrong. It has
+        // its own reason rather than joining the timeouts below because a stalled four-way handshake
+        // is the commonest symptom of a wrong password as well as of a station out of range, and
+        // either of those two sentences would send the reader to the wrong place.
+        DisconnectReason::FourWayHandshakeTimeout => Reason::HandshakeStalled,
 
         // The exchange began and the other end went quiet. From the station's side this is what being
         // too far away looks like: the beacons arrive, the handshake does not.

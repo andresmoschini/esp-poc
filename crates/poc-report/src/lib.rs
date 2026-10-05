@@ -84,6 +84,18 @@ pub enum Reason {
     /// enough to hear a beacon, too weak to finish a handshake.
     NoAnswer,
 
+    /// The handshake began and did not finish, and the radio does not say why.
+    ///
+    /// Its own variant rather than one of the two above because both of them would be a claim the
+    /// radio did not make. A four-way handshake that times out is the commonest symptom of a wrong
+    /// password, and it is also what a station just out of range looks like; `SecurityRefused` says
+    /// the network refused, and `NoAnswer` says it went away, and a timeout establishes neither. What
+    /// the radio reported is that the exchange started and stopped, so that is what this says.
+    ///
+    /// Observed on a board rather than reasoned about: an ESP32-C6 that never joined logged
+    /// `FourWayHandshakeTimeout` at -55 dBm, which is a strong signal and not a refused password.
+    HandshakeStalled,
+
     /// The link came up and then went down.
     LinkLost,
 
@@ -133,6 +145,7 @@ fn write_reason(reason: Reason) -> &'static str {
         Reason::NoSuchNetwork => "nothing with that name was heard",
         Reason::SecurityRefused => "the network refused these credentials",
         Reason::NoAnswer => "the network stopped answering partway through",
+        Reason::HandshakeStalled => "the handshake started and did not finish",
         Reason::LinkLost => "the link came up and then went down",
         Reason::Other => "the radio reported a reason this firmware does not name",
     }
@@ -323,6 +336,11 @@ const fn reason_byte(reason: Reason) -> u8 {
         Reason::NoSuchNetwork => 0,
         Reason::SecurityRefused => 1,
         Reason::NoAnswer => 2,
+        // 3 and 4 are the two this one was added between: `LinkLost` and `Other` keep the bytes they
+        // had. Both are within one firmware build, so renumbering them would change nothing the gate
+        // can see — and a published word that means something else after an edit is not worth the
+        // tidiness of consecutive numbers.
+        Reason::HandshakeStalled => 5,
         Reason::LinkLost => 3,
         Reason::Other => 4,
     }
@@ -339,6 +357,7 @@ const fn reason_from_byte(byte: u8) -> Reason {
         1 => Reason::SecurityRefused,
         2 => Reason::NoAnswer,
         3 => Reason::LinkLost,
+        5 => Reason::HandshakeStalled,
         _ => Reason::Other,
     }
 }

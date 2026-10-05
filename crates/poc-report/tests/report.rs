@@ -81,6 +81,10 @@ fn every_reason_has_a_sentence() {
             Reason::NoAnswer,
             "the network stopped answering partway through",
         ),
+        (
+            Reason::HandshakeStalled,
+            "the handshake started and did not finish",
+        ),
         (Reason::LinkLost, "the link came up and then went down"),
         (
             Reason::Other,
@@ -93,16 +97,21 @@ fn every_reason_has_a_sentence() {
     }
 }
 
-/// The four named reasons are four different problems, and two failures that read alike are the two
-/// that most often get confused: a wrong password and a station that is too far away both arrive as an
-/// exchange that stops. If these ever collapse into one sentence, the distinction that matters on the
-/// board is gone.
+/// The named reasons are different problems, and two failures that read alike are the two that most
+/// often get confused: a wrong password and a station that is too far away both arrive as an exchange
+/// that stops. If these ever collapse into one sentence, the distinction that matters on the board is
+/// gone.
+///
+/// `HandshakeStalled` is here rather than folded into `SecurityRefused` for the same reason. Both of
+/// those two failures arrive as a handshake that did not finish, and the one thing the radio did not
+/// say was which of the two it was.
 #[test]
 fn the_reasons_are_distinguishable() {
     let sentences = [
         Reason::NoSuchNetwork,
         Reason::SecurityRefused,
         Reason::NoAnswer,
+        Reason::HandshakeStalled,
         Reason::LinkLost,
     ]
     .map(|reason| render(&reason));

@@ -255,6 +255,7 @@ fn every_reason_survives_being_published() {
         Reason::NoSuchNetwork,
         Reason::SecurityRefused,
         Reason::NoAnswer,
+        Reason::HandshakeStalled,
         Reason::LinkLost,
         Reason::Other,
     ];

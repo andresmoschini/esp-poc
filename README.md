@@ -31,6 +31,7 @@ It also says when something is wrong, and what:
 | `wifi: joined`                                                                           | the station is on the network                                             |
 | `wifi: joining`                                                                          | an attempt is in progress or due                                          |
 | `wifi: not joined: nothing with that name was heard (signal -81 dBm)`                    | the last failure, in words and with the signal that separates two of them |
+| `wifi: not joined: the handshake started and did not finish (signal -55 dBm)`            | the radio ran out of time mid-handshake and did not say why               |
 | `wifi: nothing to join: no credentials were compiled in`                                 | a build with no `WIFI_SSID`, which is what the gate and CI are            |
 
 The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
@@ -270,35 +271,42 @@ the sentence `the time server's answer did not arrive` is no longer only somethi
 asserts on the host: the firmware has printed it, and the state line degraded the way those tests
 say it should.
 
-And in a fourth run the C6 never joined at all. Eleven attempts over ninety seconds, every one at a
-strong signal, and four different reasons in between:
+And after that the C6 stopped joining at all. Across seven boots on one network the C3 joined every
+time and the C6 joined twice out of five, the last three failures in a row. One of those runs logged
+eleven attempts over ninety seconds, every one at a strong signal, and four different reasons in
+between:
 
 ```text
-[ERROR] could not join my-network: the network refused these credentials (signal -55 dBm) (FourWayHandshakeTimeout)
+[ERROR] could not join my-network: the handshake started and did not finish (signal -55 dBm) (FourWayHandshakeTimeout)
 [ERROR] could not join my-network: the network stopped answering partway through (signal -60 dBm) (AuthenticationExpired)
 [ERROR] could not join my-network: the link came up and then went down (signal -60 dBm) (DisassociatedDueToInactivity)
 ```
 
-The first of those is the firmware claiming more than the radio told it. A `FourWayHandshakeTimeout`
-is a handshake that did not complete; it does not establish that the access point read the password
-and said no. `src/wifi.rs` groups it under "the network was heard and said no", while the adjacent
-`HandshakeTimeout` and `Timeout` are grouped as "the exchange began and the other end went quiet" —
-so the same phenomenon, a handshake not finishing, gets two opposite sentences depending on which
-enum value the driver happened to return. What can be said is that the network was heard at a usable
-signal and the join did not complete.
+The first of those was the firmware claiming more than the radio told it, and it is now fixed: it
+used to print `the network refused these credentials` for a handshake that ran out of time, and now
+prints what the driver reported. What can be said about that run is that the network was heard at a
+usable signal and the join did not complete — a much weaker claim, and the only one the radio
+supported.
+
+The later failures came with a falling signal, from -57 down to -70 dBm, which is a different thing
+going on and not something this repository can explain: the board was on a desk next to a router
+that answered a beacon at -55 dBm in the run above. Nothing here has established why.
 
 None of the following has been observed:
 
 - that SNTP succeeds reliably — two runs answered and one did not;
-- that a join succeeds reliably — three joined and one never did, on the same network;
+- that a join succeeds reliably — the C3 joined every time and the C6 twice out of five, on one
+  network, and nothing here says why;
+- that the new handshake sentence appears at all: `FourWayHandshakeTimeout` came back once in seven
+  boots, so the fix is checked by its test and by the compiler rather than by a log;
 - that either stack keeps running for longer than a minute and a half, or reconnects when the link
-  drops, which is the fourth run's other half and has not been seen;
+  drops, which is the failing runs' other half and has not been seen;
 - that Wokwi runs it, which nothing in the gate exercises either;
 - that the state line describes the radio rather than the last thing this firmware decided the radio
   was doing — it reports what was published, and what was published is only ever one task's word
   about what another task did. That is a property of the design, not something a longer run would
   settle. The fourth run is a sharper version of the same point: the line named a cause the driver
-  never reported.
+  never reported, and that one has since been fixed.
 
 What the gate verifies is the part it can see: both chips build in both profiles and are lint-clean
 on each. The credentials are compiled in from `.cargo/local.toml`, and nothing checks that they
