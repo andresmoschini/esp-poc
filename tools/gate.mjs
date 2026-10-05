@@ -8,11 +8,11 @@
 //
 // The obvious shape for a Rust repository is a host-side `xtask` crate with a `cargo xtask` alias,
 // and that is what the gate started as. It cannot work here, and the reason is in
-// `.cargo/config.toml`: esp-generate sets `[build] target = "riscv32imac-unknown-none-elf"` so that a
-// bare `cargo build` or `cargo run` targets the chip. `[build] target` applies to every crate in the
-// tree, so a `xtask` crate is built for a RISC-V microcontroller too — and fails, because there is no
-// `std` there and no process to spawn. Measured, and the answer was `error[E0463]: can't find crate
-// for std`.
+// `.cargo/config.toml`: esp-generate sets `[build] target = "riscv32imc-unknown-none-elf"` (or
+// `riscv32imc-unknown-none-elf`) so that a bare `cargo build` or `cargo run` targets the chip.
+// `[build] target` applies to every crate in the tree, so a `xtask` crate is built for a RISC-V
+// microcontroller too — and fails, because there is no `std` there and no process to spawn.
+// Measured, and the answer was `error[E0463]: can't find crate for std`.
 //
 // The two escapes both cost more than the crate saves. A per-crate `[target]` table does not exist,
 // and Cargo discovers configuration from the current directory upward rather than from

@@ -84,6 +84,10 @@ esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32c6"] }
 # have before: a preemptive scheduler (`esp-rtos`), a heap (`esp-alloc`, which is why the firmware
 # is no longer heap-free), and an executor for the async API the driver exposes (`embassy`). The
 # TCP/IP stack that hands out the DHCP address is `embassy-net`, which runs on the same executor.
+#
+# The version is pinned exactly, and the two `opt-level = 3` overrides below are not noise: the radio
+# blobs need level 2 or 3 whatever the profile says, and without them Wi-Fi fails to connect for
+# reasons that look like a bug in the code above.
 esp-radio       = { version = "=1.0.0-beta.1", features = ["defmt", "esp32c6", "wifi"] }
 esp-rtos        = { version = "0.4.0", features = [
   "defmt",

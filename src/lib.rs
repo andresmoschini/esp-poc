@@ -1,4 +1,3 @@
-//! Firmware for the `esp32c6` proof of concept.
 //!
 //! The proof of concept is the network and then the time: [`wifi`] brings up the radio and hands
 //! back a stack, [`ntp`] asks a time server what time it is over that stack, and [`clock`] is where

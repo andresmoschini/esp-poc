@@ -31,12 +31,10 @@ static ANSWERED: AtomicBool = AtomicBool::new(false);
 /// The number of seconds between this chip's own count of seconds and real time, at the moment of
 /// the last answer.
 ///
-/// The offset rather than the time itself, for two reasons that turn out to be the same reason.
-/// What [`time`] has to do with an answer is add the time that has passed since to it, so the
-/// difference between a real time and this chip's zero is all the arithmetic ever needs — and that
-/// difference is small, where a date is not. It also has to be small: this core has 32-bit atomics
-/// and no 64-bit ones, so a count of seconds since 1970 cannot be one atomic no matter what it is
-/// asked to hold.
+/// The offset rather than the time itself, and the difference is small where a date is not: what
+/// [`time`] has to do with an answer is add the time that has passed since to it, so the difference
+/// between a real time and this chip's zero is all the arithmetic ever needs. A count of seconds
+/// since 1970 is not a small difference, and an `i32` of them is [`storable`]'s whole job.
 static OFFSET: AtomicI32 = AtomicI32::new(0);
 
 /// How many steps from a reference clock the server that answered last was.
@@ -48,9 +46,9 @@ static STRATUM: AtomicU8 = AtomicU8::new(0);
 
 /// How long the chip had been running when a server last answered, in seconds.
 ///
-/// An `u32` rather than a `u64` for the reason [`OFFSET`] is an `i32`: this core has no 64-bit
-/// atomics. 136 years of running time is more than the clock will ever hold, and the saturation in
-/// [`seconds_in_a_word`] is what it reaches rather than something a reader of the greeting can.
+/// An `u32` rather than a `u64` because 136 years of running time is more than the clock will ever
+/// hold, and the saturation in [`seconds_in_a_word`] is what it reaches rather than something a
+/// reader of the greeting can.
 static ANSWERED_AT: AtomicU32 = AtomicU32::new(0);
 
 /// What stood between this chip and a time, the last time something did.
@@ -178,7 +176,7 @@ fn seconds_in_a_word(secs: u64) -> u32 {
     u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
-/// The offset between a real time and this chip's zero, in as many bits as this core can hold.
+/// The offset between a real time and this chip's zero, in the one word a reader can take whole.
 ///
 /// A count of seconds fits in about 68 years either way of the chip's own zero, and a time further
 /// from that than 68 years is not one this firmware can put anywhere near a wall. Saturating rather
@@ -187,7 +185,7 @@ fn seconds_in_a_word(secs: u64) -> u32 {
 ///
 /// The date this stops serving correctly on is 2038-01-19, which is where an `i32` of seconds since
 /// 1970 runs out — a reading after it lags by however far past that it is, rather than jumping
-/// backwards. Fixing it means a 64-bit static, which means a target with 64-bit atomics.
+/// backwards. Fixing it means a 64-bit static, which no reader on this target could take in one go.
 fn storable(epoch_secs: u64, since_boot_secs: u64) -> i32 {
     let since_boot = i64::try_from(since_boot_secs).unwrap_or(i64::MAX);
     let offset = i64::try_from(epoch_secs)

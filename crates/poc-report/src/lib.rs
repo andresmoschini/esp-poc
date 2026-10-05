@@ -250,10 +250,10 @@ impl Link {
 
     /// The word this state is published as, for [`Self::from_word`] to read back.
     ///
-    /// One word rather than several held in a fixed order, and the reason is the chip: this core has
-    /// 32-bit atomics and no 64-bit ones, so a value wider than that is two words and an ordering
-    /// argument between them — one that a reader from another task can only get right by trusting
-    /// the order two writers happened to use. A single word cannot be half written.
+    /// One word rather than several held in a fixed order, because several is more than one write
+    /// and an ordering argument between them — one that a reader from another task can only get
+    /// right by trusting the order two writers happened to use. A single word cannot be half
+    /// written.
     ///
     /// `const` because the static in `src/wifi.rs` that holds it has to be initialized by one.
     #[must_use]

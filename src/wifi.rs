@@ -3,8 +3,9 @@
 //! Wi-Fi on this chip is three pieces the project did not have before, and each one is a
 //! precondition of the next:
 //!
-//! - `esp-radio` drives the radio. On the `ESP32-C6` it is a device on the internal SDIO bus, so
-//!   unlike the original `ESP32` there are no pins to choose and no antenna to configure.
+//! - `esp-radio` drives the radio. On this chip it is part of the chip itself, so unlike the
+//!   original `ESP32` there are no pins to choose and no antenna to configure. It still claims a
+//!   peripheral, because claiming one is how `esp-hal` says that only one task may drive the radio.
 //! - `esp-rtos` is the preemptive scheduler that driver needs. It will not start without one, and
 //!   the scheduler has to be running *before* the radio is initialized, which is why [`join`] is
 //!   called after `esp_rtos::start` rather than before.
@@ -25,9 +26,9 @@
 //! second. A build with no credentials says so on that line, rather than leaving a reader to work
 //! out from a missing address that nothing was ever attempted.
 //!
-//! The state is published as one word rather than as the enum itself because this core has 32-bit
-//! atomics and no 64-bit ones, and because a value published as several words is a value whose parts
-//! can be read at different moments. [`Link::to_word`] is the other end of that.
+//! The state is published as one word rather than as the enum itself, because a value published as
+//! several words is a value whose parts can be read at different moments. [`Link::to_word`] is the
+//! other end of that.
 //!
 //! ## Credentials
 //!

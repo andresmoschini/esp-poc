@@ -1,6 +1,5 @@
 # Contributing
 
-Firmware proof of concept for the `esp32c6`, plus the tooling around it.
 
 Two files, one job each. The **README** is for arriving: what the project is, what you need, how to
 get it onto a board. This file is for changing it. The rules an agent cannot infer from the code are

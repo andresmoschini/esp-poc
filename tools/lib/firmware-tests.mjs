@@ -1,10 +1,11 @@
 // Running the firmware's own tests, which is a step rather than a line in the `GATE` array because
 // what it runs is not known until it runs, and not from where it runs.
 //
-// The firmware is built for `riscv32imac-unknown-none-elf`, a microcontroller with no process to run a
-// test binary in, so its tests cannot be run the way the orchestrator's are. What can be tested is the
-// part of the firmware that does not talk to hardware, and that part is a crate of its own: it has no
-// dependencies and is `#![no_std]`, so it builds for the host as well as for the chip.
+// The firmware is built for `riscv32imc-unknown-none-elf` or `riscv32imac-unknown-none-elf`, a
+// microcontroller with no process to run a test binary in, so its tests cannot be run the way the
+// orchestrator's are. What can be tested is the part of the firmware that does not talk to hardware,
+// and that part is a crate of its own: it has no dependencies and is `#![no_std]`, so it builds for
+// the host as well as for the chip.
 //
 // ## Why Cargo is run from outside the repository
 //

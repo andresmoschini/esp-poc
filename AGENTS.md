@@ -138,6 +138,10 @@ this file.
 - The firmware enables `esp-hal/unstable` and has to: the Wi-Fi peripheral singleton and the
   scheduler's time driver are behind it. Every new `unstable` API used is one more thing a future
   `esp-hal` may rename, so prefer the stable surface where one exists.
+- The statics in `src/clock.rs` and `src/wifi.rs` are one word wide deliberately rather than by
+  default. Each holds a value that another task reads, so it is published as a single atomic that a
+  reader can take whole; this target has no atomic wider than a word, so `AtomicU64` is not a type
+  this firmware can name. Widening one of them is a design change, not a simplification.
 - `esp-radio` is pinned to an exact pre-release (`=1.0.0-beta.1`) and needs `opt-level = 3` in both
   profiles, or Wi-Fi fails to connect for reasons that look like a bug in your code. The overrides
   are in `Cargo.toml`; do not remove them thinking they are noise.

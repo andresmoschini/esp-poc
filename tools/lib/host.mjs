@@ -2,10 +2,11 @@
 //
 // `.cargo/config.toml` sets `[build] target` so that a bare `cargo build` is the firmware rather
 // than a host binary, and that setting applies to every crate in the tree. A `cargo test` without an
-// explicit `--target` therefore builds the test harness for `riscv32imac-unknown-none-elf` — which
-// compiles, and then cannot run anywhere. The escape is `--target`, and the trap is hard-coding the
-// triple: the answer is a property of the machine, so a gate that spells one out is green on the
-// machine it was written on and broken on every other one, CI included.
+// explicit `--target` therefore builds the test harness for `riscv32imc-unknown-none-elf` or
+// `riscv32imac-unknown-none-elf` — which compiles, and then cannot run anywhere. The escape is
+// `--target`, and the trap is hard-coding the triple: the answer is a property of the machine, so a
+// gate that spells one out is green on the machine it was written on and broken on every other one,
+// CI included.
 //
 // `rustc -vV` prints the triple this toolchain was built for, which is by definition the one that
 // can run what it compiles.

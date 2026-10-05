@@ -12,7 +12,10 @@
 codegen
 datasheet
 devkitc
+devkitm
 imac
+imc
+jtag
 microcontroller
 msvc
 riscv
