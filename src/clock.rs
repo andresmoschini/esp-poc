@@ -185,7 +185,8 @@ fn seconds_in_a_word(secs: u64) -> u32 {
 ///
 /// The date this stops serving correctly on is 2038-01-19, which is where an `i32` of seconds since
 /// 1970 runs out — a reading after it lags by however far past that it is, rather than jumping
-/// backwards. Fixing it means a 64-bit static, which no reader on this target could take in one go.
+/// backwards. Fixing it means a 64-bit static, which on either chip would be published through
+/// `portable-atomic` and read one chunk at a time inside a critical section.
 fn storable(epoch_secs: u64, since_boot_secs: u64) -> i32 {
     let since_boot = i64::try_from(since_boot_secs).unwrap_or(i64::MAX);
     let offset = i64::try_from(epoch_secs)

@@ -25,7 +25,8 @@ concurrency:
 env:
   # Without this, cargo decides from whether it thinks it has a terminal, and in CI it does not — so
   # a clippy diagnostic arrives as an undifferentiated wall of `--> src/bin/main.rs:44:9`. The gate
-  # runs three cargo steps that can each produce a page of those, and a gate you cannot read is a
+  # runs three cargo steps that each produce a page of those — once per chip, so six — and a gate you
+  # cannot read is a
   # gate nobody fixes.
   CARGO_TERM_COLOR: always
 
@@ -45,7 +46,7 @@ jobs:
           cache: npm
 
       # Reads rust-toolchain.toml and installs exactly what it names: the pinned nightly, the
-      # components the gate's fmt and clippy steps run, and the chip's target. Spelled out rather than
+      # components the gate's fmt and clippy steps run, and both chips' targets. Spelled out rather than
       # left to the toolchain being installed on first use, because rustup now reports that behavior
       # as deprecated.
       - name: Install the pinned Rust toolchain
@@ -56,6 +57,11 @@ jobs:
       # `core` itself included — and leaves roughly 360 MB under target/. That is paid on every single
       # run otherwise, and paid twice over because the gate builds in both the debug and release
       # profiles.
+      #
+      # It is also paid twice for a different reason: the gate builds every `cargo` step once per chip,
+      # so a warm cache has to hold artifacts for two target triples rather than one. The cache key
+      # includes the compiler and this file, so both chips' artifacts live under one key and neither
+      # evicts the other.
       #
       # No `toolchain:` input is given on purpose. rust-cache reads rust-toolchain.toml when the input
       # is absent, and giving it a channel as well means two places deciding which compiler runs —

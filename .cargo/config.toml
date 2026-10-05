@@ -5,6 +5,12 @@
 # checkout builds without it.
 include = ["esp-config.toml", "local.toml"]
 
+# One `runner` per chip rather than one per build. A runner is keyed by target triple, and the two
+# chips need different ones, so both are here and the build picks the one its triple names. This is
+# the only file that says what `--chip` espflash is told, and it says it once per chip.
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3 --log-format defmt"
+
 [target.riscv32imac-unknown-none-elf]
 runner = "espflash flash --monitor --chip esp32c6 --log-format defmt"
 
@@ -16,7 +22,27 @@ rustflags = [
   "-Z", "stack-protector=all",
 ]
 
-target = "riscv32imac-unknown-none-elf"
+# The default chip, and the only line here that Cargo cannot derive from a feature: it decides what a
+# bare `cargo build` is, and it has to be one triple rather than whichever is asked for. `esp32c3` in
+# `default` in `Cargo.toml` has to agree with it, and the gate's `chips` step is what checks that,
+# because nothing in Cargo can. To build for the other one, name both:
+#
+#     cargo build --no-default-features --features esp32c6 --target riscv32imac-unknown-none-elf
+#
+# which is what `tools/lib/chip.mjs` builds, and what the gate's own steps run.
+#
+# Getting the pairing wrong is a build error and not a wrong firmware. Measured on both chips,
+# `esp-metadata` refuses a triple its features do not match, with "Seems you are building for an
+# unsupported or wrong target (e.g. the host environment)".
+#
+# `imc` and not `imac`: the `a` in `imac` is the RISC-V atomic extension, and the C3 does not have it.
+# Measured on the pinned toolchain, `rustc --print cfg --target riscv32imc-unknown-none-elf` prints
+# `target_has_atomic_load_store="32"` and no `target_has_atomic`, where `imac` prints both, and the
+# target spec says `max-atomic-width = 32` with `atomic-cas = false`. So `compare_exchange` is not
+# offered at any width on the C3 and `AtomicU64` is not a type it can name — which is also true of the
+# C6, whose triple has the extension but no atomic wider than a word. `esp-hal`'s chip feature turns
+# on `portable-atomic/unsafe-assume-single-core` for the drivers that need read-modify-write anyway.
+target = "riscv32imc-unknown-none-elf"
 
 [unstable]
 # `alloc` is here because Wi-Fi is: the radio driver and the TCP/IP stack above it both allocate.

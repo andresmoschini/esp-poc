@@ -12,6 +12,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { CHIPS } from "./lib/chip.mjs";
 import { FIX, GATE } from "./gate.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -83,13 +84,51 @@ test("every fixer is a step the gate checks", () => {
 // `run()` cannot execute: it throws on an unknown kind, which would stop the gate mid-pass rather than
 // report that step as failed.
 test("every step is an action `run` knows how to execute", () => {
-  const kinds = ["spawn", "tool", "here"];
+  const kinds = ["spawn", "tool", "here", "each"];
 
   for (const step of GATE) {
     assert.ok(
       kinds.includes(step.action.kind),
       `step \`${step.name}\` has action kind \`${step.action.kind}\``,
     );
+  }
+});
+
+// The one step that is several commands rather than one has to be several commands for *every* chip.
+// A step that reads a chip's arguments out of anything but `chipArgs` has restated the chip somewhere
+// that no test covers, and the failure is a build error about a triple rather than a wrong answer.
+test("every multi-command step asks for each chip by name", () => {
+  const perChip = GATE.filter((step) => step.action.kind === "each");
+
+  assert.ok(perChip.length > 0, "no step runs per chip, so no chip is checked by the gate");
+
+  for (const step of perChip) {
+    for (const chip of CHIPS) {
+      const action = step.action.one(chip);
+
+      assert.ok(
+        action.args.includes(chip.feature) && action.args.includes(chip.triple),
+        `step \`${step.name}\` does not pass ${chip.feature} and ${chip.triple} to ${action.program}`,
+      );
+    }
+  }
+});
+
+// Everything after a bare `--` is the compiler's, not Cargo's. Putting a chip's selection on the wrong
+// side of it produces `error: Unrecognized option: 'no-default-features'` from clippy-driver, which
+// names neither the chip nor the file to open — measured, on the step that had it.
+test("no step puts a chip's arguments after a `--`", () => {
+  for (const step of GATE) {
+    if (step.action.kind !== "spawn") {
+      continue;
+    }
+
+    const separator = step.action.args.indexOf("--");
+    const chips = step.action.args.filter((arg) => CHIPS.some((chip) => arg === chip.triple));
+
+    if (separator !== -1 && chips.length > 0) {
+      assert.fail(`step \`${step.name}\` names a triple after \`--\`, where Cargo never reads it`);
+    }
   }
 });
 

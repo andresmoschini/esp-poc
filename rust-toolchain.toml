@@ -14,4 +14,7 @@ channel    = "nightly-2026-10-02"
 # `[unstable] build-std` reads. All three are named here rather than added by hand so that `rustup
 # toolchain install` — which is all CI does — produces a tree the gate can run on.
 components = ["rust-src", "rustfmt", "clippy"]
-targets    = ["riscv32imac-unknown-none-elf"]
+# Both chips' targets, because both chips build from this tree and `rustup toolchain install` — which
+# is all CI does — has to be able to produce a tree the gate can run on. Neither triple is the default:
+# they differ in the RISC-V atomic extension, and the answer is in `.cargo/config.toml`.
+targets    = ["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"]

@@ -830,7 +830,7 @@ dependencies = [
  "esp-sync",
  "esp32",
  "esp32c2",
- "esp32c3",
+ "esp32c3 0.33.0",
  "esp32c5",
  "esp32c6 0.24.0",
  "esp32c61",
@@ -890,7 +890,9 @@ dependencies = [
  "esp-hal",
  "esp-metadata-generated",
  "esp-sync",
+ "esp-wifi-sys-esp32c3",
  "esp-wifi-sys-esp32c6",
+ "esp32c3 0.34.0",
  "esp32c6 0.25.0",
 ]
 
@@ -960,6 +962,7 @@ dependencies = [
  "esp-wifi-sys-esp32s2",
  "esp-wifi-sys-esp32s3",
  "esp-wifi-sys-esp32s31",
+ "esp32c3 0.34.0",
  "esp32c6 0.25.0",
  "heapless 0.9.3",
  "ieee802154",
@@ -1001,6 +1004,7 @@ checksum = "e933ff78374b763b65998b64ad671b4890ed4ba13a80deff9f53afe95ede289d"
 dependencies = [
  "document-features",
  "esp-metadata-generated",
+ "esp32c3 0.33.0",
  "esp32c6 0.24.0",
 ]
 
@@ -1042,6 +1046,7 @@ dependencies = [
  "esp-metadata-generated",
  "esp-rom-sys",
  "esp-sync",
+ "esp32c3 0.33.0",
  "esp32c6 0.24.0",
 ]
 
@@ -1160,6 +1165,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffb892f670ff857033c1624f99ecba1a3f3cafa05c45d734bc129388276715cf"
 dependencies = [
  "defmt 1.1.1",
+ "vcell",
+]
+
+[[package]]
+name = "esp32c3"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "569e03d871eac998bc62ef95a9a6d31a91fc0aaef0e0017a6b5a6a9c4759768a"
+dependencies = [
  "vcell",
 ]
 

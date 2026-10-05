@@ -59,43 +59,82 @@ version      = "0.1.0"
 name = "esp-poc"
 path = "./src/bin/main.rs"
 
-[dependencies]
-# `unstable` is not optional for this firmware any more: the Wi-Fi peripheral singleton and the
-# scheduler's time driver are behind it, and there is no stable API for Wi-Fi on this chip.
-esp-hal = { version = "~1.2.2", features = ["defmt", "esp32c6", "unstable"] }
+# Which chip to build for, as a feature rather than a second branch.
+#
+# Every one of the seven Espressif dependencies below has an `esp32c3` and an `esp32c6` feature, and
+# none of the other seven has a chip feature at all, so the whole selection is these two lists. The
+# rule is one line per direct dependency that has a chip feature — not the shortest list that happens
+# to work. They do forward transitively (`esp-radio/esp32c3` reaches `esp-hal/esp32c3`), but two of
+# those edges are gated on an optional dependency this package does not enable, and an edge that
+# disappears in a patch release would take the chip with it.
+#
+# `default` has to name the same chip as `[build] target` in `.cargo/config.toml`, and Cargo offers no
+# way to check that: it will not read a configuration value out of a feature, nor a feature out of a
+# manifest it is already reading. `tools/lib/chip.mjs` holds the pairing and the gate's `chips` step is
+# what compares the two files, because the failure otherwise is `esp-metadata` saying the target is
+# wrong, or a missing `Peripherals` field, neither of which names what to change.
+#
+# Anything outside this repository that is about a chip rather than about the code — the triple in
+# `rust-toolchain.toml`, the `runner` in `.cargo/config.toml`, the reserved pins in `src/bin/main.rs`
+# behind `#[cfg(feature = ...)]` — is listed there instead of here.
+[features]
+default = ["esp32c3"]
+esp32c3 = [
+  "esp-hal/esp32c3",
+  "esp-alloc/esp32c3",
+  "esp-backtrace/esp32c3",
+  "esp-bootloader-esp-idf/esp32c3",
+  "esp-println/esp32c3",
+  "esp-radio/esp32c3",
+  "esp-rtos/esp32c3",
+]
+esp32c6 = [
+  "esp-hal/esp32c6",
+  "esp-alloc/esp32c6",
+  "esp-backtrace/esp32c6",
+  "esp-bootloader-esp-idf/esp32c6",
+  "esp-println/esp32c6",
+  "esp-radio/esp32c6",
+  "esp-rtos/esp32c6",
+]
 
+[dependencies]
+# `unstable` is not optional for this firmware any more. The Wi-Fi peripheral singleton is behind it on
+# the `esp32c6` and the hardware RNG that seeds the network stack is behind it on the `esp32c3`, and
+# there is no stable API for Wi-Fi on either chip. Every new `unstable` API used is one more thing a
+# future `esp-hal` may rename, so prefer the stable surface where one exists. The chip itself is the
+# feature above, not here.
+esp-hal = { version = "~1.2.2", features = ["defmt", "unstable"] }
 
 # `ip_in_core` is what makes `defmt` know how to print the `core::net` address types the network
 # stack hands back, which are the same types `core` uses.
 defmt                  = { version = "1.0.1", features = ["ip_in_core"] }
-esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt", "esp32c6"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt"] }
 
 critical-section = "1.2.0"
 esp-backtrace = { version = "0.20.0", features = [
   "defmt",
-  "esp32c6",
   "panic-handler",
 ] }
-esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32c6"] }
+esp-println = { version = "0.18.0", features = ["defmt-espflash"] }
 
 # The proof of concept: Wi-Fi.
 #
-# `esp-radio` drives the radio over SDIO on this chip, and needs three things this project did not
-# have before: a preemptive scheduler (`esp-rtos`), a heap (`esp-alloc`, which is why the firmware
-# is no longer heap-free), and an executor for the async API the driver exposes (`embassy`). The
-# TCP/IP stack that hands out the DHCP address is `embassy-net`, which runs on the same executor.
+# `esp-radio` drives the radio, and needs three things this project did not have before: a preemptive
+# scheduler (`esp-rtos`), a heap (`esp-alloc`, which is why the firmware is no longer heap-free), and
+# an executor for the async API the driver exposes (`embassy`). The TCP/IP stack that hands out the
+# DHCP address is `embassy-net`, which runs on the same executor.
 #
 # The version is pinned exactly, and the two `opt-level = 3` overrides below are not noise: the radio
 # blobs need level 2 or 3 whatever the profile says, and without them Wi-Fi fails to connect for
 # reasons that look like a bug in the code above.
-esp-radio       = { version = "=1.0.0-beta.1", features = ["defmt", "esp32c6", "wifi"] }
+esp-radio       = { version = "=1.0.0-beta.1", features = ["defmt", "wifi"] }
 esp-rtos        = { version = "0.4.0", features = [
   "defmt",
   "embassy",
   "esp-radio",
-  "esp32c6",
 ] }
-esp-alloc       = { version = "0.11.0", features = ["esp32c6"] }
+esp-alloc       = "0.11.0"
 embassy-executor = "0.10.0"
 # `defmt` is what makes the stack's own error types printable, `dns` and `udp` are what `src/ntp.rs`
 # asks the stack for — without them there is no resolver to turn a server's name into an address, and

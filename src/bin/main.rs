@@ -37,26 +37,59 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[main]
 async fn main(spawner: Spawner) -> ! {
     // generator version: 1.4.0
-    // generator parameters: -o esp32c6 -o stack-smashing-protection -o ci -o agents -o defmt -o esp-backtrace -o wokwi -o vscode -o 1.98.1-x86_64-pc-windows-msvc -o esp32c6-mini-1
-
+    // generator parameters: one per chip, in the block below that reserves its pins.
+    //
+    // The generator emits a reserved-pin list per chip and there is no way to ask it for both at once,
+    // so these two blocks are what two branches would have said here, kept in one file and one chip
+    // apart. Each is what `esp-generate` produces for its board; the pins are the ones in use by
+    // something on the module, and a binding's only job is to be the move that reserves the
+    // peripheral — which is why `no_effect_underscore_binding` is allowed in `[lints.clippy]` and not
+    // here.
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // The following pins are used to bootstrap the chip. They are available
-    // for use, but check the datasheet of the module for more information on them.
-    // - GPIO4
-    // - GPIO5
-    // - GPIO8
-    // - GPIO9
-    // - GPIO15
-    // These GPIO pins are in use by some feature of the module and should not be used.
-    let _gpio24 = peripherals.GPIO24;
-    let _gpio25 = peripherals.GPIO25;
-    let _gpio26 = peripherals.GPIO26;
-    let _gpio27 = peripherals.GPIO27;
-    let _gpio28 = peripherals.GPIO28;
-    let _gpio29 = peripherals.GPIO29;
-    let _gpio30 = peripherals.GPIO30;
+    #[cfg(feature = "esp32c6")]
+    {
+        // generator parameters: -o esp32c6 -o stack-smashing-protection -o ci -o agents -o defmt -o
+        // esp-backtrace -o wokwi -o vscode -o 1.98.1-x86_64-pc-windows-msvc -o esp32c6-mini-1
+        //
+        // The following pins are used to bootstrap the chip. They are available
+        // for use, but check the datasheet of the module for more information on them.
+        // - GPIO4
+        // - GPIO5
+        // - GPIO8
+        // - GPIO9
+        // - GPIO15
+        // These GPIO pins are in use by some feature of the module and should not be used.
+        let _gpio24 = peripherals.GPIO24;
+        let _gpio25 = peripherals.GPIO25;
+        let _gpio26 = peripherals.GPIO26;
+        let _gpio27 = peripherals.GPIO27;
+        let _gpio28 = peripherals.GPIO28;
+        let _gpio29 = peripherals.GPIO29;
+        let _gpio30 = peripherals.GPIO30;
+    }
+
+    #[cfg(feature = "esp32c3")]
+    {
+        // generator parameters: -o esp32c3 -o unstable-hal -o alloc -o wifi -o embassy -o
+        // stack-smashing-protection -o defmt -o esp-backtrace -o wokwi -o vscode -o agents -o
+        // esp32c3-mini-1
+        //
+        // The following pins are used to bootstrap the chip. They are available
+        // for use, but check the datasheet of the module for more information on them.
+        // - GPIO2
+        // - GPIO8
+        // - GPIO9
+        // These GPIO pins are in use by some feature of the module and should not be used.
+        let _gpio11 = peripherals.GPIO11;
+        let _gpio12 = peripherals.GPIO12;
+        let _gpio13 = peripherals.GPIO13;
+        let _gpio14 = peripherals.GPIO14;
+        let _gpio15 = peripherals.GPIO15;
+        let _gpio16 = peripherals.GPIO16;
+        let _gpio17 = peripherals.GPIO17;
+    }
 
     // The radio and the network stack above it allocate, so this firmware is no longer heap-free.
     // The first heap takes the RAM the bootloader reclaimed; the second takes internal RAM.

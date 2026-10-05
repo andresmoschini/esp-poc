@@ -42,9 +42,9 @@ npm run fix      # every fixer, in the one order that works; run before check
 ### The gate is JavaScript, and that is not a preference
 
 `cargo xtask` is the obvious shape for a Rust repository's gate and is what this one started as. It
-cannot work here. `.cargo/config.toml` sets `[build] target = "riscv32imac-unknown-none-elf"` so
-that a bare `cargo build` targets the chip, and that applies to every crate in the tree — so a
-`xtask` crate is built for a microcontroller and fails with `can't find crate for std`. There is no
+cannot work here. `.cargo/config.toml` sets `[build] target = "riscv32imc-unknown-none-elf"` so that
+a bare `cargo build` targets the chip, and that applies to every crate in the tree — so a `xtask`
+crate is built for a microcontroller and fails with `can't find crate for std`. There is no
 per-crate `[target]` table, Cargo reads configuration from the current directory upward rather than
 from `--manifest-path`, and passing an explicit `--target` for the host would mean hard-coding one
 triple into the alias, which breaks on every other machine including CI.
@@ -79,19 +79,28 @@ runs Cargo from outside the repository, and the reason why is longer than the co
 
 The generator wrote these files, and it will overwrite them:
 
-| File                                                   | What has been added since                                                              |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `Cargo.toml`                                           | the `[lints]` and `[workspace]` blocks, and the path dependency on `crates/poc-report` |
-| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`                                      |
-| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                                        |
-| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                                       |
-| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                                |
-| `.cargo/config.toml`                                   | `alloc` in `build-std`, and a second `include` for the untracked `local.toml`          |
-| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                             |
+| File                                                   | What has been added since                                                                                 |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `Cargo.toml`                                           | the `[lints]`, `[workspace]` and `[features]` blocks, and the path dependency on `crates/poc-report`      |
+| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`, and the second chip's target                           |
+| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                                                           |
+| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                                                          |
+| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                                                   |
+| `.cargo/config.toml`                                   | `alloc` in `build-std`, a second `include` for the untracked `local.toml`, and the second chip's `runner` |
+| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                                                |
 
 After re-running the generator, run `npm run check` before committing and put back what it reports
 missing. The generator is told about the gate, CI and the agent file but not about a lints block, a
-pinned channel or a documentation comment, so nothing it does will tell you they were dropped.
+pinned channel, a documentation comment or a `[features]` block, so nothing it does will tell you
+they were dropped.
+
+**The `[features]` block is the trap this repository set for itself.** The generator writes one
+chip's features inline on each dependency, which is exactly what this repository stopped doing:
+regenerating replaces the block with `esp32c3` or `esp32c6` on the seven Espressif dependencies and
+leaves the other chip unable to build, and `src/bin/main.rs`'s other `#[cfg]` block goes with it.
+That one does go red, at the build step, and the message is about a chip's features and not about a
+manifest — so `git diff Cargo.toml` is still the faster way to see it. `CONTRIBUTING.md` carries the
+procedure.
 
 **Three rows in that table are not what they look like**, and they hide five traps between them.
 Take the `[lints]` blocks out and the gate does not go red — it goes quietly weaker, because with
@@ -126,22 +135,42 @@ this file.
 
 ## Project-specific notes
 
-- Target chip: `esp32c6`; keep dependencies, HAL features, and examples compatible with this chip.
+- **Target chips: `esp32c3` (the default) and `esp32c6`.** The chip is a Cargo feature, not a
+  branch: `[features]` in `Cargo.toml` names it for each of the seven Espressif dependencies, and
+  `src/` reaches the chip through `#[cfg(feature = ...)]`. Anything that changes what is built needs
+  a gate step for every chip, which is why the `cargo` steps in `GATE` are loops over
+  `tools/lib/chip.mjs`.
+- **`[build] target` in `.cargo/config.toml` and `default` in `Cargo.toml` have to name the same
+  chip, and nothing in Cargo checks it.** Cargo will not read a configuration value out of a
+  feature, nor a feature out of the manifest it is already reading, so the pairing is restated in
+  two files and the gate's `chips` step is what compares them. A mismatch is a build error that
+  names neither file.
+- The two triples differ in the RISC-V atomic extension: `imac` for the C6, `imc` for the C3, whose
+  `a` it does not have. `rustc --print cfg --target riscv32imc-unknown-none-elf` prints
+  `target_has_atomic_load_store="32"` and no `target_has_atomic`, and the target spec says
+  `max-atomic-width = 32` with `atomic-cas = false`, so `compare_exchange` is not offered at any
+  width there and read-modify-write goes through `portable-atomic` in a critical section. The output
+  this was decided on is recorded in `.cargo/config.toml`.
 - Check the `generator parameters:` comments in `src/bin/main.rs` before changing code that depends
-  on selected generation options.
+  on selected generation options. There is now one per chip, in the `#[cfg]`'d block that reserves
+  that chip's pins — the generator will only ever produce one of them.
 - This is a `#![no_std]` / `#![no_main]` project. Avoid `std`; use `core` and embedded-friendly
   crates.
 - `alloc` **is** enabled, because the Wi-Fi driver and the TCP/IP stack above it allocate: two
   `esp_alloc::heap_allocator!` statics in `src/bin/main.rs` and `build-std = ["core", "alloc"]`.
   Heap-backed types are therefore available; the two heaps are 64 KiB of reclaimed bootloader RAM
-  and 36 KiB of internal RAM, and that budget is the real limit, not whether a type compiles.
-- The firmware enables `esp-hal/unstable` and has to: the Wi-Fi peripheral singleton and the
-  scheduler's time driver are behind it. Every new `unstable` API used is one more thing a future
-  `esp-hal` may rename, so prefer the stable surface where one exists.
+  and 36 KiB of internal RAM, and that budget is the real limit, not whether a type compiles. The
+  bootloader-reclaimed region is 66320 bytes on the C3 against 65536 on the C6, so 64 KiB fits on
+  both.
+- The firmware enables `esp-hal/unstable` and has to: on the C6 the Wi-Fi peripheral singleton is
+  behind it, and on the C3 it is the hardware RNG that seeds the network stack — `esp-metadata`
+  marks `RNG` as unstable for that chip and not for the other. Every new `unstable` API used is one
+  more thing a future `esp-hal` may rename, so prefer the stable surface where one exists.
 - The statics in `src/clock.rs` and `src/wifi.rs` are one word wide deliberately rather than by
   default. Each holds a value that another task reads, so it is published as a single atomic that a
-  reader can take whole; this target has no atomic wider than a word, so `AtomicU64` is not a type
-  this firmware can name. Widening one of them is a design change, not a simplification.
+  reader can take whole; no RISC-V target here has an atomic wider than a word, so `AtomicU64` is
+  not a type this firmware can name on either chip. Widening one of them is a design change, not a
+  simplification.
 - `esp-radio` is pinned to an exact pre-release (`=1.0.0-beta.1`) and needs `opt-level = 3` in both
   profiles, or Wi-Fi fails to connect for reasons that look like a bug in your code. The overrides
   are in `Cargo.toml`; do not remove them thinking they are noise.
@@ -197,8 +226,8 @@ part of the reasoning; read them before changing what reads what.
   binary has no test harness to build — `cargo clippy --all-targets` was measured failing with
   `can't find crate for test`. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
   `src/bin/main.rs` cannot be compiled for a host either, since all five depend on `esp-hal`, on the
-  network stack, or on a scheduler that exists only for this chip, so a test on them needs a board.
-  What _is_ testable is the part that decides rather than talks to hardware, and it lives in
+  network stack, or on a scheduler that exists only on a microcontroller, so a test on them needs a
+  board. What _is_ testable is the part that decides rather than talks to hardware, and it lives in
   `crates/poc-report` so that the gate's `test-firmware` step can run it on the host: no
   dependencies, `#![no_std]`, buildable for both targets. **Put logic there when it is worth
   testing, and expect it not to be there** — logic that needs the radio stays in `src/wifi.rs`
@@ -212,9 +241,18 @@ part of the reasoning; read them before changing what reads what.
   them — so neither can be overridden from the command line or from a closer file. Run from an empty
   directory with `--manifest-path`, they are simply not in play. `tools/lib/firmware-tests.mjs` says
   so where the step is; do not "simplify" it into a plain `cargo test`.
-- **`--all-features` is not a second configuration to keep green.** There is one feature set, chosen
-  by the generator. The day a `Cargo.toml` gains a feature that changes what is built, the gate
-  needs a step that builds both.
+- **`--all-features` is gone, and it is the chip features that took it away.** It used to mean
+  "every feature there is", which was one chip; it is two now, and enabling both at once is not a
+  third configuration to keep green but a contradiction — measured, 43 duplicate definitions out of
+  `esp-metadata-generated` before anything else compiles. Every `cargo` step in `GATE` runs once per
+  chip with `--no-default-features --features <chip> --target <triple>`, and `tools/lib/chip.mjs`
+  builds those four arguments so no step spells them out. Anything after a bare `--` on a
+  `cargo clippy` command line goes to the compiler rather than to Cargo, so chip arguments belong
+  before it — `error: Unrecognized option: 'no-default-features'` is what the other order produces,
+  and it names neither the chip nor the file.
+- **Nothing checks that `.vscode/settings.json` agrees with the default chip.** It is the one place
+  a triple is restated that the gate does not compare, because a stale value there costs phantom
+  errors in the editor rather than a broken build. Change it with `target` in `.cargo/config.toml`.
 
 ## Useful references
 

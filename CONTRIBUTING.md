@@ -1,6 +1,5 @@
 # Contributing
 
-
 Two files, one job each. The **README** is for arriving: what the project is, what you need, how to
 get it onto a board. This file is for changing it. The rules an agent cannot infer from the code are
 in [AGENTS.md](AGENTS.md); this is the process around them.
@@ -38,6 +37,25 @@ The properties the array has to keep:
 - **The reason a step exists lives in its comment.** A step with no comment is a step nobody dares
   remove.
 
+## Adding a chip, or a step that depends on the chip
+
+The chip is a Cargo feature (`[features]` in `Cargo.toml`), so a step that compiles the firmware has
+to compile it once per chip or it checks the default one and calls that green. The three `cargo`
+steps do this by being `forEachChip(...)` steps, which expand to one command per entry in
+`tools/lib/chip.mjs`. Two things to know before writing a fourth:
+
+- Chip arguments go **before** a bare `--` on a `cargo clippy` line. Everything after it is the
+  compiler's, and `--no-default-features` there is `error: Unrecognized option` from clippy-driver.
+- The chip and its target triple are **two separate things** and Cargo will not connect them. Build
+  both with `chipArgs(chip)` rather than spelling them out; `tools/gate.test.mjs` fails a step that
+  names a triple after a `--`, and one that builds a chip without both of its arguments.
+
+`[build] target` in `.cargo/config.toml` and `default` in `Cargo.toml` are the two places the
+default chip is restated outside that table, and nothing in Cargo compares them. The gate's `chips`
+step is what does, which is why it runs first: it is the only step that can report "this repository
+is set up for a chip it has no features for". Change `target` in `.cargo/config.toml` and `default`
+in `Cargo.toml` together, and add the chip to `tools/lib/chip.mjs` in the same commit.
+
 ## Bumping the toolchain
 
 `rust-toolchain.toml` pins a dated nightly, because `-Z build-std` and `-Z stack-protector=all` in
@@ -54,7 +72,7 @@ stale one can fail to link rather than fail loudly, so `cargo clean` first if an
 ## Re-running esp-generate
 
 The generator owns `Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`, `build.rs`, `src/`,
-`wokwi.toml`, `diagram.json`, `.vscode/` and `.github/workflows/`, and it will overwrite them. Six
+`wokwi.toml`, `diagram.json`, `.vscode/` and `.github/workflows/`, and it will overwrite them. Eight
 things have been added to those files by hand, and nothing the generator does will tell you they
 were gone:
 
@@ -67,6 +85,11 @@ were gone:
 5. the formatter settings in `.vscode/settings.json` and the extension list in
    `.vscode/extensions.json`
 6. prettier's reformatting of `.vscode/*.json`, which the generator writes with trailing commas
+7. the `[features]` block in `Cargo.toml`, and the chip's features taken off each dependency's own
+   `features` list — see below
+8. the second chip's `runner` table in `.cargo/config.toml`, the second target in
+   `rust-toolchain.toml`, and `wokwi.c6.toml` / `diagram.c6.json`, which the generator has no
+   opinion about because it only ever emits one chip
 
 **Delete `.github/workflows/rust_ci.yml` if it comes back.** The `-o ci` flag makes the generator
 recreate it, and it builds on `stable` — which cannot build this project, because `-Z build-std` and
@@ -74,11 +97,20 @@ recreate it, and it builds on `stable` — which cannot build this project, beca
 workflow fails next to a passing `ci.yml` instead of replacing it, and the failure says nothing
 about your change.
 
-**Check `git diff Cargo.toml` after generating.** The `[lints]` blocks are the one item on the list
-that can go missing without anything turning red: with them removed, `cargo clippy -- -D warnings`
-is silent, because there are no lints left to warn. Pedantic clippy and `missing_docs` would stop
-being checked on the firmware and on everything added later, and no run would mention it. A green
-gate that is checking less is worse than a red one, because it is believed.
+**Check `git diff Cargo.toml` after generating.** Two of the items on the list are there. The
+`[lints]` blocks are the one that can go missing without anything turning red: with them removed,
+`cargo clippy -- -D warnings` is silent, because there are no lints left to warn. Pedantic clippy
+and `missing_docs` would stop being checked on the firmware and on everything added later, and no
+run would mention it. A green gate that is checking less is worse than a red one, because it is
+believed. The `[features]` block goes the other way and is loud, at the build step, with a message
+about a chip's features rather than about a manifest — the generator puts one chip inline on each
+dependency and the other chip stops existing.
+
+**Regenerating for a chip you already support is the wrong way to reach it.** esp-generate writes
+one chip's features inline and one chip's reserved pins, so regenerating to move between two chips
+this repository already builds means taking two things away as well as one thing back. Change
+`[features]` and the `#[cfg]`'d block in `src/bin/main.rs` by hand; the gate builds every chip, so
+it will say if one of them no longer compiles.
 
 Run `npm run check` after generating and put back whatever it reports. The table in AGENTS.md is the
 list.

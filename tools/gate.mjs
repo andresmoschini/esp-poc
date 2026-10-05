@@ -40,6 +40,7 @@ import { fileURLToPath } from "node:url";
 import { toolEntryPoint } from "./lib/npm-tool.mjs";
 import { check as eolCheck, fix as eolFix } from "./lib/eol.mjs";
 import { isEntryPoint } from "./lib/entry-point.mjs";
+import { CHIPS, chipArgs, defaultChip, defaultFeatureIsConfigured } from "./lib/chip.mjs";
 import { firmwareTests } from "./lib/firmware-tests.mjs";
 import { installedLockfile, nodeToolingState } from "./lib/tooling.mjs";
 
@@ -81,6 +82,43 @@ const toolStep = (packageName, args) => ({ kind: "tool", packageName, args });
  */
 const hereStep = (fn) => ({ kind: "here", fn });
 
+/**
+ * A step that is one step per chip, for the gate to run as if it were one.
+ *
+ * A step's action is a value rather than a command line, so a step can be several commands. This keeps
+ * that to a shape the rest of this file already understands: the gate prints one heading per step and
+ * collects one pass/fail, and a loop inside a step would have to reproduce both. What the operator
+ * sees is one `--- build ---` heading over one chip's output after the other's, which is the same thing
+ * they saw when there was one chip and one heading.
+ *
+ * @param {(chip: object) => object} one The action for a single chip.
+ * @returns {{kind: "each", one: (chip: object) => object}} The step's action.
+ */
+const forEachChip = (one) => ({ kind: "each", one });
+
+/**
+ * Reports whether the default chip in `Cargo.toml` and in `.cargo/config.toml` are the same chip.
+ *
+ * @param {string} root Workspace root.
+ * @returns {boolean} Whether they agree.
+ */
+function chipsAgree(root) {
+  const problems = defaultFeatureIsConfigured(root);
+
+  if (problems.length === 0) {
+    return true;
+  }
+
+  process.stderr.write(
+    `\nThe default chip and the default target are not the same chip.\n` +
+      `${problems.map((problem) => `  - ${problem}\n`).join("")}\n` +
+      `  One is \`default\` in Cargo.toml and the other is \`target\` in .cargo/config.toml.\n` +
+      `  They name one chip in tools/lib/chip.mjs, whose first entry is the default for both.\n\n`,
+  );
+
+  return false;
+}
+
 // Every step of the quality gate, in the order they run.
 //
 // Steps are added here as the gate grows. Order is presentation only: all of them run on every
@@ -92,7 +130,23 @@ const hereStep = (fn) => ({ kind: "here", fn });
 // same way. In both cases the tool knows something is wrong, says so, and the gate does not notice.
 // Closing that would mean matching on the text the tools print, which is brittle in a different and
 // less obvious way.
+//
+// The three `cargo` steps that compile the firmware are spelled as loops over `CHIPS` rather than as
+// one step each. The chip is a Cargo feature, so a feature the gate does not build is a feature
+// nothing checks, and the firmware would stop compiling for the other chip at some commit whose gate
+// was green. `tools/lib/chip.mjs` is where the chip/triple pairing lives; the reason it cannot just be
+// `[build] target` is in the header of that file and in `.cargo/config.toml`.
 export const GATE = [
+  {
+    name: "chips",
+    // Checks the one thing no tool can: that the chip `Cargo.toml` selects by default is the chip
+    // `.cargo/config.toml` builds by default. Nothing in Cargo compares a feature with a configuration
+    // value, so without this step the failure of changing one without the other is `esp-metadata`
+    // saying the target is wrong, or a missing `Peripherals` field — neither of which names the file to
+    // open. It is first because it is the only step that can say "this repository is set up for a chip
+    // it has no features for", which makes every step after it pointless.
+    action: hereStep(chipsAgree),
+  },
   {
     name: "fmt",
     action: spawnStep("cargo", ["fmt", "--all", "--check"]),
@@ -164,25 +218,37 @@ export const GATE = [
   },
   {
     name: "clippy",
-    action: spawnStep("cargo", [
-      "clippy",
-      "--all-features",
-      "--workspace",
-      // `--all-targets` is deliberately absent. It makes Cargo build the test harness of every
-      // target, and a bare-metal `#![no_std]` `#![no_main]` binary has none: measured, it fails with
-      // `error[E0463]: can't find crate for test` and `#[panic_handler] function required`. The
-      // library and the binary are what this repository has to be correct about.
-      "--",
-      // The lints themselves live in `[lints]` in `Cargo.toml`; `-D warnings` is what turns the
-      // warnings they produce into a failure here without making the editor shout while code is half
-      // written.
-      "-D",
-      "warnings",
-    ]),
+    // `--all-features` is gone, and it is the feature that changes what is built that took it away.
+    // It used to mean "every feature there is", which was one chip; it is two chips now, and enabling
+    // both at once is not a third thing to check but a contradiction — measured, 43 duplicate
+    // definitions out of `esp-metadata-generated` before anything else is even compiled. A step that
+    // has to pass for every chip to be green cannot pass for all of them at once, so this runs once
+    // per chip with that chip's feature and `--no-default-features` instead.
+    action: forEachChip((chip) =>
+      spawnStep("cargo", [
+        "clippy",
+        "--workspace",
+        // Before the `--`, and that is not a matter of taste: everything after it is passed to
+        // clippy-driver rather than to Cargo, so `--no-default-features` there is `error: Unrecognized
+        // option` from the compiler rather than a chip selection. It is the reason the chip arguments
+        // are spliced in here instead of appended at the end.
+        ...chipArgs(chip),
+        // `--all-targets` is deliberately absent. It makes Cargo build the test harness of every
+        // target, and a bare-metal `#![no_std]` `#![no_main]` binary has none: measured, it fails with
+        // `error[E0463]: can't find crate for test` and `#[panic_handler] function required`. The
+        // library and the binary are what this repository has to be correct about.
+        "--",
+        // The lints themselves live in `[lints]` in `Cargo.toml`; `-D warnings` is what turns the
+        // warnings they produce into a failure here without making the editor shout while code is half
+        // written.
+        "-D",
+        "warnings",
+      ]),
+    ),
   },
   {
     name: "build",
-    action: spawnStep("cargo", ["build", "--workspace"]),
+    action: forEachChip((chip) => spawnStep("cargo", ["build", "--workspace", ...chipArgs(chip)])),
   },
   {
     name: "build-release",
@@ -190,16 +256,23 @@ export const GATE = [
     // compiled out here and code behind `not(debug_assertions)` only exists there, so a build that is
     // green in one profile can fail in the other — which on a microcontroller is the difference
     // between a bug that reproduces and one that only happens on the device.
-    action: spawnStep("cargo", ["build", "--workspace", "--release"]),
+    action: forEachChip((chip) =>
+      spawnStep("cargo", ["build", "--workspace", "--release", ...chipArgs(chip)]),
+    ),
   },
   {
     name: "doc",
+    // One chip, and only one. `cargo doc` renders the same API for both, and the documentation is not
+    // `#[cfg]`'d on the chip, so a second run would produce a second copy of the same output. The
+    // default chip's arguments are still passed rather than left to `.cargo/config.toml`, so that this
+    // step and the three above cannot end up compiling different chips.
     action: spawnStep("cargo", [
       "doc",
       "--workspace",
       "--no-deps",
       // The rustdoc lints are set to "deny" in `[lints.rustdoc]` in `Cargo.toml`, so a broken
       // intra-doc link fails here on its own; unlike clippy, this step needs no `-D` flag.
+      ...chipArgs(defaultChip()),
     ]),
   },
   {
@@ -409,6 +482,19 @@ async function run(root, step) {
         step.action.args,
         true,
       );
+
+    case "each":
+      // The steps above run even after one fails, and these do not, which is a difference rather than
+      // an oversight: a step is cheap and a firmware build is not, and when one chip does not compile
+      // it is nearly always this repository's own code rather than something about that chip — so the
+      // second build would report the same error a second time, in as many minutes. Read the failure,
+      // fix it, run again.
+      for (const chip of CHIPS) {
+        if (!(await run(root, { ...step, action: step.action.one(chip) }))) {
+          return false;
+        }
+      }
+      return true;
 
     case "here":
       return step.action.fn(root);
