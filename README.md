@@ -353,23 +353,25 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
-| Path                                | Owns                                                                   |
-| ----------------------------------- | ---------------------------------------------------------------------- |
-| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it      |
-| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing          |
-| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer  |
-| `src/clock.rs`                      | the one number that says what time it is, and where it came from       |
-| `src/status.rs`                     | the three answers the state line is made of                            |
-| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs          |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests          |
-| `build.rs`                          | linker scripts, and what to do about each undefined symbol             |
-| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy |
-| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces    |
-| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build          |
-| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags   |
-| `.cargo/esp-config.toml`            | the default log filter, tracked                                        |
-| `.cargo/local.toml`                 | yours: the Wi-Fi credentials, untracked by design                      |
-| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                       |
+| Path                                | Owns                                                                    |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it       |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing           |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer   |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from        |
+| `src/status.rs`                     | the three answers the state line is made of                             |
+| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs           |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests           |
+| `build.rs`                          | linker scripts, and what to do about each undefined symbol              |
+| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy  |
+| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces     |
+| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build           |
+| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags    |
+| `.cargo/esp-config.toml`            | the default log filter, tracked                                         |
+| `.cargo/local.toml`                 | yours: the Wi-Fi credentials, untracked by design                       |
+| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                        |
+| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                 |
+| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it |
 
 ## Regenerating
 

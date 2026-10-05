@@ -130,8 +130,8 @@ CONTRIBUTING.md carries the procedure for all of them, and the third trap: `-o c
 
 What the generator will _not_ overwrite, and which you should keep an eye on: everything else —
 `tools/`, `package.json` and the rest of the Node tooling, `.gitattributes`, `.editorconfig`,
-`.prettierrc.json`, `rustfmt.toml`, `.commitlintrc.json`, `cspell.jsonc`, `project-words.txt`, and
-this file.
+`.prettierrc.json`, `rustfmt.toml`, `.commitlintrc.json`, `cspell.jsonc`, `project-words.txt`,
+`.claude/`, `.opencode/`, and this file.
 
 ## Project-specific notes
 
@@ -253,6 +253,32 @@ part of the reasoning; read them before changing what reads what.
 - **Nothing checks that `.vscode/settings.json` agrees with the default chip.** It is the one place
   a triple is restated that the gate does not compare, because a stale value there costs phantom
   errors in the editor rather than a broken build. Change it with `target` in `.cargo/config.toml`.
+
+## The hooks, and the two plugins behind one of them
+
+`.claude/git-hooks/{pre-commit,commit-msg}` run the gate and check the commit message. **They only
+run where a session installed them** — `git config core.hooksPath` is the check, and CI is the
+boundary that actually holds either way. `CONTRIBUTING.md`, under `The hooks`, has the trade: the
+`pre-commit` hook is this repository's slowest command by a wide margin, because the gate compiles
+firmware for two chips from a vendored `core`.
+
+`.opencode/plugins/` holds the two plugins nothing in the gate can execute. They are the only thing
+that installs the git hooks here and the only thing that puts a session id in a commit, so a failure
+in either is silent — check that they loaded before assuming either works.
+
+- **They log a line when they arm, and it reaches the TUI, not the log file.** Measured: that file
+  has never held a `[esp-poc]` line whether the plugin loaded or died. Its own `loading plugin` and
+  `failed to load plugin` entries are the readable signal, and the second carries the cause.
+- **A missing line is usually not the API moving.** The loader dies at module resolution first, and
+  a local plugin's bare imports resolve from **this project's `node_modules`** — so whatever a
+  plugin imports has to be a dependency here. What it must export is a default object carrying an
+  `id` and a `setup`.
+- **A reload unloads a plugin without warning.** Anything that checks out these files, a rebase
+  among them, drops both until they load again, and a session that loses `session-trailer.js` loses
+  the variable with it.
+- **The trailer key differs by client and the hook reads both.** `commit-msg` reads
+  `ESP_POC_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`; a commit made outside an agent shell correctly
+  carries neither.
 
 ## Useful references
 

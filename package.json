@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "Development tooling for the esp-poc repository. The project itself is Rust; see Cargo.toml.",
+  "license": "MIT",
   "engines": {
     "node": ">=22"
   },

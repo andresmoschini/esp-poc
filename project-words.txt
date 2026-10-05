@@ -7,6 +7,11 @@
 #
 # The lower-case spelling is the one to add. cspell matches a lower-case entry whatever case it meets
 # it in, so one entry covers `imac` and `IMAC`; an entry written with capitals covers only itself.
+# The exception is a proper noun, where the capitals are the spelling.
+
+# Who holds the copyright, in LICENSE
+Andrés
+Moschini
 
 # The silicon and the toolchain around it
 codegen
@@ -56,5 +61,9 @@ editorconfig
 markdownlint
 mjs
 nvmrc
+opencode
 prettier
 xtask
+
+# Git plumbing, in the formatter the session trailer tells you to reach for
+valueonly

@@ -1,0 +1,101 @@
+#!/bin/sh
+#
+# Records which agent session produced the commit, then checks the message against
+# Conventional Commits.
+#
+# Installed by the SessionStart hook in .claude/settings.json, and equivalently by
+# .opencode/plugins/install-git-hooks.js. It therefore does not run outside a session; CI is
+# what enforces the convention for everyone. The trade and its cost are recorded in
+# CONTRIBUTING.md, under The hooks.
+
+MSG_FILE="$1"
+
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+# --- Record the session -------------------------------------------------------
+#
+# Two clients, two variables, two trailer keys. Claude Code exports CLAUDE_CODE_SESSION_ID into
+# the environment of its shell tools. OpenCode exports nothing of the kind - measured, not
+# assumed: the only OPENCODE_* variable in a session's environment is OPENCODE_TERMINAL - so
+# .opencode/plugins/session-trailer.js captures the id from the session hook and injects
+# ESP_POC_SESSION_ID into the shells the agent spawns. `git commit` runs as a child of that
+# shell and this hook as a child of git, so in both cases the value is inherited and is always
+# the session that is committing. Reading it from a transcript file instead would be a guess:
+# several sessions can be open on one checkout, and "the newest transcript" is not the same
+# thing as "the one committing".
+#
+# It is written as a trailer rather than as a free-standing line because a line that is not a
+# trailer at the end of a message invalidates the entire block. Measured: with a bracketed line
+# appended after Co-Authored-By, `git interpret-trailers --parse` reports no trailers at all,
+# and the co-author attribution is lost.
+#
+# The key is Claude-Resume, not Claude-Session: Claude Code writes the latter itself when Remote
+# Control is on, carrying a browser URL. Those are different handles on the same conversation,
+# not two formats of one, so they get separate keys rather than one key whose shape depends on a
+# setting invisible from this repository. OpenCode gets its own key
+# for the same reason: neither client's id can resume the other.
+#
+# --if-exists doNothing keeps `git commit --amend` idempotent, and keeps the session that first
+# wrote the commit rather than the one that touched it last.
+#
+# When the variable is absent or malformed - a commit made by hand, or a client that stops
+# exporting it - nothing is stamped and the commit proceeds. A commit with no session trailer is
+# fine; one carrying somebody else's is not, and a commit that fails over this is worse than
+# either.
+#
+# The two patterns are deliberately unquoted. A case pattern in quotes is matched literally, so
+# "$UUID" would only ever equal the bracket string itself. Measured: the first attempt stamped
+# nothing, and the symptom read as a missing variable rather than as a quoted glob.
+#
+# One pattern per client, and the second is not a copy of the first. The two ids have different
+# shapes: measured across this repository's own sessions, a Claude Code id is a UUID and an
+# OpenCode id is `ses_` followed by more of the same, never a UUID. Validating both against the
+# UUID pattern therefore stamped nothing at all from this harness, silently, which is the one
+# failure mode this whole arrangement exists to rule out.
+#
+# UUID is eight hex digits, then four, then four, then four, then twelve. **The repetition is
+# inside each group and the dashes are only between them**, which is the part that is easy to get
+# wrong and which this file got wrong twice before measuring it: joining thirty-two single-digit
+# groups with dashes describes a value like `1-2-3-4-5-6-...`, which no UUID is, so the pattern
+# matched nothing and Claude-Resume was silently never written. It looks plausible in a diff and
+# a spell check cannot see it. Read the two characters between the groups, not the count of them.
+#
+# The prefix is the whole guard for the OpenCode id, and the width is deliberately not pinned.
+# An exact length would be a claim about OpenCode's internal id scheme, which this repository does
+# not control, and a change to it would stop the stamping silently - the same failure, one release
+# away. For a value to be stamped wrongly it would have to begin `ses_`, carry nothing outside the
+# alphanumerics, and be set in this repository's environment by something other than the plugin.
+UUID='[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]'
+
+OPENCODE='ses_?[A-Za-z0-9]*'
+
+case "$CLAUDE_CODE_SESSION_ID" in
+$UUID)
+    git interpret-trailers --in-place --if-exists doNothing \
+        --trailer "Claude-Resume: $CLAUDE_CODE_SESSION_ID" "$MSG_FILE"
+    ;;
+esac
+
+case "$ESP_POC_SESSION_ID" in
+$OPENCODE)
+    git interpret-trailers --in-place --if-exists doNothing \
+        --trailer "OpenCode-Session: $ESP_POC_SESSION_ID" "$MSG_FILE"
+    ;;
+esac
+
+# --- Check the message --------------------------------------------------------
+#
+# Runs after the stamp, so what commitlint validates is what will be committed.
+#
+# The absence of a message means a commit with no `-m` and no editor, which on a terminal means
+# the commit is waiting for input rather than that there is nothing to check. Exiting 0 there is
+# what lets it get there; the message is validated the moment the editor saves and quits.
+[ -s "$MSG_FILE" ] || exit 0
+
+if [ ! -d node_modules ]; then
+    echo "commit-msg: the Node tooling is not installed, so the message cannot be checked." >&2
+    echo "  Run: npm run setup" >&2
+    exit 1
+fi
+
+exec ./node_modules/.bin/commitlint --edit "$MSG_FILE"

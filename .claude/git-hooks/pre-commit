@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Runs the whole quality gate before a commit is created.
+#
+# It calls the same entry point CI calls, so what passes here passes there. If
+# this hook and CI ever disagree, one of them is invoking something other than
+# `npm run check`, and that is the bug.
+#
+# KNOWN LIMITATION: this checks the working tree, not the staged snapshot. With
+# unstaged changes present, or after `git add -p`, it verifies files that are
+# not exactly the ones being committed, so a commit can pass here and still be
+# broken. Stashing to fix that risks losing work when the hook is interrupted,
+# which is a worse failure than the one it prevents. See CONTRIBUTING.md.
+#
+# Installed by the SessionStart hook in .claude/settings.json, which runs
+# `git config core.hooksPath .claude/git-hooks` when a Claude Code session opens.
+#
+# So this does not run for someone working outside Claude Code. That is deliberate:
+# CI is the enforcement boundary, and this hook is fast feedback rather than
+# the guarantee. See CONTRIBUTING.md, under The hooks.
+#
+# The cost is the thing this repository gave up to get it: the gate compiles the
+# firmware for two chips from a vendored standard library, so it is measured in
+# minutes rather than seconds. Every commit pays that, and `npm run fix` first is
+# what keeps it closer to a minute than to three.
+
+if ! command -v npm >/dev/null 2>&1; then
+    echo "pre-commit: npm was not found on PATH." >&2
+    echo "  A graphical git client may not share the PATH your shell has." >&2
+    exit 1
+fi
+
+exec npm run check

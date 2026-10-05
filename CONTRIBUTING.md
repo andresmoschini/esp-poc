@@ -14,10 +14,8 @@ npm run check    # the whole gate — the same thing CI runs
 `fix` rewrites files, so read the diff. `check` is read-only. Both refuse to start until the Node
 tooling matches `package-lock.json`, so a fresh clone begins with `npm run setup`.
 
-There is **no pre-commit hook**, which is a choice rather than an omission: a hook that runs the
-whole gate turns a five-second commit into a two-minute one, and a hook is the wrong place for a
-check that takes minutes. The cost of that choice is that CI reports a broken commit after it exists
-rather than before, so a red build costs a rewrite rather than a fix.
+The `pre-commit` hook runs `npm run check` and the `commit-msg` hook checks the message; both are in
+`.claude/git-hooks/` and [The hooks](#the-hooks) says what installing them costs.
 
 ## Adding a step to the gate
 
@@ -117,8 +115,9 @@ list.
 
 ## Commits and pull requests
 
-- **Conventional Commits**, enforced by commitlint over the commit range in
-  `.github/workflows/commitlint.yml`. `fix: ...`, `feat: ...`, `docs: ...`, `chore: ...`.
+- **Conventional Commits**, enforced twice: by the `commit-msg` hook before the commit exists, and
+  by commitlint over the commit range in `.github/workflows/commitlint.yml`. `fix: ...`,
+  `feat: ...`, `docs: ...`, `chore: ...`.
 - **In a commit body, never let a colon-terminated word start a line.** commitlint reads `word:` at
   line start as a footer token, splits the message there and warns that the footer has no blank line
   before it. It is only a warning, so it lands unnoticed. Reword with an em dash, or re-wrap so the
@@ -135,6 +134,60 @@ list.
 One template, `.github/pull_request_template.md`, because this repository has one shape of change.
 Four sections; a section with nothing to say says **"None."** rather than being deleted, because a
 missing section reads as an oversight and costs the reviewer a question.
+
+## The hooks
+
+`pre-commit` runs the gate. `commit-msg` checks the message with commitlint and stamps which agent
+session produced the commit. Both live in `.claude/git-hooks/`.
+
+**They only run if they were installed, and a session is what installs them.** A commit made from a
+plain terminal in a clone where no session has opened runs no hooks at all, and nothing says so —
+the commit simply succeeds. That is deliberate: CI runs the same gate on every push and pull
+request, so the boundary that actually holds is there, and the hooks are fast feedback in front of
+it. Check yours with `git config core.hooksPath`.
+
+**The pre-commit hook is the slowest command in this repository, on purpose, and that is the
+trade.** Unlike `monospace`, whose gate is host-only, this one compiles firmware for two chips from
+a vendored standard library — `build-std` in `.cargo/config.toml` rebuilds `core` for the target —
+so `npm run check` is measured in minutes rather than seconds, and every commit pays it. Run
+`npm run fix` first; that is what keeps a commit closer to a minute than to three. The gate's `eol`
+step reads the working tree, so a commit made with unstaged changes present can pass here and still
+be broken — see the limitation below.
+
+**The pre-commit hook checks your working tree, not what you staged.** With unstaged changes
+present, or after `git add -p`, it verifies files that are not the ones being committed, so a commit
+can pass and still be broken. Stashing to close that gap risks losing work if the hook is
+interrupted, which is the worse failure. If you stage selectively, run `npm run check` on a clean
+tree before trusting it.
+
+**`git commit --no-verify` is never used.** A bypassed gate is worse than no gate, because the log
+then claims a green history that was never checked. When the hook fails, fix the cause or stop and
+report.
+
+### The session trailer
+
+A commit made from an agent session can carry up to three trailers, and each is a different handle
+on the same conversation rather than the same one twice.
+
+- **`Claude-Resume`** holds a Claude Code session's local id. Reopen the conversation with
+  `claude --resume <id>`. The `commit-msg` hook writes it.
+- **`Claude-Session`** holds a URL that opens a Claude Code session in a browser. Claude Code writes
+  it itself when Remote Control is enabled, which is a setting outside this repository — so it is
+  present sometimes and absent otherwise.
+- **`OpenCode-Session`** holds an OpenCode session's id, stamped by the same hook from the value
+  `.opencode/plugins/session-trailer.js` injects as `ESP_POC_SESSION_ID`.
+
+**They are separate keys on purpose because neither client's id resumes the other**, and one key
+whose shape depends on the client would make a commit's provenance unreadable after the fact. List
+them with:
+
+```sh
+git log --format='%h %(trailers:key=Claude-Resume,valueonly)'
+```
+
+It is a convenience, not a record. Transcripts live outside the repository and do not survive a new
+machine, so the reasoning that matters belongs in the commit body or in the pull request. **If a
+commit body only makes sense with the transcript open, the body is wrong.**
 
 ## Documentation
 

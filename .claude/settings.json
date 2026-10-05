@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git config core.hooksPath .claude/git-hooks",
+            "shell": "bash",
+            "timeout": 5,
+            "statusMessage": "Installing git hooks..."
+          }
+        ]
+      }
+    ]
+  }
+}
