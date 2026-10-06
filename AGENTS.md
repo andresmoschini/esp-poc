@@ -254,6 +254,25 @@ part of the reasoning; read them before changing what reads what.
   a triple is restated that the gate does not compare, because a stale value there costs phantom
   errors in the editor rather than a broken build. Change it with `target` in `.cargo/config.toml`.
 
+## How work lands, and what cannot be skipped
+
+**`main` is behind a ruleset, so the gate is binding rather than advisory.** A direct push to `main`
+is refused, force-pushes and branch deletion are refused, `main` must be up to date, and the only
+merge method is a merge commit. There is **no bypass actor** — not for the owner either.
+`CONTRIBUTING.md`, under `How a change reaches main`, has each requirement and the reason for it;
+the short version is that a pull request cannot merge until `Quality gate` and
+`Conventional Commits` are both green, and nothing here will let you merge around that.
+
+**This changes what "done" means for a session, and it is worth being blunt about.** A branch that
+is committed and pushed is not landed until a pull request merges, and that merge is the
+maintainer's. Offer it rather than assuming it: say that the branch is pushed and what the workflows
+reported, and leave the merge as a separate, deliberate act.
+
+**Nothing in the gate reads the ruleset.** It is a repository setting on GitHub rather than a file
+in the tree, so it cannot be a step in `GATE`, and a step that fetched it would fail for a reason
+that has nothing to do with the code. Where the ruleset and a document here disagree, the ruleset is
+what enforces and the document is what is wrong.
+
 ## The hooks, and the two plugins behind one of them
 
 `.claude/git-hooks/{pre-commit,commit-msg}` run the gate and check the commit message. **They only
