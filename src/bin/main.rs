@@ -105,10 +105,13 @@ async fn main(spawner: Spawner) -> ! {
     // out of, and it is `Copy`, so handing a copy to the SNTP client below leaves it here.
     let stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
 
-    // With a network, ask a time server over it what time it is. That runs in its own task and needs
-    // no answer from here: until one arrives, the greeting prints how long the chip has been up.
+    // With a network, ask a time server over it what time it is, and report what this chip is doing
+    // to an HTTP API. Both run in their own tasks and need no answer from here: until a time arrives
+    // the greeting prints how long the chip has been up, and until the API answers, the reporter has
+    // said nothing at all.
     if let Some(stack) = stack {
         esp_poc::ntp::sync(spawner, stack);
+        esp_poc::report::start(spawner, stack);
     }
 
     loop {

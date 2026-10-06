@@ -18,6 +18,7 @@ codegen
 datasheet
 devkitc
 devkitm
+efuse
 imac
 imc
 jtag
@@ -44,11 +45,19 @@ authmode
 datagram
 dhcp
 dhcpv4
+heapless
 hinnant
 ntp
 rssi
 smoltcp
 sntp
+
+# The API the firmware reports to: a Cloudflare Worker, its name, and the examples in its tests
+aabbccddeeff
+cfpoc
+andresmoschini
+workers
+dev
 
 # Git's line-ending rules
 safecrlf

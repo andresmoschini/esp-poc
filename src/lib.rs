@@ -2,7 +2,8 @@
 //! The proof of concept is the network and then the time: [`wifi`] brings up the radio and hands
 //! back a stack, [`ntp`] asks a time server what time it is over that stack, and [`clock`] is where
 //! the answer is kept. [`status`] puts the three together into the line the binary in
-//! `src/bin/main.rs` prints. Nothing in this crate is a reusable library.
+//! `src/bin/main.rs` prints, and [`report`] sends that line to an HTTP API every five minutes.
+//! Nothing in this crate is a reusable library.
 
 #![no_std]
 // `static_cell::make_static!` is built out of `impl Trait` in a type alias, which is what the pinned
@@ -12,5 +13,6 @@
 
 pub mod clock;
 pub mod ntp;
+pub mod report;
 pub mod status;
 pub mod wifi;

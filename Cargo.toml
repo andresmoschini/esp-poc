@@ -138,13 +138,20 @@ esp-alloc       = "0.11.0"
 embassy-executor = "0.10.0"
 # `defmt` is what makes the stack's own error types printable, `dns` and `udp` are what `src/ntp.rs`
 # asks the stack for — without them there is no resolver to turn a server's name into an address, and
-# no way to send it a datagram. The `dns` and `udp` features are also a socket each out of the
-# fixed-size set that `SOCKETS` in `src/wifi.rs` sizes.
+# no way to send it a datagram. `tcp` is what `src/report.rs` sends an HTTP request over. The `dns`,
+# `udp` and `tcp` features are a socket each out of the fixed-size set that `SOCKETS` in
+# `src/wifi.rs` sizes, on top of the one DHCP takes.
+#
+# There is no TLS here, so `https://` is not reachable and the API is spoken to in cleartext on port
+# 80. That is also why the reporter sends no credentials: a bearer token without TLS is a password on
+# the wire. Both are the next thing after this, and the transport they need is a TLS stack rather than
+# another feature of this one.
 embassy-net     = { version = "0.9.0", features = [
   "defmt",
   "dhcpv4",
   "dns",
   "medium-ethernet",
+  "tcp",
   "udp",
 ] }
 embassy-time    = "0.5.0"

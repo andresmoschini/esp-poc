@@ -15,8 +15,8 @@
 //! Nothing here waits for the network: [`join`] starts three tasks and returns, so the firmware
 //! keeps doing whatever it was doing while the radio does its work in the background. What
 //! `join` returns is the handle to the network stack, which is what the rest of the firmware needs
-//! — an SNTP client runs on it, in [`crate::ntp`] — and which is `Copy`, so a task can take its own
-//! copy of it.
+//! — an SNTP client runs on it in [`crate::ntp`], an HTTP reporter in [`crate::report`] — and which
+//! is `Copy`, so a task can take its own copy of it.
 //!
 //! ## Saying what the radio is doing
 //!
@@ -69,12 +69,13 @@ const NEIGHBORS: usize = 10;
 
 /// Sockets the network stack is sized for.
 ///
-/// Three of them are taken before anything in this file asks for one: DHCP takes a socket when the
-/// stack is first configured, the DNS resolver takes one when the stack is built, and the SNTP
-/// client in `src/ntp.rs` takes the third. The fourth is the point — `smoltcp`'s socket set is a
-/// fixed-size array that panics when it is full rather than refusing the socket that does not fit,
-/// so this is the number that decides whether the next thing to want a socket works at all.
-const SOCKETS: usize = 4;
+/// Four of them are taken before anything here asks for one: DHCP takes a socket when the stack is
+/// first configured, the DNS resolver takes one when the stack is built, the SNTP client in
+/// `src/ntp.rs` takes the third, and the HTTP reporter in `src/report.rs` takes the fourth. The fifth
+/// is the point — `smoltcp`'s socket set is a fixed-size array that panics when it is full rather than
+/// refusing the socket that does not fit, so this is the number that decides whether the next thing
+/// to want a socket works at all.
+const SOCKETS: usize = 5;
 
 /// What the radio is doing, published for [`link`] to read.
 ///
