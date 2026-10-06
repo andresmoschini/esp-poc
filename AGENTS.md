@@ -176,6 +176,12 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   are in `Cargo.toml`; do not remove them thinking they are noise.
 - Credentials are compiled in from `.cargo/local.toml`, which is untracked. Keep it that way, and
   remember that whatever is in it also lands in the flash image.
+- `src/report.rs` sends **no `Authorization` header, in cleartext, to port 80**, and both halves of
+  that are deliberate rather than unfinished: there is no TLS stack in the tree, so the API is
+  reached over plain HTTP, and a bearer token in cleartext is a password on the wire. So the API
+  answers `401` and the log says so on every pass — that line is the feature working, not a bug. Do
+  not add the token before TLS. The host is overridable with `EVENTS_API_HOST` at build time, and
+  `HOST` is printed only in the lines about a name that does not resolve.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled
@@ -224,17 +230,20 @@ part of the reasoning; read them before changing what reads what.
 
 - **The firmware has no test target of its own**, because a bare-metal `#![no_std]` `#![no_main]`
   binary has no test harness to build — `cargo clippy --all-targets` was measured failing with
-  `can't find crate for test`. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
-  `src/bin/main.rs` cannot be compiled for a host either, since all five depend on `esp-hal`, on the
-  network stack, or on a scheduler that exists only on a microcontroller, so a test on them needs a
-  board. What _is_ testable is the part that decides rather than talks to hardware, and it lives in
-  `crates/poc-report` so that the gate's `test-firmware` step can run it on the host: no
-  dependencies, `#![no_std]`, buildable for both targets. **Put logic there when it is worth
-  testing, and expect it not to be there** — logic that needs the radio stays in `src/wifi.rs`
-  untested, and logic that needs a socket or a clock stays in `src/ntp.rs` untested, because moving
-  either would mean moving the hardware it is about. What has moved out is what neither needs: the
-  calendar arithmetic, the SNTP header, and the whole of the state line — its wording, its order,
-  and the encoding each state is published in for another task to read.
+  `can't find crate for test`. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
+  `src/report.rs` and `src/bin/main.rs` cannot be compiled for a host either, since all six depend
+  on `esp-hal`, on the network stack, or on a scheduler that exists only on a microcontroller, so a
+  test on them needs a board. What _is_ testable is the part that decides rather than talks to
+  hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run it
+  on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when it
+  is worth testing, and expect it not to be there** — logic that needs the radio stays in
+  `src/wifi.rs` untested, logic that needs a socket or a clock stays in `src/ntp.rs` untested, and
+  logic that needs a TCP connection stays in `src/report.rs` untested, because moving any of them
+  would mean moving the hardware it is about. What has moved out is what none of them needs: the
+  calendar arithmetic, the SNTP header, the whole of the state line — its wording, its order, and
+  the encoding each state is published in for another task to read — and the whole of what goes on
+  the wire when that line is reported: the JSON body and its escaping, the timestamp's format, the
+  request head, and the reading of a status line.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

@@ -48,8 +48,40 @@ a preemptive scheduler (`esp-rtos`) and a heap, which is why the firmware is no 
 and the TCP/IP stack that turns a joined network into an address (`embassy-net`). `src/wifi.rs` has
 the whole sequence up to the network and publishes what the radio is doing; `src/ntp.rs` and
 `src/clock.rs` are what the network is for; `src/status.rs` is the one place that asks all three and
-puts the answers together; `src/bin/main.rs` is the entry point that starts them and prints the
-result.
+puts the answers together; `src/report.rs` sends that line to an HTTP API every five minutes;
+`src/bin/main.rs` is the entry point that starts them and prints the result.
+
+### Reporting to an API
+
+Once the network is up, the firmware sends that same state line to an HTTP endpoint every five
+minutes, and prints what came back:
+
+```text
+[INFO ] reported to the API after 2 minutes
+```
+
+The endpoint takes a JSON body with four string fields — a device id, an RFC 3339 timestamp, an
+event type and a payload — and this firmware sends the state line as the payload. The device id is
+the chip plus its MAC address, so two boards flashed from the same image are still two rows.
+
+**It sends no credentials, on purpose.** There is no `Authorization` header, so the API answers
+`401 Unauthorized` and the log says exactly that:
+
+```text
+[WARN ] the API did not store the event: the API refused the event: no credentials were sent with it
+```
+
+That line is the point of the exercise as it stands. A 401 says three things at once — the request
+reached the API, the API understood it, and it was refused for want of a token — where a timeout
+would say only the first. Adding the token is the next piece of work, and it is also why this speaks
+plain HTTP to port 80: a bearer token in cleartext is a password on the wire, so the TLS stack comes
+first. Both notes are in `src/report.rs`, which is the file that would change.
+
+Point it somewhere else with `EVENTS_API_HOST` at build time:
+
+```sh
+EVENTS_API_HOST=my-api.example.com cargo run
+```
 
 That is still scaffolding. The point of the repository is that the scaffolding is now somewhere you
 can build something without first deciding how, and that whatever you build is checked by something
@@ -101,10 +133,11 @@ chips have no atomic wider than a word, which is why the statics in `src/clock.r
 are 32 bits.
 
 What is _not_ per-chip, and is the reason this is one branch and two features rather than two
-directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs` and `src/status.rs`
-name no chip at all. The one piece of chip-specific code is the reserved-pin list in
-`src/bin/main.rs`, which is `#[cfg]`'d on the feature, because the modules reserve different pins
-and there is no way to ask `esp-generate` for both at once.
+directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
+`src/report.rs` name no chip at all. The chip-specific code is the reserved-pin list in
+`src/bin/main.rs` and the `CHIP` constant in `src/report.rs`, both `#[cfg]`'d on the feature: the
+modules reserve different pins, and a device id that said `esp32c3` on a C6 would put two boards in
+one id space. There is no way to ask `esp-generate` for both pin lists at once.
 
 ## What you need
 
@@ -320,23 +353,26 @@ Two test steps, and the difference between them is the whole story:
 - `test` runs the tests of this repository's own automation, in Node.
 - `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
   that decides rather than talks to hardware: how an address and a time are written, what a failed
-  join says, what an SNTP packet means, what the radio is doing, and what the line the firmware
-  prints twice a second reads.
+  join says, what an SNTP packet means, what the radio is doing, what the line the firmware prints
+  twice a second reads, and what goes on the wire when that line is reported to an API.
 
-The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
-`src/bin/main.rs` all depend on `esp-hal`, on the network stack, or on a scheduler that exists only
-on a microcontroller, so none of them can be compiled for a host at all — a test on them needs a
-board. Anything testable therefore has to be in something that builds without them, which is what
-`crates/poc-report` is for, and what makes `poc-report` the only crate in the tree with no
-dependencies of its own. Logic that belongs next to hardware rather than in that crate is untested,
-and stays that way until a board or a simulator can run it.
+The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
+`src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack, or on a
+scheduler that exists only on a microcontroller, so none of them can be compiled for a host at all —
+a test on them needs a board. Anything testable therefore has to be in something that builds without
+them, which is what `crates/poc-report` is for, and what makes `poc-report` the only crate in the
+tree with no dependencies of its own. Logic that belongs next to hardware rather than in that crate
+is untested, and stays that way until a board or a simulator can run it.
 
 What that buys, and what it does not, is worth being specific about. The line the firmware prints is
 a `Status` in `poc-report`, so its wording, its order and the decision of when a time has gone stale
 are all checked on the host. What publishes the state — the radio writing a word another task reads,
 and the clock remembering which server set it and when — is the same encoding, so the words and the
-values they stand for cannot drift apart. None of it can check that the value published is the one
-the radio meant: that is still only knowable from the board.
+values they stand for cannot drift apart. The reported event is the same story one step further out:
+the JSON body, the timestamp's format, the request head with its CRLF lines, and the reading of a
+status line are all checked on the host, including the case that matters most here — a reply that is
+not a status line at all, which is what a network with a login portal sends. None of it can check
+that the value published is the one the radio meant: that is still only knowable from the board.
 
 ## The gate
 
@@ -353,26 +389,27 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
-| Path                                | Owns                                                                    |
-| ----------------------------------- | ----------------------------------------------------------------------- |
-| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it       |
-| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing           |
-| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer   |
-| `src/clock.rs`                      | the one number that says what time it is, and where it came from        |
-| `src/status.rs`                     | the three answers the state line is made of                             |
-| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs           |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests           |
-| `build.rs`                          | linker scripts, and what to do about each undefined symbol              |
-| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy  |
-| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces     |
-| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build           |
-| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see       |
-| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags    |
-| `.cargo/esp-config.toml`            | the default log filter, tracked                                         |
-| `.cargo/local.toml`                 | yours: the Wi-Fi credentials, untracked by design                       |
-| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                        |
-| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                 |
-| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it |
+| Path                                | Owns                                                                       |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it          |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing              |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer      |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from           |
+| `src/status.rs`                     | the three answers the state line is made of                                |
+| `src/report.rs`                     | post that state line to an HTTP API every five minutes, and read the reply |
+| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs              |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests              |
+| `build.rs`                          | linker scripts, and what to do about each undefined symbol                 |
+| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy     |
+| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces        |
+| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build              |
+| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see          |
+| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags       |
+| `.cargo/esp-config.toml`            | the default log filter, tracked                                            |
+| `.cargo/local.toml`                 | yours: the Wi-Fi credentials, untracked by design                          |
+| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                           |
+| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                    |
+| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it    |
 
 ## Regenerating
 
