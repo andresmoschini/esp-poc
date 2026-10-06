@@ -114,6 +114,39 @@ it will say if one of them no longer compiles.
 Run `npm run check` after generating and put back whatever it reports. The table in AGENTS.md is the
 list.
 
+## How a change reaches `main`
+
+**Nothing reaches `main` except a pull request, and no pull request merges without both workflows
+green.** This is a ruleset rather than a convention: `main` carries one called
+`default branch ruleset`, and it is what makes the gate's answer binding instead of advisory. It
+requires
+
+- **A pull request.** A direct push to `main` is refused, and so is one that rewrites history: the
+  ruleset refuses force-pushes and refuses deletion of the branch.
+- **`Quality gate` and `Conventional Commits` both passing.** Those are the two job names in
+  `.github/workflows/`, and both are required because they answer different questions — the first
+  whether the code is right, the second whether the commit says what the code is. Requiring only the
+  first would merge commits this repository's own rules never made committable. **`main` must also
+  be up to date**, so GitHub re-runs both after every push to the branch rather than merging against
+  a result from an earlier commit.
+- **A merge commit.** Squash and rebase are both disabled, in the repository's merge settings and in
+  the ruleset, so the commits on a branch land on `main` one by one and the history reads as the
+  steps it was made of.
+
+**There is no bypass, including for the owner.** That is a choice rather than a default: an escape
+hatch is available exactly when it is most convenient to reach for, and a history that sometimes
+skips the gate is a history nobody can read as evidence of anything. The cost is that a broken gate
+blocks even the fix for the broken gate until it is green, which is the right trade for a repository
+whose only claim is that its history was checked.
+
+To change any of it, it is the repository's ruleset settings page — [the rules][rulesets]. The link
+is relative, so renaming or transferring the repository does not leave a stale address in this file.
+Nothing in `npm run check` reads any of it: a repository setting GitHub enforces is not a file in
+the tree, so it cannot be a step in the gate, and a step that fetched it would fail for a reason
+that has nothing to do with the code.
+
+[rulesets]: ../../settings/rules
+
 ## Commits and pull requests
 
 - **Conventional Commits**, enforced twice: by the `commit-msg` hook before the commit exists, and
@@ -126,7 +159,8 @@ list.
 - **The closing keyword goes in the pull request body, never in a commit message.** Only the body
   shows the link before the merge, a wrong number is an edit rather than a history rewrite, and no
   single commit is "the" one closing work that took several.
-- **A commit should leave the gate green, and nothing stops a commit that does not.**
+- **A commit should leave the gate green, and a pull request cannot merge without it.** What
+  enforces that is not a convention — see [How a change reaches `main`](#how-a-change-reaches-main).
 - **_Verified_ means what was observed, not that the gate passed.** The gate cannot see the firmware
   run — [why is in the README](README.md#a-green-gate-does-not-mean-the-firmware-works) — so a
   change that touches what the firmware does says what the board or the simulator showed. "Builds"
