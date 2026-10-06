@@ -53,12 +53,17 @@ MSG_FILE="$1"
 # UUID pattern therefore stamped nothing at all from this harness, silently, which is the one
 # failure mode this whole arrangement exists to rule out.
 #
-# UUID is eight hex digits, then four, then four, then four, then twelve. **The repetition is
-# inside each group and the dashes are only between them**, which is the part that is easy to get
-# wrong and which this file got wrong twice before measuring it: joining thirty-two single-digit
-# groups with dashes describes a value like `1-2-3-4-5-6-...`, which no UUID is, so the pattern
-# matched nothing and Claude-Resume was silently never written. It looks plausible in a diff and
-# a spell check cannot see it. Read the two characters between the groups, not the count of them.
+# UUID is eight hex digits, then four, then four, then four, then twelve: **the repetition is
+# inside each group and the dashes are only between them.** Joining thirty-two single-digit groups
+# with dashes instead describes `1-2-3-4-5-...`, which no UUID is, so such a pattern matches nothing
+# and Claude-Resume is silently never written. It looks plausible in a diff, and neither `sh` nor a
+# spell check complains.
+#
+# Counting the groups is not enough to tell the two apart, and that is worth saying because getting it
+# wrong here is invisible: splitting the pattern on `-` returns 101 pieces, because every
+# `[0-9a-fA-F]` contains two dashes of its own. Count the `]-` separators, or — better — test the
+# pattern against a canonical UUID and against one that is a digit short, which is what
+# `tools/lib/hooks.test.mjs` and the commit in this repository's history did before this was written.
 #
 # The prefix is the whole guard for the OpenCode id, and the width is deliberately not pinned.
 # An exact length would be a claim about OpenCode's internal id scheme, which this repository does

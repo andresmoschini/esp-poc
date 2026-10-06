@@ -366,6 +366,7 @@ step fails, how to add one, and which files esp-generate will overwrite.
 | `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy  |
 | `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces     |
 | `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build           |
+| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see       |
 | `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags    |
 | `.cargo/esp-config.toml`            | the default log filter, tracked                                         |
 | `.cargo/local.toml`                 | yours: the Wi-Fi credentials, untracked by design                       |

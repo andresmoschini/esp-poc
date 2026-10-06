@@ -14,8 +14,9 @@ npm run check    # the whole gate — the same thing CI runs
 `fix` rewrites files, so read the diff. `check` is read-only. Both refuse to start until the Node
 tooling matches `package-lock.json`, so a fresh clone begins with `npm run setup`.
 
-The `pre-commit` hook runs `npm run check` and the `commit-msg` hook checks the message; both are in
-`.claude/git-hooks/` and [The hooks](#the-hooks) says what installing them costs.
+The `pre-commit` hook runs `npm run check`, and the `commit-msg` hook checks the message against
+commitlint. Both are in `.claude/git-hooks/`; [The hooks](#the-hooks) says how they get installed,
+what they cost, and how to tell that Git is not running them at all.
 
 ## Adding a step to the gate
 
@@ -143,16 +144,15 @@ session produced the commit. Both live in `.claude/git-hooks/`.
 **They only run if they were installed, and a session is what installs them.** A commit made from a
 plain terminal in a clone where no session has opened runs no hooks at all, and nothing says so —
 the commit simply succeeds. That is deliberate: CI runs the same gate on every push and pull
-request, so the boundary that actually holds is there, and the hooks are fast feedback in front of
-it. Check yours with `git config core.hooksPath`.
+request, so the boundary that actually holds is there, and the hooks are in front of it. Check yours
+with `git config core.hooksPath`.
 
-**The pre-commit hook is the slowest command in this repository, on purpose, and that is the
-trade.** Unlike `monospace`, whose gate is host-only, this one compiles firmware for two chips from
-a vendored standard library — `build-std` in `.cargo/config.toml` rebuilds `core` for the target —
-so `npm run check` is measured in minutes rather than seconds, and every commit pays it. Run
-`npm run fix` first; that is what keeps a commit closer to a minute than to three. The gate's `eol`
-step reads the working tree, so a commit made with unstaged changes present can pass here and still
-be broken — see the limitation below.
+**The pre-commit hook runs the whole gate, which makes a commit the slowest thing in this
+repository, and that is the price of learning about a broken commit before it exists rather than
+after.** `build-std` in `.cargo/config.toml` rebuilds `core` for the target, so the gate compiles
+the firmware for two chips in two profiles, and a commit is measured in minutes. Two things keep
+that short: `npm run fix` first, which is what brings a commit near a minute rather than three, and
+committing less often.
 
 **The pre-commit hook checks your working tree, not what you staged.** With unstaged changes
 present, or after `git add -p`, it verifies files that are not the ones being committed, so a commit
@@ -161,8 +161,23 @@ interrupted, which is the worse failure. If you stage selectively, run `npm run 
 tree before trusting it.
 
 **`git commit --no-verify` is never used.** A bypassed gate is worse than no gate, because the log
-then claims a green history that was never checked. When the hook fails, fix the cause or stop and
-report.
+then claims a green history that was never checked, and on a gate this slow the temptation is the
+real cost. When the hook fails, fix the cause or stop and report.
+
+**A hook Git will not run is the failure this repository is best placed to hide.** Git skips a hook
+that is not executable in the index, or that names no interpreter, and says nothing when it does.
+Windows produces that routinely: `git add` records `100644`, because there is no executable bit to
+read off the filesystem, while the working-tree copy still looks executable — so `ls` and Git
+disagree and only Git is the one that matters. The gate's `hooks` step asks Git rather than the
+filesystem, so this is a red step rather than a mystery. A hook that is newly added or re-added
+needs
+
+```sh
+git update-index --chmod=+x .claude/git-hooks/*
+```
+
+once, and the reason it is not a step in `FIX` is in `tools/lib/hooks.mjs`: it writes to the index
+rather than to a file, and a fixer that staged would change what a commit is about to contain.
 
 ### The session trailer
 

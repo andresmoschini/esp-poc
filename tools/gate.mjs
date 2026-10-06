@@ -42,6 +42,7 @@ import { check as eolCheck, fix as eolFix } from "./lib/eol.mjs";
 import { isEntryPoint } from "./lib/entry-point.mjs";
 import { CHIPS, chipArgs, defaultChip, defaultFeatureIsConfigured } from "./lib/chip.mjs";
 import { firmwareTests } from "./lib/firmware-tests.mjs";
+import { check as hookCheck } from "./lib/hooks.mjs";
 import { installedLockfile, nodeToolingState } from "./lib/tooling.mjs";
 
 // The npm executable.
@@ -146,6 +147,20 @@ export const GATE = [
     // open. It is first because it is the only step that can say "this repository is set up for a chip
     // it has no features for", which makes every step after it pointless.
     action: hereStep(chipsAgree),
+  },
+  {
+    name: "hooks",
+    // The one step that reads the index rather than the files. Git runs a hook only when the index
+    // says `100755` and the file names an interpreter, and it skips a hook that fails either test
+    // without saying so — so a repository can hold hooks no commit has ever run while every other
+    // step reports green. Windows is where that is produced: `git add` records `100644`, because
+    // there is no executable bit to read from the filesystem, and the working-tree copy looking
+    // executable answers a different question than the one Git asks.
+    //
+    // It sits early because it is cheap, and because a red `hooks` explains why `pre-commit` is not
+    // running at all — which is the first thing to establish when a commit went through unchecked.
+    // It is second only to `chips`, which can report a repository set up for a chip nothing builds.
+    action: hereStep(hookCheck),
   },
   {
     name: "fmt",
