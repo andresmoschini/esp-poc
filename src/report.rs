@@ -38,29 +38,61 @@ use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Request, Time, Verdict};
+use poc_report::{
+    EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Request, Time, Verdict,
+    status_line_arrived,
+};
 
 use crate::{clock, status};
 
-/// The API to report to, overridable at build time.
+/// The API to report to: the deployed Cloudflare Worker, overridable at build time.
 ///
-/// A worker deployed under another account is another name, and a build that cannot be pointed at
-/// one is a build that can only ever talk to this one. The same reason `src/ntp.rs` takes its time
-/// server from the environment.
+/// **Remote, production:** the default, `http://cfpoc.andresmoschini.workers.dev` on port 80.
+/// Measured on 2026-10-07: it answers a request this firmware sends in plain HTTP with
+/// `401 Unauthorized` and no redirect to HTTPS, which is what makes talking to it in cleartext work
+/// at all — and also what makes the token below the wrong thing to add first.
 ///
-/// It is printed in the log lines about a name not resolving and nowhere else: it is a compile-time
-/// constant, so a reader of any other line already knows which API this build talks to, and a name
-/// repeated in every line of a log is a name nobody reads.
+/// **Local, development:** `wrangler dev` serves the same API on `http://127.0.0.1:8787`, and it is
+/// not reachable from a board on a network — `127.0.0.1` is the board. Point at a machine on the LAN
+/// instead, with its address and the port `wrangler dev` printed:
+///
+/// ```sh
+/// EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run
+/// ```
+///
+/// Both are overridable because both change: the worker is deployed under whatever account, and the
+/// local port moves to 8788 when 8787 is taken. A build that could only reach one of them is a build
+/// that can only be tested against one of them.
+///
+/// The host is printed in the log lines about a name not resolving and nowhere else: it is a
+/// compile-time constant, so a reader of any other line already knows which API this build talks to,
+/// and a name repeated in every line of a log is a name nobody reads.
 const HOST: &str = match option_env!("EVENTS_API_HOST") {
     Some(host) => host,
     None => "cfpoc.andresmoschini.workers.dev",
 };
 
-/// Port 80, which is where a plain-HTTP request to a Cloudflare worker arrives.
+/// The port to connect to when the build says nothing: 80.
 ///
-/// Named rather than written inline because it is the other half of "which server": a reader who has
-/// the name above and this below can tell that cleartext is on purpose here and not by accident.
-const PORT: u16 = 80;
+/// 80 rather than 443 because there is no TLS in this firmware, and a plain-HTTP request to a
+/// Cloudflare worker arrives on 80 and is answered there — measured on 2026-10-07 against the
+/// deployed worker, not assumed.
+const DEFAULT_PORT: u16 = 80;
+
+/// The port to connect to, overridable at build time alongside [`HOST`].
+///
+/// `EVENTS_API_PORT` is what points the board at a local `wrangler dev`, whose port is not 80 and not
+/// always 8787.
+///
+/// A function rather than a `const` because parsing a port out of an environment variable at compile
+/// time means writing a parser, and `core`'s does the whole job — including refusing `"8787 "` and
+/// `"0x8787"` — for one call every five minutes.
+fn port() -> u16 {
+    match option_env!("EVENTS_API_PORT") {
+        Some(port) => port.trim().parse().unwrap_or(DEFAULT_PORT),
+        None => DEFAULT_PORT,
+    }
+}
 
 /// The chip, as [`device_id`] names it.
 ///
@@ -229,25 +261,9 @@ async fn once(stack: &Stack<'static>, socket: &mut TcpSocket<'static>) {
     // `close` shuts only the write half, which is exactly "I have finished asking".
     socket.close();
 
-    let mut reply = [0; RX_LEN];
-
-    let read = match with_timeout(TIMEOUT, socket.read(&mut reply)).await {
-        Err(_) => {
-            error!("the API did not answer");
-
-            return;
-        }
-        Ok(Err(e)) => {
-            error!("the answer could not be read: {:?}", e);
-
-            return;
-        }
-        Ok(Ok(read)) => read,
+    let Some(verdict) = read_reply(socket).await else {
+        return;
     };
-
-    // Read from the status line alone, which is what `Verdict` does: a reply this firmware does not
-    // understand is a sentence rather than a number to guess at.
-    let verdict = Verdict::from_status_line(&reply[..read]);
 
     // `info` for the one answer that means the exchange worked, `warn` for the rest, and `error` for
     // neither. A 401 is the expected answer while there is no token, and a line marked as an error
@@ -265,13 +281,79 @@ async fn once(stack: &Stack<'static>, socket: &mut TcpSocket<'static>) {
     }
 }
 
+/// Reads until the reply's first line is whole, and says what it said.
+///
+/// The loop is the whole point of this function. A TCP read returns whatever has arrived, which is
+/// not the same thing as a reply: the 401 this API sends is 650 bytes against a 25-byte status line,
+/// and nothing in TCP promises where the boundary between them falls. Reading once and judging that
+/// is what this firmware used to do, and it reported "what answered was not the API" for replies the
+/// API had sent correctly — because the read had landed inside the status line and a line with eleven
+/// of its twenty-five bytes looks like no line at all.
+///
+/// Three ways to stop, and each is a different thing to say:
+///
+/// - the status line is whole, which is the answer;
+/// - the buffer is full, which is a reply longer than [`RX_LEN`] and a sentence about that;
+/// - the peer closed with nothing more, which is a server that answered and then stopped.
+///
+/// `None` means there was no reply to judge, and each of those has already said so.
+async fn read_reply(socket: &mut TcpSocket<'static>) -> Option<Verdict> {
+    let mut buffer = [0; RX_LEN];
+    let mut read = 0;
+
+    while read < buffer.len() {
+        // Ask before reading again, on the bytes from the previous read: this is the answer to "is
+        // there anything left to wait for", and it can be true before the read that completes it.
+        if status_line_arrived(&buffer[..read]) {
+            return Some(Verdict::from_reply(&buffer[..read]));
+        }
+
+        let got = match with_timeout(TIMEOUT, socket.read(&mut buffer[read..])).await {
+            Err(_) => {
+                error!("the API did not finish answering after {} bytes", read);
+
+                return None;
+            }
+            Ok(Err(e)) => {
+                error!("the answer could not be read: {:?}", e);
+
+                return None;
+            }
+            Ok(Ok(got)) => got,
+        };
+
+        // Zero bytes with the connection open is the end of the stream: the server said everything it
+        // was going to say. A status line inside it is still a status line, so this is checked
+        // before giving up rather than after.
+        if got == 0 {
+            return Some(Verdict::from_reply(&buffer[..read]));
+        }
+
+        read += got;
+    }
+
+    // The buffer is full and no CRLF is in it, so the first line is longer than the whole buffer.
+    // That is not a reply this firmware can read, and saying so beats reporting a sentence about a
+    // reply it has not finished collecting.
+    if status_line_arrived(&buffer) {
+        return Some(Verdict::from_reply(&buffer));
+    }
+
+    error!(
+        "the first line of the reply is longer than the {} byte buffer",
+        RX_LEN
+    );
+
+    None
+}
+
 /// Opens the connection to the API, or says why it did not.
 ///
 /// Its own function rather than a step inside [`once`] because it is the one step whose failure is
 /// not about the request: everything after it is about bytes this firmware is sending, and a reader
 /// of a log line saying which step failed needs the two to be separable.
 async fn connect(socket: &mut TcpSocket<'static>, address: Ipv4Addr) -> Result<(), ()> {
-    match with_timeout(TIMEOUT, socket.connect((address, PORT))).await {
+    match with_timeout(TIMEOUT, socket.connect((address, port()))).await {
         Err(_) => {
             error!("the API did not complete the connection: it timed out");
 
