@@ -156,12 +156,17 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   that chip's pins — the generator will only ever produce one of them.
 - This is a `#![no_std]` / `#![no_main]` project. Avoid `std`; use `core` and embedded-friendly
   crates.
-- `alloc` **is** enabled, because the Wi-Fi driver and the TCP/IP stack above it allocate: two
-  `esp_alloc::heap_allocator!` statics in `src/bin/main.rs` and `build-std = ["core", "alloc"]`.
-  Heap-backed types are therefore available; the two heaps are 64 KiB of reclaimed bootloader RAM
-  and 36 KiB of internal RAM, and that budget is the real limit, not whether a type compiles. The
-  bootloader-reclaimed region is 66320 bytes on the C3 against 65536 on the C6, so 64 KiB fits on
-  both.
+- `alloc` **is** enabled, because the Wi-Fi driver, the TCP/IP stack above it and the TLS stack
+  allocate: two `esp_alloc::heap_allocator!` statics in `src/bin/main.rs` and
+  `build-std = ["core", "alloc"]`. Heap-backed types are therefore available; the two heaps are 64
+  KiB of reclaimed bootloader RAM and 96 KiB of internal RAM, and that budget is the real limit, not
+  whether a type compiles. The bootloader-reclaimed region is 66320 bytes on the C3 against 65536 on
+  the C6, so 64 KiB fits on both. **The internal heap is 96 KiB because a TLS handshake needs about
+  32 KiB of it at its peak**, and it does not get that from MbedTLS' configuration without a C
+  toolchain — see the next bullet. Measured, not estimated: at 36 KiB the handshake failed with
+  `MBEDTLS_ERR_SSL_ALLOC_FAILED` while 53336 bytes were still free, and at 96 KiB the same boot
+  reported 114580 free and completed it. Two heaps rather than one because the reclaimed region is
+  barely bigger than 64 KiB.
 - The firmware enables `esp-hal/unstable` and has to: on the C6 the Wi-Fi peripheral singleton is
   behind it, and on the C3 it is the hardware RNG that seeds the network stack — `esp-metadata`
   marks `RNG` as unstable for that chip and not for the other. Every new `unstable` API used is one
@@ -176,14 +181,46 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   are in `Cargo.toml`; do not remove them thinking they are noise.
 - Credentials are compiled in from `.cargo/local.toml`, which is untracked. Keep it that way, and
   remember that whatever is in it also lands in the flash image.
-- `src/report.rs` sends **no `Authorization` header, in cleartext, to port 80**, and both halves of
-  that are deliberate rather than unfinished: there is no TLS stack in the tree, so the API is
-  reached over plain HTTP, and a bearer token in cleartext is a password on the wire. So the API
-  answers `401` and the log says so on every pass — that line is the feature working, not a bug. Do
-  not add the token before TLS. Which API it is comes from two build-time variables rather than from
-  source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the deployed Worker and
-  port 80. `HOST` is printed only in the lines about a name that does not resolve.
-- **A reply is not a read.** `socket.read` returns whatever has arrived, which is not the same thing
+- **The TLS stack is prebuilt or it is not built at all.** `mbedtls-rs` ships static libraries for
+  exactly the two triples this project builds, and uses them only when the enabled features match
+  what they were built with byte for byte; anything else compiles MbedTLS from C and needs `CMake`,
+  Clang and a RISC-V C cross-compiler that nothing else here requires. **Two consequences, both
+  traps.** Turning on `hook-wall-clock` — the only way to make it check certificate _dates_, which
+  it otherwise does not — falls on the wrong side of that line, so `src/clock.rs`'s SNTP time is not
+  currently reaching the certificate check. And so does any `ssl-*-content-len-*` feature, which is
+  why the 16 KiB record buffers are paid for in heap instead. Read `Cargo.toml`'s `mbedtls-rs` entry
+  and `src/tls.rs` before changing any feature of that crate; the failure mode of getting it wrong
+  is a build that wants a C toolchain, not a build that says so.
+- **`certs/` holds the one root this firmware trusts**, and it is a promise with a shelf life: if
+  the API moves behind another authority, every handshake fails with a verification error rather
+  than trusting whatever is offered, and `certs/README.md` is what has to change. `.gitattributes`
+  marks the `.der` binary and `.editorconfig-checker.json` excludes it, so the gate reads it as
+  neither text nor prose.
+- `src/report.rs` sends **no `Authorization` header**, so the API answers `401` and the log says so
+  on every pass — that line is the feature working, not a bug. It is now safe to add the token,
+  which is the next piece of work: the exchange is HTTPS through `src/tls.rs` on port 443, so a
+  bearer token is no longer a password on the wire. Which API it is comes from two build-time
+  variables rather than from source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the
+  deployed Worker and port 443. `HOST` is printed only in the lines about a name that does not
+  resolve.
+- **One socket per exchange, and this is load-bearing rather than tidy.** `smoltcp` answers
+  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of the
+  task means every exchange after the first is refused by the stack before a packet goes out.
+  Measured on the board: the first exchange succeeded and the second logged `InvalidState` five
+  minutes later. The socket is opened by the loop in `report` and dropped at the end of each pass;
+  the buffers are built once in `start` and passed in, because `make_static!` cannot hand the same
+  `StaticCell` slot out twice and a per-exchange buffer would panic on the second exchange. It hid
+  for a long time for two reasons worth remembering: the cleartext version half-closed the
+  connection itself before reading, which left the socket in a state the next `connect` tolerated,
+  and **nothing shorter than two intervals can show this class of bug at all** — one exchange has to
+  succeed before a second can fail.
+- **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
+  closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
+  as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
+  so `once` reads first and closes afterwards. Close on **both** paths: `MbedTLS` warns on a session
+  dropped while still open, and a warning on every failed exchange would be a warning about the
+  reporting rather than about the failure.
+- **A reply is not a read.** `stream.read` returns whatever has arrived, which is not the same thing
   as a whole HTTP reply: the 401 this API sends is 650 bytes against a 25-byte status line, and
   nothing in TCP promises where the boundary falls. So `read_reply` loops and asks
   `poc_report::status_line_arrived` before it judges anything. **Reading once and parsing that was
@@ -251,19 +288,22 @@ part of the reasoning; read them before changing what reads what.
 - **The firmware has no test target of its own**, because a bare-metal `#![no_std]` `#![no_main]`
   binary has no test harness to build — `cargo clippy --all-targets` was measured failing with
   `can't find crate for test`. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
-  `src/report.rs` and `src/bin/main.rs` cannot be compiled for a host either, since all six depend
-  on `esp-hal`, on the network stack, or on a scheduler that exists only on a microcontroller, so a
-  test on them needs a board. What _is_ testable is the part that decides rather than talks to
-  hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run it
-  on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when it
-  is worth testing, and expect it not to be there** — logic that needs the radio stays in
-  `src/wifi.rs` untested, logic that needs a socket or a clock stays in `src/ntp.rs` untested, and
-  logic that needs a TCP connection stays in `src/report.rs` untested, because moving any of them
-  would mean moving the hardware it is about. What has moved out is what none of them needs: the
-  calendar arithmetic, the SNTP header, the whole of the state line — its wording, its order, and
-  the encoding each state is published in for another task to read — and the whole of what goes on
-  the wire when that line is reported: the JSON body and its escaping, the timestamp's format, the
-  request head, and the reading of a status line.
+  `src/tls.rs`, `src/report.rs` and `src/bin/main.rs` cannot be compiled for a host either, since
+  all seven depend on `esp-hal`, on the network stack, or on a scheduler that exists only on a
+  microcontroller, so a test on them needs a board. TLS is the sharpest case: whether the
+  certificate chains to the root in `certs/` is a decision MbedTLS makes, and the only evidence
+  either way is a log line on a board. What _is_ testable is the part that decides rather than talks
+  to hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run
+  it on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when
+  it is worth testing, and expect it not to be there** — logic that needs the radio stays in
+  `src/wifi.rs` untested, logic that needs a socket or a clock stays in `src/ntp.rs` untested, logic
+  that needs a TCP connection stays in `src/report.rs` untested, and logic that needs a certificate
+  to be trusted stays in `src/tls.rs` untested, because moving any of them would mean moving the
+  hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
+  SNTP header, the whole of the state line — its wording, its order, and the encoding each state is
+  published in for another task to read — and the whole of what goes on the wire when that line is
+  reported: the JSON body and its escaping, the timestamp's format, the request head, and the
+  reading of a status line.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing
@@ -349,3 +389,8 @@ in either is silent — check that they loaded before assuming either works.
 - esp-backtrace additional configuration:
   <https://docs.espressif.com/projects/rust/esp-backtrace/latest/esp_backtrace/index.html#additional-configuration>
 - esp-hal examples: <https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples>
+- mbedtls-rs: <https://github.com/esp-rs/mbedtls-rs> — the build script is where the
+  prebuilt-or-compile rule above is written down, and it is worth reading before changing any
+  feature of that crate
+- mbedtls-rs examples: <https://github.com/esp-rs/mbedtls-rs/tree/main/examples/esp> — bare-metal
+  esp-hal with `embassy-net`, which is this firmware's shape

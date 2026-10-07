@@ -26,15 +26,17 @@ DEFMT_LOG="info"
 #     EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run
 #
 # The port is a separate key rather than part of the host because `wrangler dev` does not listen on
-# 80 and moves to 8788 when 8787 is taken, so a combined `host:port` would be a URL that is wrong in
-# two different ways at once. 80 and not 443 because this firmware has no TLS, and the Worker answers a
-# cleartext POST on 80 without redirecting to HTTPS — measured on 2026-10-07, and the reason this
-# reaches the API at all before there is a token.
+# 443 and moves to 8788 when 8787 is taken, so a combined `host:port` would be a URL that is wrong in
+# two different ways at once. 443 and not 80 because `src/report.rs` speaks TLS, which `src/tls.rs` is
+# the reason for. Worth saying plainly, because it is not that 80 stopped working: measured again on
+# 2026-10-07, the deployed Worker still answers a cleartext POST on 80 with the same 401 and no
+# redirect to 443. So this is the firmware choosing not to put a credential on the wire in cleartext,
+# not the API refusing to be spoken to that way.
 #
 # `esp-generate` owns this file, so regenerating can drop these keys. It cannot break the build: the
 # constants at the top of `src/report.rs` are the fallback and they name the same API.
 EVENTS_API_HOST="cfpoc.andresmoschini.workers.dev"
-EVENTS_API_PORT="80"
+EVENTS_API_PORT="443"
 
 # The Wi-Fi credentials for the proof of concept are not here: this file is tracked, and a password
 # in a tracked file is a password in the repository. They go in `local.toml`, which is included by

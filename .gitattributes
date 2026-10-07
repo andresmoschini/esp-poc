@@ -27,6 +27,11 @@
 *.ico   binary
 *.pdf   binary
 
+# The trust anchor in `certs/`, in the encoding TLS can parse without copying it into RAM. Binary for
+# the same reason as the images above: it is DER, not text, and a line-ending rule applied to it
+# would corrupt it.
+*.der   binary
+
 # Diff drivers change how a change is displayed, not how it is stored, so these are unaffected by the
 # rule above and still carry their weight: Git uses them to label hunks with the enclosing function or
 # section.

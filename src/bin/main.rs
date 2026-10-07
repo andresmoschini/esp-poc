@@ -21,8 +21,13 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::main;
 use esp_hal::ram;
+use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
+// The C library's `memchr`, which `MbedTLS` calls from `x509.c`. It is named here rather than left to
+// the linker because a dependency nothing in Rust refers to is not linked at all, so without this the
+// firmware builds until the last step and then fails with `undefined symbol: memchr`.
+use tinyrlibc as _;
 
 use esp_poc::status;
 
@@ -92,9 +97,24 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // The radio and the network stack above it allocate, so this firmware is no longer heap-free.
-    // The first heap takes the RAM the bootloader reclaimed; the second takes internal RAM.
+    // The first heap takes the RAM the bootloader reclaimed; the second takes internal RAM. The
+    // budget is now two heaps rather than one, because the TLS handshake in `src/report.rs` takes
+    // about 32 KiB out of them at its peak — MbedTLS allocates a record buffer in each direction,
+    // 16 KiB each by default — on top of whatever the radio is holding.
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 36 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
+
+    // MbedTLS draws its key material from the chip's hardware random number generator, and
+    // `esp_hal` only issues that generator once the entropy source behind it has been enabled — so
+    // it has to be enabled here, and the source has to outlive everything that reads it. Dropping
+    // it would switch the SAR ADC back off and take the Wi-Fi driver's randomness with it, which is
+    // why this is a binding with a name rather than a `_`: it lives as long as `main` does, which is
+    // forever.
+    //
+    // `ADC1` goes with it because the SAR ADC is what the entropy source is made of. Nothing in this
+    // firmware reads an analogue input, so it costs nothing here.
+    let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
+    let trng = Trng::try_new().expect("the entropy source above is enabled");
 
     // The radio needs a preemptive scheduler and will not start without one, so this has to come
     // before anything touches the radio. `FROM_CPU_INTR0` is how the scheduler is woken.
@@ -106,12 +126,12 @@ async fn main(spawner: Spawner) -> ! {
     let stack = esp_poc::wifi::join(spawner, peripherals.WIFI);
 
     // With a network, ask a time server over it what time it is, and report what this chip is doing
-    // to an HTTP API. Both run in their own tasks and need no answer from here: until a time arrives
+    // to an HTTPS API. Both run in their own tasks and need no answer from here: until a time arrives
     // the greeting prints how long the chip has been up, and until the API answers, the reporter has
     // said nothing at all.
     if let Some(stack) = stack {
         esp_poc::ntp::sync(spawner, stack);
-        esp_poc::report::start(spawner, stack);
+        esp_poc::report::start(spawner, stack, trng);
     }
 
     loop {

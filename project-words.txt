@@ -40,6 +40,15 @@ tdefmt
 tlinkall
 wokwi
 
+# The TLS stack, and the entropy source it is fed from
+calloc
+mbedtls
+mbed
+memchr
+showcerts
+tinyrlibc
+trng
+
 # What the proof of concept speaks over the air
 authmode
 datagram

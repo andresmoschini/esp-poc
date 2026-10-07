@@ -48,17 +48,24 @@ a preemptive scheduler (`esp-rtos`) and a heap, which is why the firmware is no 
 and the TCP/IP stack that turns a joined network into an address (`embassy-net`). `src/wifi.rs` has
 the whole sequence up to the network and publishes what the radio is doing; `src/ntp.rs` and
 `src/clock.rs` are what the network is for; `src/status.rs` is the one place that asks all three and
-puts the answers together; `src/report.rs` sends that line to an HTTP API every five minutes;
-`src/bin/main.rs` is the entry point that starts them and prints the result.
+puts the answers together; `src/report.rs` sends that line to an HTTPS API every five minutes and
+`src/tls.rs` is what makes the API's answer to it trustworthy; `src/bin/main.rs` is the entry point
+that starts them and prints the result.
 
 ### Reporting to an API
 
-Once the network is up, the firmware sends that same state line to an HTTP endpoint every five
+Once the network is up, the firmware sends that same state line to an HTTPS endpoint every five
 minutes. It says which one before anything else, because the host comes from the environment and a
 reader of a serial log cannot see an environment:
 
 ```text
-[INFO ] reporting to http://cfpoc.andresmoschini.workers.dev:80/events every 300 seconds
+[INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
+```
+
+then, once per exchange, who the thing on the other end turned out to be:
+
+```text
+[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0
 ```
 
 and then, every five minutes, what came back:
@@ -82,15 +89,39 @@ API's own words:
 
 Those three lines are the point of the exercise as it stands. A 401 says three things at once — the
 request reached the API, the API understood it, and it was refused for want of a token — where a
-timeout would say only the first. Adding the token is the next piece of work, and it is also why
-this speaks plain HTTP to port 80: a bearer token in cleartext is a password on the wire, so the TLS
-stack comes first. Both notes are in `src/report.rs`, which is the file that would change.
+timeout would say only the first. Adding the token is the next piece of work, and it is why this
+speaks HTTPS: a bearer token in cleartext is a password on the wire, so the TLS stack came first.
+Both notes are in `src/report.rs`, which is the file that would change.
 
 The status code is on every line and the body is not, and the split is deliberate. The code is the
 one thing in a reply that is not this firmware's opinion, so it is there even when the sentence
 beside it is one of the named cases. The body is the API's own explanation, which on a `400` is the
 only thing that says _which_ field was wrong — and it is left out for a `201`, whose body is eleven
 bytes saying `ok`, every five minutes, forever.
+
+#### What the API's certificate is checked against
+
+TLS needs one certificate the firmware trusts before it believes any other, and here that is ISRG
+Root X1 in [`certs/`](certs/README.md) — the self-signed root of the Internet Security Research
+Group, under which Let's Encrypt issues the certificate the deployed Worker is served with. The
+server sends the three intermediates above it; only the root has to be on the chip.
+
+Chain, signatures and hostname are checked. **Expiry dates are not**, and that is worth being blunt
+about rather than discovering later: `MBEDTLS_HAVE_TIME_DATE` is compiled out unless `mbedtls-rs`'s
+`hook-wall-clock` feature is on, and turning it on changes MbedTLS's configuration enough that
+`mbedtls-rs-sys` throws away the static libraries it ships for these two chips and compiles MbedTLS
+from C source instead — which needs CMake, Clang and a RISC-V C cross-compiler, none of which
+anything else in this repository requires. So the promise this firmware can currently keep is "this
+chain leads to ISRG", not "this chain leads to ISRG and is current". `src/clock.rs` already holds a
+real time from SNTP, so enabling the hook and handing it that clock is the fix; it is a
+build-environment change rather than a code change.
+
+The trade it makes is worth naming, because it is not the usual one: `mbedtls-rs` only uses its
+prebuilt static libraries when the enabled features match what they were built with byte for byte.
+The obvious next step — turning the certificate buffers down from MbedTLS's 16 KiB default to
+something a chip can afford — is exactly such a change, so it costs a C toolchain too. The buffer is
+therefore paid for in RAM: the handshake takes about 32 KiB of heap at its peak, which is measured
+below.
 
 #### Where it points
 
@@ -99,7 +130,7 @@ Both halves are build-time configuration, and they live in a file rather than in
 | Key               | Tracked default                    | Overridden in `local.toml` for                                 |
 | ----------------- | ---------------------------------- | -------------------------------------------------------------- |
 | `EVENTS_API_HOST` | `cfpoc.andresmoschini.workers.dev` | another account, a staging worker, a `wrangler dev` on the LAN |
-| `EVENTS_API_PORT` | `80`                               | the port; `8787` for a local `wrangler dev`                    |
+| `EVENTS_API_PORT` | `443`                              | the port; `8787` for a local `wrangler dev`                    |
 
 They are in the `[env]` section of [`.cargo/esp-config.toml`](.cargo/esp-config.toml), which is
 where this repository keeps build-time values — the same place `DEFMT_LOG` is. A fresh clone
@@ -116,7 +147,10 @@ EVENTS_API_PORT = "8787"
 
 Two things about a local one. `wrangler dev` listens on `127.0.0.1`, which is the board rather than
 your machine, so it has to be a machine on the network and not a loopback. And the port moves to
-8788 when 8787 is taken — read it off the `Ready on http://…` line `wrangler dev` prints.
+8788 when 8787 is taken — read it off the `Ready on http://…` line `wrangler dev` prints. It also
+speaks cleartext HTTP by default, which this firmware no longer does:
+`wrangler dev --local-protocol https` is what makes one it can actually be pointed at, and its
+certificate is signed by a development authority that [`certs/`](certs/README.md) does not contain.
 
 For a single run, the environment wins over both files:
 
@@ -124,10 +158,11 @@ For a single run, the environment wins over both files:
 EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run
 ```
 
-The port is a separate key rather than part of a URL because `wrangler dev` is not on 80 and not
-always on 8787, and one combined value would be wrong in two ways at once. The deployed Worker
-answers a cleartext POST on port 80 with the same `401` and **no** redirect to HTTPS, which is
-measured rather than assumed and is the whole of why this reaches it without TLS.
+The port is a separate key rather than part of a URL because `wrangler dev` is not on 443 and not
+always on 8787, and one combined value would be wrong in two ways at once. Worth saying plainly,
+because it is not that port 80 stopped working: measured again on 2026-10-07, the deployed Worker
+still answers a cleartext POST on 80 with the same `401` and no redirect to 443. This firmware
+chooses not to put a credential on the wire in cleartext; that is a decision, not a limitation.
 
 That is still scaffolding. The point of the repository is that the scaffolding is now somewhere you
 can build something without first deciding how, and that whatever you build is checked by something
@@ -179,8 +214,10 @@ chips have no atomic wider than a word, which is why the statics in `src/clock.r
 are 32 bits.
 
 What is _not_ per-chip, and is the reason this is one branch and two features rather than two
-directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs` and
-`src/report.rs` name no chip at all. The chip-specific code is the reserved-pin list in
+directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
+`src/tls.rs` and `src/report.rs` name no chip at all — `src/tls.rs` reaches the chip only through
+the random number generator it is handed, and `mbedtls-rs` takes its chip from the same `[features]`
+block every other Espressif dependency does. The chip-specific code is the reserved-pin list in
 `src/bin/main.rs` and the `CHIP` constant in `src/report.rs`, both `#[cfg]`'d on the feature: the
 modules reserve different pins, and a device id that said `esp32c3` on a C6 would put two boards in
 one id space. There is no way to ask `esp-generate` for both pin lists at once.
@@ -200,6 +237,14 @@ toolchain, both targets and the components from it:
 ```sh
 rustup toolchain install
 ```
+
+That is still true of the TLS stack, and it is worth knowing why, because the obvious expectation is
+the opposite. `mbedtls-rs` ships prebuilt static libraries for exactly these two triples and builds
+against them as they are; anything that changes its configuration — including the wall-clock hook
+that would make it check certificate dates — makes it compile MbedTLS from C instead, which would
+add CMake, Clang and a RISC-V C cross-compiler to the list above. See
+[what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against) for
+what that costs and what it buys.
 
 ## Getting it running
 
@@ -375,8 +420,65 @@ The later failures came with a falling signal, from -57 down to -70 dBm, which i
 going on and not something this repository can explain: the board was on a desk next to a router
 that answered a beacon at -55 dBm in the run above. Nothing here has established why.
 
+### What the HTTPS work was measured doing
+
+The TLS path was run on the **ESP32-C3 Super Mini** against the deployed Worker, release profile,
+over the same network as the runs above. Release image 905,232 bytes, 21.92% of the flash — the jump
+from 520,768 is MbedTLS and the certificate.
+
+```text
+[INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
+[INFO ] the clock is set to 2026-10-07 14:52:59 UTC by a stratum 3 server  (src/ntp.rs:146)
+[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:143)
+[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[INFO ] the API said: {"error":"Unauthorized"}
+```
+
+That is the whole of what one exchange has produced: TLS 1.3 negotiated, verification flags `0x0`,
+634 bytes of reply, and the same 401 the cleartext path produced — over port 443, encrypted, with
+the API's certificate verified against [`certs/`](certs/README.md).
+
+Three things about that run are worth recording because none of them was obvious beforehand, and one
+of them was a bug that only a second exchange could show.
+
+**The reporter only ever worked once.** The first exchange succeeded and the second, five minutes
+later, logged `the API would not accept the connection: InvalidState`. It is not a TLS failure and
+it is not the API: `smoltcp` answers `connect` on a socket that is still open with `InvalidState`,
+and this firmware held one socket for the life of the task, so after the first exchange left the
+connection half-closed every later one was refused by the stack before a packet went out. The socket
+is now opened per exchange and dropped at the end of it, which is what the comment in `once` had
+claimed the code was doing all along — the comment was right and the code was not. Two things hid it
+until now: the cleartext version half-closed the connection itself before reading, which happened to
+leave the socket in a state the next `connect` tolerated, and the report interval is five minutes,
+so a run has to outlive one exchange before anything can show. **The second exchange is the first
+thing here that has actually been exercised, and the fix for it has not yet been seen on a board.**
+
+**The heap had to grow, and the reason is the TLS record buffers.** With the two heaps this
+repository had — 64 KiB of reclaimed RAM and 36 KiB of internal — the handshake failed with
+`MbedTLS_ERR_SSL_ALLOC_FAILED` (-0x7F00) while 53,336 bytes were still free. MbedTLS `calloc`s a
+record buffer in each direction at its default 16 KiB, and that is 32 KiB it cannot be talked out of
+without changing its configuration, which costs a C toolchain (see above). The internal heap is now
+96 KiB, where the same boot reported 114,580 bytes free before the handshake and completed it. Two
+heaps rather than one because the reclaimed region is 66,320 bytes on the C3, so 64 KiB is close to
+all of it.
+
+**Closing the connection before reading the reply does not work.** `Connection: close` in the head
+means the _server_ closes when it has answered, and shutting the write half first — TLS
+`close_notify` and then the TCP FIN, as the cleartext version did — came back as
+`IO("ConnectionReset")` before a single byte arrived. The reply is now read first and `close_notify`
+sent afterwards, which is both what the server expects and what stops MbedTLS warning about a
+session dropped while still open.
+
 None of the following has been observed:
 
+- that a **second** exchange succeeds, which is the fix above and the next thing to check on a
+  board;
+- that the C6 completes a handshake: the TLS code names no chip, and the C6 builds and lints clean,
+  but the board above is the C3 and nothing here says the other one connects;
+- that certificate _dates_ are checked, because they are not — see the note under
+  [what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against);
+- that a handshake survives longer than a minute, or that the reporter recovers from one that does
+  not: one exchange has been seen, and the interval is five minutes;
 - that SNTP succeeds reliably — two runs answered and one did not;
 - that a join succeeds reliably — the C3 joined every time and the C6 twice out of five, on one
   network, and nothing here says why;
@@ -407,12 +509,15 @@ Two test steps, and the difference between them is the whole story:
   twice a second reads, and what goes on the wire when that line is reported to an API.
 
 The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
-`src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack, or on a
-scheduler that exists only on a microcontroller, so none of them can be compiled for a host at all —
-a test on them needs a board. Anything testable therefore has to be in something that builds without
-them, which is what `crates/poc-report` is for, and what makes `poc-report` the only crate in the
-tree with no dependencies of its own. Logic that belongs next to hardware rather than in that crate
-is untested, and stays that way until a board or a simulator can run it.
+`src/tls.rs`, `src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack,
+or on a scheduler that exists only on a microcontroller, so none of them can be compiled for a host
+at all — a test on them needs a board. Anything testable therefore has to be in something that
+builds without them, which is what `crates/poc-report` is for, and what makes `poc-report` the only
+crate in the tree with no dependencies of its own. Logic that belongs next to hardware rather than
+in that crate is untested, and stays that way until a board or a simulator can run it. TLS is the
+clearest case of that: what the certificate is checked against, whether the hostname matches and
+whether the chain leads to ISRG are decisions `MbedTLS` makes, and the one thing this repository
+says about them is the log line and the run above.
 
 What that buys, and what it does not, is worth being specific about. The line the firmware prints is
 a `Status` in `poc-report`, so its wording, its order and the decision of when a time has gone stale
@@ -439,27 +544,29 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
-| Path                                | Owns                                                                       |
-| ----------------------------------- | -------------------------------------------------------------------------- |
-| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it          |
-| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing              |
-| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer      |
-| `src/clock.rs`                      | the one number that says what time it is, and where it came from           |
-| `src/status.rs`                     | the three answers the state line is made of                                |
-| `src/report.rs`                     | post that state line to an HTTP API every five minutes, and read the reply |
-| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs              |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests              |
-| `build.rs`                          | linker scripts, and what to do about each undefined symbol                 |
-| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy     |
-| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces        |
-| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build              |
-| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see          |
-| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags       |
-| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked            |
-| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design     |
-| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                           |
-| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                    |
-| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it    |
+| Path                                | Owns                                                                        |
+| ----------------------------------- | --------------------------------------------------------------------------- |
+| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it           |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing               |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer       |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from            |
+| `src/status.rs`                     | the three answers the state line is made of                                 |
+| `src/tls.rs`                        | what the API's certificate is checked against, and the handshake            |
+| `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and read the reply |
+| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs               |
+| `certs/`                            | the one root this firmware trusts, and where it came from                   |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests               |
+| `build.rs`                          | linker scripts, and what to do about each undefined symbol                  |
+| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy      |
+| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces         |
+| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build               |
+| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see           |
+| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags        |
+| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked             |
+| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design      |
+| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                            |
+| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                     |
+| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it     |
 
 ## Regenerating
 

@@ -1,3 +1,4 @@
 {
-  "Disable": { "IndentSize": true }
+  "Disable": { "IndentSize": true },
+  "Exclude": ["certs/.*\\.der$"]
 }
