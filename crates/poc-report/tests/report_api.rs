@@ -15,12 +15,30 @@ use std::fmt::Write as _;
 
 use poc_report::{
     Address, EVENT_TELEMETRY, EVENTS_PATH, Event, Link, REPORT_EVERY_SECS, Request, Status, Time,
-    Timestamp, Verdict,
+    Timestamp, Verdict, status_line_arrived,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
 /// test.
 const AT: u64 = 20_730 * 24 * 60 * 60 + 18 * 3_600 + 22 * 60 + 31;
+
+/// A real 401 from this API, captured on 2026-10-07 with the bytes the firmware sends.
+///
+/// The `Date`, `CF-RAY`, `Report-To` and `Nel` headers are trimmed, and everything else is byte for
+/// byte what came back — in particular the `Connection: close` and the 24-byte JSON body, both of
+/// which are what a real worker sends and neither of which a hand-written fixture would have thought
+/// of. It is 650 bytes against a 25-byte status line, which is the ratio that makes the read-boundary
+/// bug in [`Verdict::from_reply`] ordinary rather than exotic: one read of this reply is very likely
+/// not the whole of it.
+const REPLY_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
+Date: Wed, 07 Oct 2026 11:36:42 GMT\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 24\r\n\
+Connection: close\r\n\
+WWW-Authenticate: Bearer realm=\"cfpoc\"\r\n\
+Server: cloudflare\r\n\
+\r\n\
+{\"error\":\"Unauthorized\"}";
 
 /// The status line of an event from a chip that has joined and has a time.
 fn status() -> Status {
@@ -273,12 +291,94 @@ fn the_content_length_is_the_length_the_caller_measured() {
     );
 }
 
+/// A reply arrives in as many reads as the network decides, and the status line is not guaranteed to
+/// be whole in the first one. Measured against this API, the real 401 below is 650 bytes and the
+/// status line is the first 25 of them, so a read that lands inside the line is ordinary rather than
+/// exotic.
+///
+/// This is the bug this file exists to stop repeating. The firmware read the reply exactly once and
+/// judged whatever arrived, so a read landing inside the line reported "what answered was not the
+/// API" — for a reply the API had already sent, in full, correctly. Both halves are pinned here: the
+/// reader must be able to say when the line is whole, and once it says so every prefix must give the
+/// same answer.
+#[test]
+fn a_reply_read_one_byte_at_a_time_is_still_a_reply() {
+    let line_end = REPLY_401
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .expect("a status line");
+
+    for read in 1..=line_end {
+        let arrived = &REPLY_401[..read];
+
+        // Before the CRLF arrives the reader must know it has to read more, and must not have an
+        // opinion about what it has.
+        assert!(
+            !status_line_arrived(arrived),
+            "{read} bytes of a reply were taken for a whole first line: {}",
+            String::from_utf8_lossy(arrived),
+        );
+    }
+
+    // The CRLF itself, which is the byte that ends the line: one byte earlier than this the line is
+    // not whole and one byte later it is.
+    assert!(!status_line_arrived(&REPLY_401[..line_end + 1]));
+    assert!(status_line_arrived(&REPLY_401[..line_end + 2]));
+
+    // From the moment the line is whole, every byte that can be in the buffer after it gives the same
+    // answer, including the CRLF, the headers, and the body.
+    for read in (line_end + 2)..=REPLY_401.len() {
+        assert_eq!(
+            Verdict::from_reply(&REPLY_401[..read]),
+            Verdict::Unauthorized,
+            "{read} bytes of a valid reply read as something else: {}",
+            String::from_utf8_lossy(&REPLY_401[..read]),
+        );
+    }
+}
+
+/// The point of the loop above, stated on its own: a first line that has half arrived and a first line
+/// that is wrong look identical in the bytes, and the firmware has to be able to tell them apart
+/// rather than guess. This is the exact prefix that made the guess, and what it is made of.
+#[test]
+fn a_half_arrived_status_line_is_not_the_same_as_a_wrong_one() {
+    let half = &REPLY_401[..11];
+
+    assert_eq!(half, b"HTTP/1.1 40");
+    assert!(
+        !status_line_arrived(half),
+        "a truncated line was taken for a whole one",
+    );
+    assert_eq!(
+        Verdict::from_reply(b"HTTP/1.1 2011 Created\r\n\r\n"),
+        Verdict::NotTheApi,
+        "a whole line that is not a status line is still a whole line",
+    );
+}
+
+/// Nothing at all is its own answer, and it is not the same thing as a portal's login page: one means
+/// nothing answered and the other means something that is not the API answered. They want different
+/// fixes, so they do not share a sentence.
+#[test]
+fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
+    assert_eq!(Verdict::from_reply(b""), Verdict::NothingCameBack);
+    assert_eq!(
+        render(&Verdict::NothingCameBack),
+        "nothing came back: the connection closed silently",
+    );
+
+    assert_eq!(
+        Verdict::from_reply(b"<!DOCTYPE html><html>..."),
+        Verdict::NotTheApi,
+    );
+}
+
 /// The 201 the API answers a stored event with is the one that means the exchange worked, and it is
 /// the only answer that does.
 #[test]
 fn a_stored_event_is_recognized() {
     assert_eq!(
-        Verdict::from_status_line(b"HTTP/1.1 201 Created"),
+        Verdict::from_reply(b"HTTP/1.1 201 Created\r\n\r\n"),
         Verdict::Stored,
     );
     assert_eq!(render(&Verdict::Stored), "the API stored the event");
@@ -290,7 +390,7 @@ fn a_stored_event_is_recognized() {
 #[test]
 fn a_refusal_for_want_of_credentials_is_recognized() {
     assert_eq!(
-        Verdict::from_status_line(b"HTTP/1.1 401 Unauthorized"),
+        Verdict::from_reply(b"HTTP/1.1 401 Unauthorized\r\n\r\n"),
         Verdict::Unauthorized,
     );
     assert_eq!(
@@ -299,47 +399,40 @@ fn a_refusal_for_want_of_credentials_is_recognized() {
     );
 }
 
-/// The line the API answers with does not have to arrive whole, and does not have to be the only
-/// thing in the buffer: a TCP read can hand over a status line followed by the headers and the body,
-/// or a line that was cut short. Only the code is read, and a line that was cut short says nothing.
+/// A reply does not have to be only a status line: headers and a body follow it in the same buffer,
+/// and only the first line is read.
 #[test]
-fn a_status_line_is_read_out_of_whatever_arrived() {
-    // A whole reply: the status line, the headers, the body, all in one buffer.
+fn a_status_line_is_read_out_of_whatever_follows_it() {
     let whole = b"HTTP/1.1 201 Created\r\n\
                   Content-Type: application/json\r\n\
                   Content-Length: 11\r\n\
                   \r\n\
                   {\"ok\":true}";
-    assert_eq!(Verdict::from_status_line(whole), Verdict::Stored);
+    assert_eq!(Verdict::from_reply(whole), Verdict::Stored);
 }
 
-/// A body with no status line in it is a different problem from a status nobody expected: the first
-/// means whatever answered was not the API, which on a network with a login portal is the normal
-/// case.
+/// Something that is not a status line is the captive-portal case: on a network with a login page,
+/// the first fifteen bytes of the answer are a `<!DOCTYPE`. These are all whole replies — every one of
+/// them has bytes and none of them has a status line in them — and they must not be confused with a
+/// reply that has not finished arriving, which is [`Verdict`]'s problem and not this one's.
 #[test]
 fn something_that_is_not_a_status_line_is_reported_as_such() {
-    for line in [
-        &b""[..],
-        b"<!DOCTYPE html>",
-        b"HTTP/1.1",
-        // A line cut short by a read that landed mid-header: two digits of a code that could be
-        // 400 or 401, which is exactly the case where guessing is worst.
-        b"HTTP/1.1 40",
-        b"HTTP/1.1 20",
-        b"HTTP/1.1 20x Created",
+    let not_status_lines: [&[u8]; 6] = [
+        b"<!DOCTYPE html>\r\n\r\n<html>",
+        b"HTTP/1.1\r\n\r\n",
+        b"HTTP/1.1 20x Created\r\n\r\n",
         // Four digits, which is a length or a version rather than a status code.
-        b"HTTP/1.1 2011 Created",
+        b"HTTP/1.1 2011 Created\r\n\r\n",
         b"{\"ok\":true}",
-    ] {
-        assert_eq!(
-            Verdict::from_status_line(line),
-            Verdict::NotAnAnswer,
-            "{line:?}",
-        );
+        b"  HTTP/1.1 401 Unauthorized\r\n\r\n",
+    ];
+
+    for line in not_status_lines {
+        assert_eq!(Verdict::from_reply(line), Verdict::NotTheApi, "{line:?}",);
     }
 
     assert_eq!(
-        render(&Verdict::NotAnAnswer),
+        render(&Verdict::NotTheApi),
         "what answered was not the API: the first line was not a status line",
     );
 }
@@ -349,10 +442,14 @@ fn something_that_is_not_a_status_line_is_reported_as_such() {
 #[test]
 fn an_unnamed_status_is_reported_as_the_number_it_is() {
     for status in [200u16, 204, 301, 404, 429, 500, 503] {
-        let line = format!("HTTP/1.1 {status} Something");
+        let reply = format!(
+            "HTTP/1.1 {status} Something
+
+"
+        );
 
         assert_eq!(
-            Verdict::from_status_line(line.as_bytes()),
+            Verdict::from_reply(reply.as_bytes()),
             Verdict::Unexpected(status),
             "{status}",
         );
@@ -387,8 +484,12 @@ fn every_verdict_says_something() {
             "the API answered with a status this firmware does not name: 500",
         ),
         (
-            Verdict::NotAnAnswer,
+            Verdict::NotTheApi,
             "what answered was not the API: the first line was not a status line",
+        ),
+        (
+            Verdict::NothingCameBack,
+            "nothing came back: the connection closed silently",
         ),
     ];
 
@@ -399,7 +500,8 @@ fn every_verdict_says_something() {
 
 /// Two verdicts that read alike are two that will be confused, and the set here has one case per
 /// thing the API can do with this exchange: take it, refuse it for want of credentials, fail to
-/// parse it, refuse the method, say something else, or not be the API at all.
+/// parse it, refuse the method, say something else, answer with something that is not the API, or
+/// not answer at all.
 #[test]
 fn the_answers_are_distinguishable() {
     let sentences = [
@@ -408,7 +510,8 @@ fn the_answers_are_distinguishable() {
         Verdict::Malformed,
         Verdict::NotAllowed,
         Verdict::Unexpected(500),
-        Verdict::NotAnAnswer,
+        Verdict::NotTheApi,
+        Verdict::NothingCameBack,
     ]
     .map(|verdict| render(&verdict));
 

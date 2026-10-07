@@ -1327,23 +1327,38 @@ pub enum Verdict {
     /// is not.
     Unexpected(u16),
 
-    /// The answer did not begin with something that could be a status line.
+    /// Something answered, and it was not the API: the reply's first line is not a status line.
     ///
     /// Its own case rather than folded into `Unexpected`, because it is a different problem: the
     /// other means the API answered and this means whatever answered was not the API. A captive
     /// portal is the usual one, and a board on a hotel network is exactly where that happens.
-    NotAnAnswer,
+    NotTheApi,
+
+    /// The connection produced no bytes at all.
+    ///
+    /// Separate from [`Self::NotTheApi`] because the two have nothing in common beyond "this did not
+    /// work". One means something answered and it was the wrong thing; this means nothing answered,
+    /// which is the network, the server going away, or a peer that closed without a word.
+    NothingCameBack,
 }
 
 impl Verdict {
-    /// What a status line says, or [`Self::NotAnAnswer`] for something that is not one.
+    /// What a reply says, given bytes that [`status_line_arrived`] is already true of.
     ///
-    /// Total rather than an `Option`: the caller prints this either way, and a value it has to
-    /// handle before it can say anything is a place for the handling to be forgotten.
+    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
+    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
+    /// pass it a line it has not finished collecting.
+    ///
+    /// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
+    /// before it can say anything is a place for the handling to be forgotten.
     #[must_use]
-    pub fn from_status_line(line: &[u8]) -> Self {
+    pub fn from_reply(reply: &[u8]) -> Self {
+        let Some(line) = first_line(reply) else {
+            return Self::NothingCameBack;
+        };
+
         let Some(status) = status_code(line) else {
-            return Self::NotAnAnswer;
+            return Self::NotTheApi;
         };
 
         match status {
@@ -1354,6 +1369,22 @@ impl Verdict {
             other => Self::Unexpected(other),
         }
     }
+}
+
+/// Whether a reply has a whole first line in it yet.
+///
+/// The reader's question before it judges anything, and the reason [`Verdict::from_reply`] cannot be
+/// asked sooner: a first line that has half arrived cannot be told apart from one that is wrong.
+/// Measured on the real 401 this API sends, the first eleven bytes of it are `HTTP/1.1 40` — a
+/// truncated status line, a line with no status in it, and a line that looks like a nonsense reply.
+/// All three at once, and nothing in the bytes says which.
+///
+/// So a caller that judges a reply before this is true has to guess, and the guess is the expensive
+/// one: it blames something that was not the API for a reply the API had already sent, which is
+/// exactly what this firmware did until the read loop started asking.
+#[must_use]
+pub fn status_line_arrived(reply: &[u8]) -> bool {
+    reply.windows(2).any(|pair| pair == b"\r\n")
 }
 
 impl fmt::Display for Verdict {
@@ -1373,21 +1404,46 @@ impl fmt::Display for Verdict {
                     "the API answered with a status this firmware does not name: {status}"
                 )
             }
-            Self::NotAnAnswer => {
+            Self::NotTheApi => {
                 f.write_str("what answered was not the API: the first line was not a status line")
+            }
+            Self::NothingCameBack => {
+                f.write_str("nothing came back: the connection closed silently")
             }
         }
     }
 }
 
-/// The three digits of a status code, from the first line of an answer.
+/// The first line of a reply, or `None` when there are no bytes at all.
+///
+/// `None` and not an empty slice, because "a line that arrived as nothing" and "a line that is not a
+/// status line" are different problems and this is where they are told apart. An empty read is a
+/// server that closed without answering; a portal's login page is a thousand bytes that do not start
+/// with a version number.
+///
+/// The line runs to the first `CRLF`, and a reply with no `CRLF` in it at all yields everything there
+/// is. That last case is the caller asking too early, which [`status_line_arrived`] exists to stop
+/// them doing; it yields the whole buffer rather than nothing, because a caller who got here anyway is
+/// better served by a sentence about a reply this firmware does not recognize than by one about
+/// silence.
+fn first_line(reply: &[u8]) -> Option<&[u8]> {
+    if reply.is_empty() {
+        return None;
+    }
+
+    let end = reply.windows(2).position(|pair| pair == b"\r\n");
+
+    Some(&reply[..end.unwrap_or(reply.len())])
+}
+
+/// The three digits of a status code, from the first line of a reply.
 ///
 /// Reads the code rather than the reason phrase, because the phrase is prose that a server may
-/// change and the code is the part of the line that means something. The line is not required to
-/// end anywhere in particular: a read that arrived in pieces is a line this still has to make sense
-/// of, so the search is for the first space and then three digits, and the rest is ignored.
+/// change and the code is the part of the line that means something. Everything after the three
+/// digits is ignored, so a reason phrase that is missing or one this firmware has never seen does not
+/// change what the code was.
 ///
-/// `None` for anything that is not `HTTP/x.y NNN`, which is what makes [`Verdict::NotAnAnswer`]
+/// `None` for anything that is not `HTTP/x.y NNN`, which is what makes [`Verdict::NotTheApi`]
 /// reachable at all — a portal's login page is HTML, and the first fifteen bytes of it are a
 /// `<!DOCTYPE` that is not a version number.
 fn status_code(line: &[u8]) -> Option<u16> {
