@@ -776,6 +776,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-nal"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "590182a48668fa4988cd97b9b500bcc9a213e9b122b4e0008e934b3916c64031"
+dependencies = [
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+]
+
+[[package]]
+name = "edge-nal-embassy"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79ad23a63d41bdda528a3b725ae9119ce58abeea265b41fc7f8b254c8d07b2a2"
+dependencies = [
+ "edge-nal",
+ "embassy-futures",
+ "embassy-net",
+ "embedded-io-async 0.7.0",
+]
+
+[[package]]
+name = "edge-nal-tls"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "801084ceecca4616794943227e2c5594327771a5e98167484abb0b728f4b0920"
+dependencies = [
+ "defmt 1.1.1",
+ "edge-nal",
+ "embedded-io-async 0.7.0",
+ "mbedtls-rs",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,6 +1378,9 @@ version = "0.1.0"
 dependencies = [
  "critical-section",
  "defmt 1.1.1",
+ "edge-nal",
+ "edge-nal-embassy",
+ "edge-nal-tls",
  "embassy-executor",
  "embassy-net",
  "embassy-time",

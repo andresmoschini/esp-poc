@@ -35,13 +35,15 @@ use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 
 use defmt::{error, info, warn};
+use edge_nal::io::{Read, Write};
+use edge_nal::{Close, TcpShutdown as _};
+use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
+use edge_nal_tls::TlsConnector;
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::rng::Trng;
-use mbedtls_rs::{Tls, TlsReference};
 use poc_report::{
     EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Reply, Request, Time, Verdict,
     status_line_arrived,
@@ -152,22 +154,6 @@ fn server_name(buffer: &'static mut [u8; NAME_LEN]) -> &'static CStr {
 /// different problems with different fixes.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Receive buffer for the socket.
-///
-/// Larger than any reply this API gives — the largest is a Cloudflare error page of a few hundred
-/// bytes. `smoltcp` drops a datagram that does not fit rather than truncating it, so a buffer sized
-/// to the status line alone would throw away every body there is.
-///
-/// It is also large enough for the largest record TLS will deliver in one piece. A TLS record is at
-/// most 16 KiB by `MbedTLS`' default, and `mbedtls-rs` hands the socket whatever `mbedtls_ssl_read`
-/// returns, which is one record's worth of plaintext — so a peer whose first record is larger than
-/// this would have it split across reads rather than truncated. Measured on the deployed Worker:
-/// one 634-byte reply, arriving in one read.
-const RX_LEN: usize = 1024;
-
-/// Transmit buffer for the socket, which has to hold the head and the body.
-const TX_LEN: usize = 512;
-
 /// How many bytes of body to build.
 ///
 /// 512, comfortably over the longest body this firmware can produce: a failed join with a signal in it
@@ -225,40 +211,22 @@ pub fn start(spawner: Spawner, stack: Stack<'static>, trng: Trng) {
 
     // Here rather than inside the task, for the reason `src/ntp.rs` builds its socket in the same
     // place: `make_static!` builds its type out of `impl Trait`, and a task's body is itself an
-    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. What is
-    // built here is the *storage*, not the socket: the socket itself is opened per exchange by the
-    // task, which is what has to own its lifetime.
-    let rx = static_cell::make_static!([0; RX_LEN]);
-    let tx = static_cell::make_static!([0; TX_LEN]);
-
-    // Also here, and for the same reason: the TLS session borrows the server name for as long as it
-    // lives, and `MbedTLS` has one instance for the whole program rather than one per exchange.
+    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. All of it
+    // is storage rather than state: the pool of socket buffers, the server name, and the factory
+    // that holds the trust anchor and the MbedTLS instance.
+    let buffers = static_cell::make_static!(TcpBuffers::new());
     let name = server_name(static_cell::make_static!([0; NAME_LEN]));
     let tls = tls::instance(trng);
+    let connector = tls::connector(tls, buffers, stack, name);
 
-    spawner.spawn(report(stack, tls, name, rx, tx).expect("report is a task"));
-}
-
-/// Opens one socket for one exchange.
-///
-/// The buffers are passed in rather than built here because they outlive the socket, and that
-/// asymmetry is the whole of why this works. `embassy-net` has a fixed number of sockets and a
-/// socket set that is full panics rather than refusing, so a socket whose buffers were also
-/// per-exchange would hand the same `StaticCell` slot to `make_static!` twice and panic on the second
-/// call. One pair of buffers for the life of the task, one socket at a time borrowed from them, and
-/// the loop in [`report`] is what guarantees only one socket exists at a time.
-fn open<'a>(stack: Stack<'a>, rx: &'a mut [u8; RX_LEN], tx: &'a mut [u8; TX_LEN]) -> TcpSocket<'a> {
-    TcpSocket::new(stack, rx, tx)
+    spawner.spawn(report(stack, connector).expect("report is a task"));
 }
 
 /// The task behind [`start`].
 #[embassy_executor::task]
 async fn report(
     stack: Stack<'static>,
-    tls: Tls<'static>,
-    name: &'static CStr,
-    rx: &'static mut [u8; RX_LEN],
-    tx: &'static mut [u8; TX_LEN],
+    connector: &'static TlsConnector<'static, EmbassyTcp<'static>>,
 ) {
     // The first report waits for DHCP rather than firing into a stack that has no address yet: the
     // exchange needs an address to send from, and the resolver it needs to find the API with is
@@ -266,15 +234,7 @@ async fn report(
     stack.wait_config_up().await;
 
     loop {
-        // A socket per exchange, dropped at the end of it. That is not a stylistic choice: a
-        // `TcpSocket` that is still open cannot be connected again — `smoltcp` answers `connect`
-        // on an open socket with `InvalidState`, which is what the second pass used to log five
-        // minutes after the first one succeeded. Dropping it takes it out of the socket set and
-        // leaves the next pass a socket that has never been connected, which is the only state
-        // `connect` accepts.
-        let mut socket = open(stack, rx, tx);
-
-        once(&stack, tls.reference(), &mut socket, name).await;
+        once(stack, connector).await;
 
         Timer::after(Duration::from_secs(REPORT_EVERY_SECS)).await;
     }
@@ -283,19 +243,17 @@ async fn report(
 /// One exchange: resolve the host, connect, shake hands, write the head and the body, and read the
 /// answer.
 async fn once(
-    stack: &Stack<'static>,
-    tls: TlsReference<'_>,
-    socket: &mut TcpSocket<'_>,
-    name: &'static CStr,
+    stack: Stack<'static>,
+    connector: &'static TlsConnector<'static, EmbassyTcp<'static>>,
 ) {
-    let Ok(address) = resolve(stack).await else {
+    let Ok(address) = resolve(&stack).await else {
         return;
     };
 
     // Read here, in the task that is about to report, rather than passed in: the greeting reads the
     // same three facts twice a second and this reads them once every five minutes, and the state a
     // report carries has to be the state at the moment it is stamped.
-    let state = status::report(Some(*stack));
+    let state = status::report(Some(stack));
 
     let mut id = [0; ID_LEN];
     let id_len = write_id(&mut id, esp_hal::efuse::base_mac_address());
@@ -333,18 +291,14 @@ async fn once(
     };
 
     // Each step below returns `Err` having already said what went wrong, so the caller only has to
-    // stop. Nothing here has to arrange for the socket to be reusable: the caller drops it on the way
-    // out whatever the outcome, which is also what a `connect` that timed out mid-handshake needs,
-    // since `smoltcp`'s state machine would refuse the next `connect` on it as an invalid state.
-    if connect(socket, address).await.is_err() {
-        return;
-    }
-
-    // The TCP connection is established but nothing has been said yet, so this is the first moment
-    // at which a certificate could be checked and the first moment at which the API is known to be
-    // the API. The borrow of the socket ends with the session, so a handshake that fails leaves the
-    // socket in the state the step above left it in.
-    let Some(mut stream) = tls::open(tls, socket, name).await else {
+    // stop. Nothing here has to arrange for the connection to be reusable: `crate::tls` builds the
+    // socket out of a pool and the connection is dropped on the way out whatever the outcome, which
+    // is also what a handshake that timed out needs — `smoltcp` refuses the next `connect` on a
+    // socket that is still open as an invalid state.
+    //
+    // This is the first moment at which a certificate could be checked, and the first at which the
+    // API is known to be the API.
+    let Some(mut stream) = tls::open(connector, address, port()).await else {
         return;
     };
 
@@ -360,7 +314,7 @@ async fn once(
     // closes when it has answered, and the answer is what this is waiting for: shutting the write
     // half first measured as a `ConnectionReset` before a single byte came back, which is this
     // server's answer to being told the conversation was over before it had replied to it.
-    let mut buffer = [0; RX_LEN];
+    let mut buffer = [0; tls::RX_LEN];
 
     let read = read_reply(&mut stream, &mut buffer).await;
 
@@ -368,7 +322,7 @@ async fn once(
     // protocol's own way of saying there is no more of this exchange. On both paths rather than
     // only the happy one: MbedTLS warns on a session dropped while still open, and a warning that
     // fires on every failed exchange would be a warning about the reporting, not about the failure.
-    match with_timeout(TIMEOUT, stream.close()).await {
+    match with_timeout(TIMEOUT, stream.close(Close::Write)).await {
         Err(_) => warn!("the exchange was not closed politely: it timed out"),
         Ok(Err(e)) => warn!("the exchange was not closed politely: {:?}", e),
         Ok(Ok(())) => {}
@@ -435,7 +389,7 @@ async fn once(
 /// - the buffer filled up with no CRLF in it, which is a reply this firmware cannot read.
 ///
 /// `None` means the last two, or a read that failed, and each has already said which.
-async fn read_reply(stream: &mut tls::Stream<'_, '_>, into: &mut [u8; RX_LEN]) -> Option<usize> {
+async fn read_reply(stream: &mut tls::Stream<'_>, into: &mut [u8; tls::RX_LEN]) -> Option<usize> {
     let mut read = 0;
 
     while read < into.len() {
@@ -478,34 +432,10 @@ async fn read_reply(stream: &mut tls::Stream<'_, '_>, into: &mut [u8; RX_LEN]) -
 
     error!(
         "the first line of the reply is longer than the {} byte buffer",
-        RX_LEN
+        tls::RX_LEN
     );
 
     None
-}
-
-/// Opens the connection to the API, or says why it did not.
-///
-/// Its own function rather than a step inside [`once`] because it is the one step whose failure is
-/// not about the request: everything after it is about bytes this firmware is sending, and a reader
-/// of a log line saying which step failed needs the two to be separable.
-async fn connect(socket: &mut TcpSocket<'_>, address: Ipv4Addr) -> Result<(), ()> {
-    match with_timeout(TIMEOUT, socket.connect((address, port()))).await {
-        Err(_) => {
-            error!("the API did not complete the connection: it timed out");
-
-            Err(())
-        }
-        // The driver's own words are logged here rather than folded into a sentence: what a
-        // connection was refused for is a numbered reason out of a set this firmware does not name,
-        // and a reader of this log is better served by it than by a guess.
-        Ok(Err(e)) => {
-            error!("the API would not accept the connection: {:?}", e);
-
-            Err(())
-        }
-        Ok(Ok(())) => Ok(()),
-    }
 }
 
 /// Writes all of `bytes` to the stream, or gives up.
@@ -517,7 +447,7 @@ async fn connect(socket: &mut TcpSocket<'_>, address: Ipv4Addr) -> Result<(), ()
 ///
 /// `Err(())` rather than the stack's error because every failure here has already said what it was
 /// in the log, and a caller that logged it again would print the same sentence twice.
-async fn send(stream: &mut tls::Stream<'_, '_>, bytes: &[u8]) -> Result<(), ()> {
+async fn send(stream: &mut tls::Stream<'_>, bytes: &[u8]) -> Result<(), ()> {
     let mut sent = 0;
 
     while sent < bytes.len() {

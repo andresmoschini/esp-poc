@@ -160,18 +160,25 @@ static_cell     = { version = "2.1.0", features = ["nightly"] }
 
 # The TLS stack `src/report.rs` speaks HTTPS through, which is what makes `https://` reachable at all.
 #
-# Pinned to an exact version, and the pin is not only about a 0.x API: the crate selects MbedTLS's
-# configuration from its enabled features, and it only uses the static libraries committed under
-# `mbedtls-rs-sys/libs/<target>` when the active features match what those were built with byte for
-# byte. Anything else compiles MbedTLS from C source, which needs CMake and a RISC-V C cross-compiler
-# that nothing else in this project requires. So a different feature set is a build that works on one
-# machine and not another, and a patch release is a change to this line on purpose rather than
-# something `cargo update` may do by itself.
+# It is reached through `edge-nal`: `edge-nal-embassy` makes a `embassy-net` socket an `edge-nal`
+# factory that builds a socket per `connect` and returns its buffers to a pool on drop, and
+# `edge-nal-tls` layers MbedTLS on top of that. See `src/tls.rs` for why the abstraction exists.
+#
+# `mbedtls-rs` is pinned to an exact version, and the pin is not only about a 0.x API: the crate
+# selects MbedTLS's configuration from its enabled features, and it only uses the static libraries
+# committed under `mbedtls-rs-sys/libs/<target>` when the active features match what those were built
+# with byte for byte. Anything else compiles MbedTLS from C source, which needs CMake and a RISC-V C
+# cross-compiler that nothing else in this project requires. So a different feature set is a build
+# that works on one machine and not another, and a patch release is a change to this line on purpose
+# rather than something `cargo update` may do by itself.
 #
 # `defmt` is what makes MbedTLS's error types printable in a `defmt` log. The chip features are in the
 # `[features]` block above, like every other Espressif dependency: they select the chip, and one list
 # says which chip is being built.
 mbedtls-rs = { version = "=0.3.0", features = ["defmt"] }
+edge-nal         = "0.7.0"
+edge-nal-embassy = "0.9.0"
+edge-nal-tls     = { version = "0.3.0", features = ["defmt"] }
 
 # The C library's `memchr`, which MbedTLS calls from `x509.c` and which nothing else on the chip
 # provides. Measured, not assumed: without this the link fails with `undefined symbol: memchr`,
