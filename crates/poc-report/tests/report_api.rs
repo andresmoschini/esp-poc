@@ -14,8 +14,8 @@
 use std::fmt::Write as _;
 
 use poc_report::{
-    Address, EVENT_TELEMETRY, EVENTS_PATH, Event, Link, REPORT_EVERY_SECS, Request, Status, Time,
-    Timestamp, Verdict, status_line_arrived,
+    Address, EVENT_TELEMETRY, EVENTS_PATH, Event, LOGGED_LEN, Link, REPORT_EVERY_SECS, Reply,
+    Request, Status, Time, Timestamp, Verdict, logged, status_line_arrived,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
@@ -329,7 +329,7 @@ fn a_reply_read_one_byte_at_a_time_is_still_a_reply() {
     // answer, including the CRLF, the headers, and the body.
     for read in (line_end + 2)..=REPLY_401.len() {
         assert_eq!(
-            Verdict::from_reply(&REPLY_401[..read]),
+            Reply::from_bytes(&REPLY_401[..read]).verdict(),
             Verdict::Unauthorized,
             "{read} bytes of a valid reply read as something else: {}",
             String::from_utf8_lossy(&REPLY_401[..read]),
@@ -350,7 +350,7 @@ fn a_half_arrived_status_line_is_not_the_same_as_a_wrong_one() {
         "a truncated line was taken for a whole one",
     );
     assert_eq!(
-        Verdict::from_reply(b"HTTP/1.1 2011 Created\r\n\r\n"),
+        Reply::from_bytes(b"HTTP/1.1 2011 Created\r\n\r\n").verdict(),
         Verdict::NotTheApi,
         "a whole line that is not a status line is still a whole line",
     );
@@ -361,15 +361,152 @@ fn a_half_arrived_status_line_is_not_the_same_as_a_wrong_one() {
 /// fixes, so they do not share a sentence.
 #[test]
 fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
-    assert_eq!(Verdict::from_reply(b""), Verdict::NothingCameBack);
+    assert_eq!(Reply::from_bytes(b"").verdict(), Verdict::NothingCameBack);
     assert_eq!(
         render(&Verdict::NothingCameBack),
         "nothing came back: the connection closed silently",
     );
 
     assert_eq!(
-        Verdict::from_reply(b"<!DOCTYPE html><html>..."),
+        Reply::from_bytes(b"<!DOCTYPE html><html>...").verdict(),
         Verdict::NotTheApi,
+    );
+}
+
+/// The status code is the one thing in a reply that is not this firmware's opinion, so it has to be
+/// readable for every status and not only for the ones this crate happens to have a name for. That
+/// was the actual gap: a verdict on its own throws 401 away and keeps 503, which is backwards.
+#[test]
+fn the_status_code_is_readable_for_every_status() {
+    for status in [200u16, 201, 204, 400, 401, 403, 404, 405, 429, 500, 503] {
+        let reply = format!("HTTP/1.1 {status} Something\r\nContent-Length: 0\r\n\r\n");
+
+        assert_eq!(
+            Reply::from_bytes(reply.as_bytes()).status(),
+            Some(status),
+            "{status}",
+        );
+    }
+}
+
+/// A reply that is not HTTP has no status, and inventing one would be a guess: a zero in a log reads
+/// as a status the API sent, and there is no such status. `None` is the truth and the caller says so.
+#[test]
+fn a_reply_that_is_not_http_has_no_status_code() {
+    for reply in [
+        &b""[..],
+        b"<!DOCTYPE html>\r\n\r\n",
+        b"HTTP/1.1 20x Created\r\n\r\n",
+        b"{\"ok\":true}",
+    ] {
+        assert_eq!(Reply::from_bytes(reply).status(), None, "{reply:?}");
+    }
+}
+
+/// The body is what follows the first blank line, and it is the only thing a 400 says about which
+/// field was wrong. This is the API's own, from [`REPLY_401`].
+#[test]
+fn the_body_is_what_follows_the_headers() {
+    let reply = Reply::from_bytes(REPLY_401);
+
+    assert_eq!(reply.body(), br#"{"error":"Unauthorized"}"#);
+    assert_eq!(render(&logged(reply.body())), r#"{"error":"Unauthorized"}"#);
+}
+
+/// A reply with no blank line has no body yet, which is not the same as a reply with an empty one.
+/// Both log as "(no body)" here, and the reason is in [`logged`]: the body is the only thing the
+/// status line does not already say, so a guess about framing would be a guess about the only part
+/// that is not already known.
+#[test]
+fn a_reply_with_no_blank_line_has_no_body() {
+    // The status line and nothing else, which is what the reader has the moment the line arrives.
+    let line_end = REPLY_401
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .expect("a status line")
+        + 2;
+    let just_the_line = &REPLY_401[..line_end];
+
+    assert!(status_line_arrived(just_the_line));
+    assert_eq!(Reply::from_bytes(just_the_line).body(), b"");
+
+    // An explicitly empty body, which is what a 204 or a 304 carries.
+    let empty = b"HTTP/1.1 204 No Content\r\n\r\n";
+    assert_eq!(Reply::from_bytes(empty).body(), b"");
+
+    assert_eq!(render(&logged(b"")), "(no body)");
+}
+
+/// A body is untrusted bytes and it goes into a serial log, so anything unprintable is replaced
+/// rather than written through: a NUL or an escape sequence in a reply would garble the terminal of
+/// whoever is reading, which destroys the output the line exists to produce.
+#[test]
+fn a_body_that_is_not_text_cannot_break_the_log() {
+    let body = b"{\"n\":0}\x00\x07\x1b[31m\xff\xfe end";
+
+    let line = render(&logged(body));
+
+    // The escape is replaced and the `[31m` after it is not: what follows an escape sequence is
+    // ordinary printable text once the escape that introduced it is gone, and there is nothing left
+    // for a terminal to interpret. What matters is that the `0x1b` itself did not reach the log.
+    assert_eq!(line, "{\"n\":0}···[31m·· end");
+    assert!(
+        !line.chars().any(|character| character.is_control()),
+        "a control character reached the log: {line:?}",
+    );
+}
+
+/// The body is cut at a bound and marked when it is, so that a truncated body cannot read as a
+/// complete one. A Cloudflare error page is the case this is for: its first 120 characters already
+/// say it is HTML, and the other thousand are noise on a line read twice a second.
+#[test]
+fn a_body_longer_than_the_bound_is_cut_and_says_so() {
+    let long = vec![b'x'; LOGGED_LEN + 500];
+
+    let line = render(&logged(&long));
+
+    assert_eq!(line.len(), LOGGED_LEN + '…'.len_utf8());
+    assert!(line.ends_with('…'), "{line}");
+    assert_eq!(line.chars().take(LOGGED_LEN).count(), LOGGED_LEN);
+
+    // Exactly at the bound is not cut: the ellipsis means "there was more", and adding one when there
+    // was not would make every short body look like a fragment of a longer one.
+    let exact = vec![b'x'; LOGGED_LEN];
+    assert_eq!(render(&logged(&exact)), "x".repeat(LOGGED_LEN));
+}
+
+/// Every byte value survives `logged` without becoming a control character or a panic. This is the
+/// property that makes it safe to hand it anything off the network, and a sweep is the only way to
+/// check all 256 of them — a body from the wire has no type, so there is no value a caller could have
+/// promised anything about.
+#[test]
+fn every_byte_value_can_be_logged() {
+    let all: Vec<u8> = (0..=255).collect();
+
+    let line = render(&logged(&all));
+
+    assert!(
+        !line.chars().any(|character| character.is_control()),
+        "a control character reached the log: {line:?}",
+    );
+    // Cut at the bound, so the sweep's own tail is not in the output; every byte that was written
+    // came out as one character and none of them was a control character.
+    assert_eq!(line.chars().count(), LOGGED_LEN + 1, "the ellipsis");
+}
+
+/// Printable ASCII comes through as itself, which is the other half: replacing everything unprintable
+/// with a dot is only safe if what was printable in the first place survives.
+#[test]
+fn printable_ascii_survives_logging() {
+    let printable: Vec<u8> = (0x20..=0x7e).collect();
+
+    assert_eq!(
+        render(&logged(&printable)),
+        (0x20u8..=0x7e).map(char::from).collect::<String>()
+    );
+    assert!(
+        render(&logged(&printable)).contains('~'),
+        "0x7e did not survive"
     );
 }
 
@@ -378,7 +515,7 @@ fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
 #[test]
 fn a_stored_event_is_recognized() {
     assert_eq!(
-        Verdict::from_reply(b"HTTP/1.1 201 Created\r\n\r\n"),
+        Reply::from_bytes(b"HTTP/1.1 201 Created\r\n\r\n").verdict(),
         Verdict::Stored,
     );
     assert_eq!(render(&Verdict::Stored), "the API stored the event");
@@ -390,7 +527,7 @@ fn a_stored_event_is_recognized() {
 #[test]
 fn a_refusal_for_want_of_credentials_is_recognized() {
     assert_eq!(
-        Verdict::from_reply(b"HTTP/1.1 401 Unauthorized\r\n\r\n"),
+        Reply::from_bytes(b"HTTP/1.1 401 Unauthorized\r\n\r\n").verdict(),
         Verdict::Unauthorized,
     );
     assert_eq!(
@@ -408,7 +545,7 @@ fn a_status_line_is_read_out_of_whatever_follows_it() {
                   Content-Length: 11\r\n\
                   \r\n\
                   {\"ok\":true}";
-    assert_eq!(Verdict::from_reply(whole), Verdict::Stored);
+    assert_eq!(Reply::from_bytes(whole).verdict(), Verdict::Stored);
 }
 
 /// Something that is not a status line is the captive-portal case: on a network with a login page,
@@ -428,7 +565,11 @@ fn something_that_is_not_a_status_line_is_reported_as_such() {
     ];
 
     for line in not_status_lines {
-        assert_eq!(Verdict::from_reply(line), Verdict::NotTheApi, "{line:?}",);
+        assert_eq!(
+            Reply::from_bytes(line).verdict(),
+            Verdict::NotTheApi,
+            "{line:?}",
+        );
     }
 
     assert_eq!(
@@ -449,7 +590,7 @@ fn an_unnamed_status_is_reported_as_the_number_it_is() {
         );
 
         assert_eq!(
-            Verdict::from_reply(reply.as_bytes()),
+            Reply::from_bytes(reply.as_bytes()).verdict(),
             Verdict::Unexpected(status),
             "{status}",
         );

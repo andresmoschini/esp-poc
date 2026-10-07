@@ -1291,16 +1291,161 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// What a reply from the API is: the number it said, what that means, and the body it said it in.
+///
+/// One type rather than a bare [`Verdict`] because the three are three answers to one parse and the
+/// caller wants all three. The status code is the most concrete fact a reply carries and a verdict
+/// alone throws it away for every case it has a name for; the body is the API's own explanation, and
+/// on a 400 it is the only thing that says *which* field was wrong.
+///
+/// The bytes are borrowed, not decoded: nothing here parses the body. Deciding is [`Verdict`]'s job
+/// and the status line is enough for it, but logging is a different question, and for logging the
+/// body is text a person reads. See [`logged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reply<'a> {
+    /// The three digits of the status code, or `None` when the first line was not a status line.
+    status: Option<u16>,
+
+    /// What the status line means.
+    verdict: Verdict,
+
+    /// Everything after the first blank line, which is where a body is.
+    body: &'a [u8],
+}
+
+impl<'a> Reply<'a> {
+    /// A reply, from the bytes that have arrived.
+    ///
+    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
+    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
+    /// pass it a line it has not finished collecting. See [`status_line_arrived`].
+    #[must_use]
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        let Some(line) = first_line(bytes) else {
+            return Self {
+                status: None,
+                verdict: Verdict::NothingCameBack,
+                body: &[],
+            };
+        };
+
+        let status = status_code(line);
+
+        // The body is what follows the first blank line, and an empty slice when there is not one —
+        // a 401 with no body and a 401 whose body has not arrived yet are the same thing to log, and
+        // both are better described by what the status line says than by a guess about the framing.
+        let body = bytes
+            .windows(4)
+            .position(|blank| blank == b"\r\n\r\n")
+            .map_or(&[][..], |blank| &bytes[blank + 4..]);
+
+        Self {
+            status,
+            verdict: match status {
+                Some(201) => Verdict::Stored,
+                Some(400) => Verdict::Malformed,
+                Some(401) => Verdict::Unauthorized,
+                Some(405) => Verdict::NotAllowed,
+                Some(other) => Verdict::Unexpected(other),
+                None => Verdict::NotTheApi,
+            },
+            body,
+        }
+    }
+
+    /// What the reply meant, in words.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// The status code, or `None` when the first line was not a status line.
+    ///
+    /// `Option` and not a number, because a reply that is not HTTP has no status and inventing one —
+    /// a zero, say — is exactly the guess this module exists to refuse. A reader of a log that sees
+    /// no number is being told the truth; one that sees `0` would go and read the API's
+    /// documentation about status zero.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// The bytes after the headers, for [`logged`].
+    #[must_use]
+    pub fn body(&self) -> &'a [u8] {
+        self.body
+    }
+}
+
+/// How many bytes of a body [`logged`] will write.
+///
+/// 120, which is more than any message this API sends — its longest is `{"error":"Unauthorized"}` at
+/// 24 — and short enough that a line with the greeting's worth of context in front of it stays
+/// readable on a serial log. A Cloudflare error page gets cut, which costs nothing: its first 120
+/// characters already say it is HTML.
+pub const LOGGED_LEN: usize = 120;
+
+/// The bytes of a body as something safe to write into a serial log.
+///
+/// Bytes off the network cannot go into a log as they are, and this is the reason:
+///
+/// - **They may not be text.** `{"error":"Unauthorized"}` is, and a truncated read in the middle of a
+///   multi-byte character is not. There is no `Display` or `defmt::Format` for `[u8]`, and guessing
+///   UTF-8 would mean either a lossy conversion nobody asked for or a panic on a network task.
+/// - **They may contain control characters.** A reply is untrusted input and a `0x00` or an escape
+///   sequence in a serial log garbles the terminal of whoever is reading it, which destroys the very
+///   output the line exists to produce. Anything unprintable is written as `·`.
+///
+/// Truncated at [`LOGGED_LEN`] and marked when it is, so that a cut-off body does not read as a
+/// complete one.
+///
+/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the escaping
+/// are decisions, and a decision made in a private function returning a `String` would be one this
+/// crate has no allocator to make.
+#[must_use]
+pub fn logged(body: &[u8]) -> impl fmt::Display {
+    Logged(body)
+}
+
+/// A body that knows how to write itself safely, in [`logged`].
+struct Logged<'a>(&'a [u8]);
+
+impl fmt::Display for Logged<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("(no body)");
+        }
+
+        let cut = self.0.len().min(LOGGED_LEN);
+
+        for byte in &self.0[..cut] {
+            match byte {
+                // Printable ASCII and nothing else. Above 0x7e is a decision too: a UTF-8 body would
+                // be valid text but there is no way to know that from one byte, and a byte rendered
+                // on its own is at best a replacement character. So this is honest about what it has.
+                0x20..=0x7e => f.write_char(char::from(*byte))?,
+                _ => f.write_str("·")?,
+            }
+        }
+
+        if self.0.len() > LOGGED_LEN {
+            f.write_str("…")?;
+        }
+
+        Ok(())
+    }
+}
+
 /// What a status line from the API means.
 ///
-/// The body is not read. It is `{"ok":true}` on a store and `{"error":"Unauthorized"}` on a refusal,
-/// and the status line already says which of the two it is — parsing a second JSON document on a
-/// microcontroller to learn what three digits said for free is a way to have a second thing that can
-/// be wrong about the API.
+/// The number is not in here: it is in [`Reply`], because a name for a case and the code that named
+/// it are two different things and a reader of a log wants both. What is here is what to do about
+/// it — a 401 here means one specific thing, which is that the request went out with no credentials
+/// on it, and it is going to keep meaning that until a token is added.
 ///
-/// A sentence per case rather than the number, because the number is what the API said and the
-/// sentence is what to do about it: 401 here means one specific thing, which is that the request
-/// went out with no credentials on it, and it is going to keep meaning that until a token is added.
+/// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
+/// before it can say anything is a place for the handling to be forgotten. Every variant has a
+/// sentence, because the sentence is what ends up in the serial log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// 201: the event was stored.
@@ -1342,38 +1487,9 @@ pub enum Verdict {
     NothingCameBack,
 }
 
-impl Verdict {
-    /// What a reply says, given bytes that [`status_line_arrived`] is already true of.
-    ///
-    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
-    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
-    /// pass it a line it has not finished collecting.
-    ///
-    /// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
-    /// before it can say anything is a place for the handling to be forgotten.
-    #[must_use]
-    pub fn from_reply(reply: &[u8]) -> Self {
-        let Some(line) = first_line(reply) else {
-            return Self::NothingCameBack;
-        };
-
-        let Some(status) = status_code(line) else {
-            return Self::NotTheApi;
-        };
-
-        match status {
-            201 => Self::Stored,
-            400 => Self::Malformed,
-            401 => Self::Unauthorized,
-            405 => Self::NotAllowed,
-            other => Self::Unexpected(other),
-        }
-    }
-}
-
 /// Whether a reply has a whole first line in it yet.
 ///
-/// The reader's question before it judges anything, and the reason [`Verdict::from_reply`] cannot be
+/// The reader's question before it judges anything, and the reason [`Reply::from_bytes`] cannot be
 /// asked sooner: a first line that has half arrived cannot be told apart from one that is wrong.
 /// Measured on the real 401 this API sends, the first eleven bytes of it are `HTTP/1.1 40` — a
 /// truncated status line, a line with no status in it, and a line that looks like a nonsense reply.
