@@ -428,30 +428,39 @@ from 520,768 is MbedTLS and the certificate.
 
 ```text
 [INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
-[INFO ] the clock is set to 2026-10-07 14:52:59 UTC by a stratum 3 server  (src/ntp.rs:146)
-[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:143)
+[INFO ] the clock is set to 2026-10-07 17:57:09 UTC by a stratum 3 server  (src/ntp.rs:146)
+[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
 [WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
 [INFO ] the API said: {"error":"Unauthorized"}
 ```
 
-That is the whole of what one exchange has produced: TLS 1.3 negotiated, verification flags `0x0`,
-634 bytes of reply, and the same 401 the cleartext path produced — over port 443, encrypted, with
-the API's certificate verified against [`certs/`](certs/README.md).
+and then, five minutes later, the same three lines again:
 
-Three things about that run are worth recording because none of them was obvious beforehand, and one
-of them was a bug that only a second exchange could show.
+```text
+[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
+[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[INFO ] the API said: {"error":"Unauthorized"}
+```
+
+Two consecutive exchanges, TLS 1.3 both times, verification flags `0x0` both times, and the same 401
+the cleartext path produced — now over port 443, encrypted, with the API's certificate verified
+against [`certs/`](certs/README.md). **The second exchange is the interesting half of that**: it
+took a run of seven minutes to produce, and it is the only evidence the reporter works more than
+once.
+
+Three things about it are worth recording because none of them was obvious beforehand, and one of
+them was a bug that only a second exchange could show.
 
 **The reporter only ever worked once.** The first exchange succeeded and the second, five minutes
 later, logged `the API would not accept the connection: InvalidState`. It is not a TLS failure and
 it is not the API: `smoltcp` answers `connect` on a socket that is still open with `InvalidState`,
 and this firmware held one socket for the life of the task, so after the first exchange left the
 connection half-closed every later one was refused by the stack before a packet went out. The socket
-is now opened per exchange and dropped at the end of it, which is what the comment in `once` had
-claimed the code was doing all along — the comment was right and the code was not. Two things hid it
-until now: the cleartext version half-closed the connection itself before reading, which happened to
-leave the socket in a state the next `connect` tolerated, and the report interval is five minutes,
-so a run has to outlive one exchange before anything can show. **The second exchange is the first
-thing here that has actually been exercised, and the fix for it has not yet been seen on a board.**
+is now built by `edge-nal-embassy` per connection and dropped at the end of it, which also took the
+buffers out of the reporter's signatures. Two things hid the bug until now: the cleartext version
+half-closed the connection itself before reading, which happened to leave the socket in a state the
+next `connect` tolerated, and the report interval is five minutes, so **a run has to outlive one
+exchange before anything can show.**
 
 **The heap had to grow, and the reason is the TLS record buffers.** With the two heaps this
 repository had — 64 KiB of reclaimed RAM and 36 KiB of internal — the handshake failed with
@@ -477,8 +486,8 @@ None of the following has been observed:
   but the board above is the C3 and nothing here says the other one connects;
 - that certificate _dates_ are checked, because they are not — see the note under
   [what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against);
-- that a handshake survives longer than a minute, or that the reporter recovers from one that does
-  not: one exchange has been seen, and the interval is five minutes;
+- that a handshake survives much longer than five minutes, or that the reporter recovers from one
+  that does not: two exchanges have been seen, five minutes apart;
 - that SNTP succeeds reliably — two runs answered and one did not;
 - that a join succeeds reliably — the C3 joined every time and the C6 twice out of five, on one
   network, and nothing here says why;

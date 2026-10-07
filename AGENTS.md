@@ -203,17 +203,18 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   variables rather than from source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the
   deployed Worker and port 443. `HOST` is printed only in the lines about a name that does not
   resolve.
-- **One socket per exchange, and this is load-bearing rather than tidy.** `smoltcp` answers
-  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of the
-  task means every exchange after the first is refused by the stack before a packet goes out.
-  Measured on the board: the first exchange succeeded and the second logged `InvalidState` five
-  minutes later. The socket is opened by the loop in `report` and dropped at the end of each pass;
-  the buffers are built once in `start` and passed in, because `make_static!` cannot hand the same
-  `StaticCell` slot out twice and a per-exchange buffer would panic on the second exchange. It hid
-  for a long time for two reasons worth remembering: the cleartext version half-closed the
-  connection itself before reading, which left the socket in a state the next `connect` tolerated,
-  and **nothing shorter than two intervals can show this class of bug at all** — one exchange has to
-  succeed before a second can fail.
+- **One connection per exchange, and it is `edge-nal`'s job rather than ours.** `smoltcp` answers
+  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of a
+  task means every exchange after the first is refused by the stack before a packet goes out —
+  measured on the board, the first exchange succeeded and the second logged `InvalidState` five
+  minutes later. `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a
+  pool on drop, so this is now the library's property; **do not reintroduce a socket that outlives
+  one exchange.** The factory in `src/tls.rs` is built once and parked in a static because a
+  `TlsSocket` borrows the factory that made it — that is the one constraint the abstraction adds,
+  and it costs two statics. It hid for a long time for two reasons worth remembering: the cleartext
+  version half-closed the connection itself before reading, which left the socket in a state the
+  next `connect` tolerated, and **nothing shorter than two intervals can show this class of bug at
+  all** — one exchange has to succeed before a second can fail.
 - **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
   closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
   as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
