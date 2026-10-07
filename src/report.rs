@@ -45,28 +45,21 @@ use poc_report::{
 
 use crate::{clock, status};
 
-/// The API to report to: the deployed Cloudflare Worker, overridable at build time.
+/// Which API to report to, from the build's configuration.
 ///
-/// **Remote, production:** the default, `http://cfpoc.andresmoschini.workers.dev` on port 80.
-/// Measured on 2026-10-07: it answers a request this firmware sends in plain HTTP with
-/// `401 Unauthorized` and no redirect to HTTPS, which is what makes talking to it in cleartext work
-/// at all — and also what makes the token below the wrong thing to add first.
+/// **Read from `.cargo/esp-config.toml`,** in its `[env]` section, which is where this repository
+/// keeps build-time values. `EVENTS_API_HOST` and `EVENTS_API_PORT` name the two halves, and
+/// `.cargo/local.toml` overrides either of them for a machine that needs it — a `wrangler dev` on the
+/// LAN, another account, a staging worker.
 ///
-/// **Local, development:** `wrangler dev` serves the same API on `http://127.0.0.1:8787`, and it is
-/// not reachable from a board on a network — `127.0.0.1` is the board. Point at a machine on the LAN
-/// instead, with its address and the port `wrangler dev` printed:
+/// The two constants below are the fallback rather than the answer. They name the same deployed Worker
+/// the configuration file does, which is deliberate twice over: the gate and CI build with no
+/// `local.toml` at all, and `esp-generate` owns `.cargo/esp-config.toml`, so a regeneration can drop
+/// the keys. With the constants here, either case still builds and still points at the same API.
 ///
-/// ```sh
-/// EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run
-/// ```
-///
-/// Both are overridable because both change: the worker is deployed under whatever account, and the
-/// local port moves to 8788 when 8787 is taken. A build that could only reach one of them is a build
-/// that can only be tested against one of them.
-///
-/// The host is printed in the log lines about a name not resolving and nowhere else: it is a
-/// compile-time constant, so a reader of any other line already knows which API this build talks to,
-/// and a name repeated in every line of a log is a name nobody reads.
+/// The host is printed in the log lines about a name not resolving and nowhere else: it is fixed at
+/// build time, so a reader of any other line already knows which API this build talks to, and a name
+/// repeated in every line of a log is a name nobody reads.
 const HOST: &str = match option_env!("EVENTS_API_HOST") {
     Some(host) => host,
     None => "cfpoc.andresmoschini.workers.dev",
@@ -79,14 +72,15 @@ const HOST: &str = match option_env!("EVENTS_API_HOST") {
 /// deployed worker, not assumed.
 const DEFAULT_PORT: u16 = 80;
 
-/// The port to connect to, overridable at build time alongside [`HOST`].
+/// The port from the build's configuration, or [`DEFAULT_PORT`].
 ///
-/// `EVENTS_API_PORT` is what points the board at a local `wrangler dev`, whose port is not 80 and not
-/// always 8787.
+/// `EVENTS_API_PORT` is a separate value from the host rather than part of it, because `wrangler dev`
+/// does not listen on 80 and moves to 8788 when 8787 is taken: a combined `host:port` would be a URL
+/// that is wrong in two different ways at once.
 ///
-/// A function rather than a `const` because parsing a port out of an environment variable at compile
-/// time means writing a parser, and `core`'s does the whole job — including refusing `"8787 "` and
-/// `"0x8787"` — for one call every five minutes.
+/// A function rather than a `const` because parsing a port out of a string at compile time means
+/// writing a parser, and `core`'s does the whole job — including refusing `"8787 "` and `"0x8787"` —
+/// for one call every five minutes.
 fn port() -> u16 {
     match option_env!("EVENTS_API_PORT") {
         Some(port) => port.trim().parse().unwrap_or(DEFAULT_PORT),

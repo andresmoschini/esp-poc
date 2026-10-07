@@ -200,6 +200,17 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   `.cargo/esp-config.toml` and can be overridden from the environment. `defmt`'s format strings take
   positional or integer-named placeholders and arguments — `info!("{}", x)` — because this defmt
   version rejects captured identifiers and `{=expr}` for anything that is not a type name.
+- **Build-time configuration lives in `.cargo/esp-config.toml`, not in source.** That is the tracked
+  half; `.cargo/local.toml` is the untracked half, and both are pulled in by the `include` line in
+  `.cargo/config.toml`. Precedence is measured rather than assumed, and it is: a variable set in the
+  shell wins over both, and a key in `local.toml` wins over the same key in `esp-config.toml`.
+  `EVENTS_API_HOST` and `EVENTS_API_PORT` are there for the API in `src/report.rs`, next to
+  `DEFMT_LOG`, and the `option_env!` constants in that module are the **fallback rather than the
+  answer** — the gate and CI build with no `local.toml` at all, and `esp-generate` owns
+  `esp-config.toml` and can drop the keys, so a build with neither file still has to build and still
+  has to point at the same API. `WIFI_SSID` and `WIFI_PASSWORD` are the other half of this and go in
+  `local.toml` only, because a password in a tracked file is a password in the repository as well as
+  in the flash image. Add new build-time values to `esp-config.toml`, not to a constant.
 - Running it on a board, and what to check when flashing fails, is in
   [README.md](README.md#on-the-board). What the gate cannot tell you about the radio is in
   [README.md](README.md#a-green-gate-does-not-mean-the-firmware-works).
