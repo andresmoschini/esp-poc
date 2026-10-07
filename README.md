@@ -57,7 +57,7 @@ Once the network is up, the firmware sends that same state line to an HTTP endpo
 minutes, and prints what came back:
 
 ```text
-[INFO ] reported to the API after 2 minutes
+[INFO ] the API stored the event, 201 after 2 minutes
 ```
 
 The endpoint takes a JSON body with four string fields — a device id, an RFC 3339 timestamp, an
@@ -65,17 +65,25 @@ event type and a payload — and this firmware sends the state line as the paylo
 the chip plus its MAC address, so two boards flashed from the same image are still two rows.
 
 **It sends no credentials, on purpose.** There is no `Authorization` header, so the API answers
-`401 Unauthorized` and the log says exactly that:
+`401 Unauthorized` and the log says exactly that — the number first, then what it means, then the
+API's own words:
 
 ```text
-[WARN ] the API did not store the event: the API refused the event: no credentials were sent with it
+[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[INFO ] the API said: {"error":"Unauthorized"}
 ```
 
-That line is the point of the exercise as it stands. A 401 says three things at once — the request
-reached the API, the API understood it, and it was refused for want of a token — where a timeout
-would say only the first. Adding the token is the next piece of work, and it is also why this speaks
-plain HTTP to port 80: a bearer token in cleartext is a password on the wire, so the TLS stack comes
-first. Both notes are in `src/report.rs`, which is the file that would change.
+Those three lines are the point of the exercise as it stands. A 401 says three things at once — the
+request reached the API, the API understood it, and it was refused for want of a token — where a
+timeout would say only the first. Adding the token is the next piece of work, and it is also why
+this speaks plain HTTP to port 80: a bearer token in cleartext is a password on the wire, so the TLS
+stack comes first. Both notes are in `src/report.rs`, which is the file that would change.
+
+The status code is on every line and the body is not, and the split is deliberate. The code is the
+one thing in a reply that is not this firmware's opinion, so it is there even when the sentence
+beside it is one of the named cases. The body is the API's own explanation, which on a `400` is the
+only thing that says _which_ field was wrong — and it is left out for a `201`, whose body is eleven
+bytes saying `ok`, every five minutes, forever.
 
 #### Where it points
 

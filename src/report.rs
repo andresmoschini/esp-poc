@@ -39,7 +39,7 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use poc_report::{
-    EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Request, Time, Verdict,
+    EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Reply, Request, Time, Verdict,
     status_line_arrived,
 };
 
@@ -255,27 +255,57 @@ async fn once(stack: &Stack<'static>, socket: &mut TcpSocket<'static>) {
     // `close` shuts only the write half, which is exactly "I have finished asking".
     socket.close();
 
-    let Some(verdict) = read_reply(socket).await else {
+    // The buffer is here rather than inside `read_reply` because what comes back borrows it: the
+    // status code and the body's own words are both parts of the answer that are not this firmware's
+    // opinion, and a value that could not outlive the function that read it would not be much of one.
+    let mut buffer = [0; RX_LEN];
+
+    let Some(read) = read_reply(socket, &mut buffer).await else {
         return;
     };
 
-    // `info` for the one answer that means the exchange worked, `warn` for the rest, and `error` for
-    // neither. A 401 is the expected answer while there is no token, and a line marked as an error
-    // every five minutes is a line nobody reads — the words in it are still what to do about it.
-    if verdict == Verdict::Stored {
-        info!(
-            "reported to the API after {}",
-            defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
-        );
-    } else {
-        warn!(
+    let reply = Reply::from_bytes(&buffer[..read]);
+
+    // The status code goes on every line, and it is the one thing here that is not this firmware's
+    // opinion: it is what the API actually did, where the sentence beside it is what to make of it. A
+    // reader who does not believe the sentence can still go and read the number.
+    match reply.status() {
+        // No code at all, for a reply that was not HTTP. Saying "no status" beats printing a zero,
+        // which is not a thing this API can send and would read as a status.
+        None => warn!(
             "the API did not store the event: {}",
-            defmt::Display2Format(&verdict)
+            defmt::Display2Format(&reply.verdict())
+        ),
+        Some(status) if reply.verdict() == Verdict::Stored => info!(
+            "the API stored the event, {} after {}",
+            status,
+            defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
+        ),
+        Some(status) => warn!(
+            "the API did not store the event: {} {}",
+            status,
+            defmt::Display2Format(&reply.verdict())
+        ),
+    }
+
+    // The API's own words, on anything that was not a store. On a 400 this is the only thing that
+    // says which field was wrong; on a status this firmware does not name, it is the only thing the
+    // API said at all. Left out for a store, whose body is eleven bytes saying "ok" — every five
+    // minutes, forever, and a log line nobody reads is a log line that costs time to skip.
+    if reply.verdict() != Verdict::Stored {
+        info!(
+            "the API said: {}",
+            defmt::Display2Format(&poc_report::logged(reply.body()))
         );
     }
 }
 
-/// Reads until the reply's first line is whole, and says what it said.
+/// Reads until the reply's first line is whole, and says how much of it there is.
+///
+/// The buffer belongs to the caller, and only the count comes back: [`Reply`] borrows the bytes, and
+/// a value that borrowed a local would not survive this function. That turns out to be the better
+/// split anyway — this is the part that talks to the network and the caller is the part that reads
+/// what arrived.
 ///
 /// The loop is the whole point of this function. A TCP read returns whatever has arrived, which is
 /// not the same thing as a reply: the 401 this API sends is 650 bytes against a 25-byte status line,
@@ -287,22 +317,21 @@ async fn once(stack: &Stack<'static>, socket: &mut TcpSocket<'static>) {
 /// Three ways to stop, and each is a different thing to say:
 ///
 /// - the status line is whole, which is the answer;
-/// - the buffer is full, which is a reply longer than [`RX_LEN`] and a sentence about that;
-/// - the peer closed with nothing more, which is a server that answered and then stopped.
+/// - the peer closed with nothing more, which is a server that answered and then stopped;
+/// - the buffer filled up with no CRLF in it, which is a reply this firmware cannot read.
 ///
-/// `None` means there was no reply to judge, and each of those has already said so.
-async fn read_reply(socket: &mut TcpSocket<'static>) -> Option<Verdict> {
-    let mut buffer = [0; RX_LEN];
+/// `None` means the last two, or a read that failed, and each has already said which.
+async fn read_reply(socket: &mut TcpSocket<'static>, into: &mut [u8; RX_LEN]) -> Option<usize> {
     let mut read = 0;
 
-    while read < buffer.len() {
+    while read < into.len() {
         // Ask before reading again, on the bytes from the previous read: this is the answer to "is
         // there anything left to wait for", and it can be true before the read that completes it.
-        if status_line_arrived(&buffer[..read]) {
-            return Some(Verdict::from_reply(&buffer[..read]));
+        if status_line_arrived(&into[..read]) {
+            return Some(read);
         }
 
-        let got = match with_timeout(TIMEOUT, socket.read(&mut buffer[read..])).await {
+        let got = match with_timeout(TIMEOUT, socket.read(&mut into[read..])).await {
             Err(_) => {
                 error!("the API did not finish answering after {} bytes", read);
 
@@ -320,17 +349,17 @@ async fn read_reply(socket: &mut TcpSocket<'static>) -> Option<Verdict> {
         // was going to say. A status line inside it is still a status line, so this is checked
         // before giving up rather than after.
         if got == 0 {
-            return Some(Verdict::from_reply(&buffer[..read]));
+            return Some(read);
         }
 
         read += got;
     }
 
     // The buffer is full and no CRLF is in it, so the first line is longer than the whole buffer.
-    // That is not a reply this firmware can read, and saying so beats reporting a sentence about a
-    // reply it has not finished collecting.
-    if status_line_arrived(&buffer) {
-        return Some(Verdict::from_reply(&buffer));
+    // That is not a reply this firmware can read, and saying so beats handing back a count and
+    // letting the caller judge a line it has not finished collecting.
+    if status_line_arrived(into) {
+        return Some(read);
     }
 
     error!(
