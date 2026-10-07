@@ -180,8 +180,17 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   that are deliberate rather than unfinished: there is no TLS stack in the tree, so the API is
   reached over plain HTTP, and a bearer token in cleartext is a password on the wire. So the API
   answers `401` and the log says so on every pass — that line is the feature working, not a bug. Do
-  not add the token before TLS. The host is overridable with `EVENTS_API_HOST` at build time, and
-  `HOST` is printed only in the lines about a name that does not resolve.
+  not add the token before TLS. Which API it is comes from two build-time variables rather than from
+  source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the deployed Worker and
+  port 80. `HOST` is printed only in the lines about a name that does not resolve.
+- **A reply is not a read.** `socket.read` returns whatever has arrived, which is not the same thing
+  as a whole HTTP reply: the 401 this API sends is 650 bytes against a 25-byte status line, and
+  nothing in TCP promises where the boundary falls. So `read_reply` loops and asks
+  `poc_report::status_line_arrived` before it judges anything. **Reading once and parsing that was
+  the bug that produced "what answered was not the API" against a working API** — the read had
+  landed inside the status line, and the first eleven bytes of a valid `401` (`HTTP/1.1 40`) parse
+  as no status at all. `tests/report_api.rs` pins it against a captured real reply, one byte at a
+  time. Anything that parses a reply needs the same question asked first.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled

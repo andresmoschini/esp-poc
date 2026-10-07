@@ -77,11 +77,27 @@ would say only the first. Adding the token is the next piece of work, and it is 
 plain HTTP to port 80: a bearer token in cleartext is a password on the wire, so the TLS stack comes
 first. Both notes are in `src/report.rs`, which is the file that would change.
 
-Point it somewhere else with `EVENTS_API_HOST` at build time:
+#### Where it points
+
+Two environments, both in the constants at the top of `src/report.rs` and both overridable at build
+time:
+
+| Variable          | Default                            | For                                           |
+| ----------------- | ---------------------------------- | --------------------------------------------- |
+| `EVENTS_API_HOST` | `cfpoc.andresmoschini.workers.dev` | the deployed Worker, in plain HTTP on port 80 |
+| `EVENTS_API_PORT` | `80`                               | the port; `8787` for a local `wrangler dev`   |
 
 ```sh
-EVENTS_API_HOST=my-api.example.com cargo run
+cargo run                                          # the deployed Worker, port 80
+EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run   # a wrangler dev on the LAN
 ```
+
+Two things about the local one. `wrangler dev` listens on `127.0.0.1`, which is the board rather
+than your machine, so it has to be a machine on the network and not a loopback. And the port moves
+to 8788 when 8787 is taken — read it off the `Ready on http://…` line `wrangler dev` prints.
+
+The deployed Worker answers a cleartext POST on port 80 with the same `401` and **no** redirect to
+HTTPS, which is measured rather than assumed and is the whole of why this reaches it without TLS.
 
 That is still scaffolding. The point of the repository is that the scaffolding is now somewhere you
 can build something without first deciding how, and that whatever you build is checked by something
