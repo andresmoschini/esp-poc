@@ -1,6 +1,42 @@
 # Keep user/runtime configuration values in this file.
+#
+# This is the tracked half of the build-time configuration, and `local.toml` is the untracked half:
+# both are pulled in by the `include` line in `.cargo/config.toml`, and a key in `local.toml` wins over
+# the same key here — measured, not assumed, and the reason a machine-local value belongs there rather
+# than here. A variable set in the shell wins over both, which is what `DEFMT_LOG=debug cargo run` has
+# always relied on and what `EVENTS_API_HOST=… cargo run` now does too.
 [env]
 DEFMT_LOG="info"
+
+# Which API `src/report.rs` reports to. Both are overridable at build time for the same reason
+# `DEFMT_LOG` is: this file says what a build gets by default and the environment says what this
+# invocation gets.
+#
+# The default is the deployed Worker, so a fresh clone reports to the real API with nothing to set
+# up. Point it somewhere else — a `wrangler dev` on the LAN, another account, a staging worker — by
+# putting this in `.cargo/local.toml`, which is untracked and which this repository therefore never
+# holds:
+#
+#     [env]
+#     EVENTS_API_HOST = "192.168.0.10"
+#     EVENTS_API_PORT = "8787"
+#
+# or, for one run, in the environment:
+#
+#     EVENTS_API_HOST=192.168.0.10 EVENTS_API_PORT=8787 cargo run
+#
+# The port is a separate key rather than part of the host because `wrangler dev` does not listen on
+# 443 and moves to 8788 when 8787 is taken, so a combined `host:port` would be a URL that is wrong in
+# two different ways at once. 443 and not 80 because `src/report.rs` speaks TLS, which `src/tls.rs` is
+# the reason for. Worth saying plainly, because it is not that 80 stopped working: measured again on
+# 2026-10-07, the deployed Worker still answers a cleartext POST on 80 with the same 401 and no
+# redirect to 443. So this is the firmware choosing not to put a credential on the wire in cleartext,
+# not the API refusing to be spoken to that way.
+#
+# `esp-generate` owns this file, so regenerating can drop these keys. It cannot break the build: the
+# constants at the top of `src/report.rs` are the fallback and they name the same API.
+EVENTS_API_HOST="cfpoc.andresmoschini.workers.dev"
+EVENTS_API_PORT="443"
 
 # The Wi-Fi credentials for the proof of concept are not here: this file is tracked, and a password
 # in a tracked file is a password in the repository. They go in `local.toml`, which is included by

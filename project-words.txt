@@ -18,6 +18,7 @@ codegen
 datasheet
 devkitc
 devkitm
+efuse
 imac
 imc
 jtag
@@ -39,16 +40,33 @@ tdefmt
 tlinkall
 wokwi
 
+# The TLS stack, and the entropy source it is fed from
+calloc
+mbedtls
+mbed
+memchr
+showcerts
+tinyrlibc
+trng
+
 # What the proof of concept speaks over the air
 authmode
 datagram
 dhcp
 dhcpv4
+heapless
 hinnant
 ntp
 rssi
 smoltcp
 sntp
+
+# The API the firmware reports to: a Cloudflare Worker, its name, and the examples in its tests
+aabbccddeeff
+cfpoc
+andresmoschini
+workers
+dev
 
 # Git's line-ending rules
 safecrlf

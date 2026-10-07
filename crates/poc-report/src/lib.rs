@@ -1,6 +1,6 @@
 //! What the firmware decides for itself, decided here so that something can check it.
 //!
-//! Six decisions live in this crate, and every one of them is one the firmware would otherwise get
+//! Seven decisions live in this crate, and every one of them is one the firmware would otherwise get
 //! subtly wrong and nobody would notice until it mattered:
 //!
 //! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/wifi.rs`
@@ -20,6 +20,9 @@
 //! - What the line the firmware prints twice a second reads, and whether the time on it is real.
 //!   That line is the whole of what this repository says about itself to whoever is reading it, and
 //!   it was assembled from three `format!`s in a generated file.
+//! - What the body of a reported event looks like, and what an answer from the API means. The bytes
+//!   of an HTTP request are the same kind of thing as the bytes of an SNTP header: right in the
+//!   common case, wrong in the detail nobody reads, and impossible to check on a board.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
@@ -36,7 +39,7 @@
 
 #![no_std]
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 use core::net::Ipv4Addr;
 
 /// An address the stack is holding, with the prefix length that goes with it.
@@ -1117,5 +1120,526 @@ impl fmt::Display for Status {
         }
 
         write!(f, "wifi: {}", self.link)
+    }
+}
+
+/// How often the firmware reports what it is doing.
+///
+/// Five minutes, which is [`REPORT_EVERY_SECS`] rather than a number in the task that waits: this is
+/// the one interval in the firmware that is a decision about a third party rather than about a
+/// timing here — a server that is going to answer with an authentication error is not going to
+/// answer differently because it was asked twice as often — and a decision with a third party in it
+/// is one that belongs where something can read it.
+pub const REPORT_EVERY_SECS: u64 = 5 * 60;
+
+/// The kind of every event this firmware reports.
+///
+/// One value rather than a field, because there is one kind: what this chip is doing right now. A
+/// second kind would be a second type here, and the difference between "the chip is up" and "the
+/// chip was up" is a difference in when it is sent rather than in what the API stores about it.
+pub const EVENT_TELEMETRY: &str = "telemetry";
+
+/// The path the API takes an event on.
+pub const EVENTS_PATH: &str = "/events";
+
+/// One event, as the JSON the API stores.
+///
+/// The four fields are the API's, in its order, and the payload is a string rather than an object:
+/// the API stores whatever JSON the body carries as text, so nesting a JSON document inside one is
+/// this firmware's business and not the schema's — a server that wants to read it back is a
+/// different API than one that wants to keep it.
+///
+/// A `Display` rather than a serializer because there is no serializer here and no allocator either:
+/// this crate is `#![no_std]` with no dependencies, and the body is small enough that writing it
+/// with [`fmt::Write`] is a few lines rather than a dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Event<'a> {
+    /// What this chip is called, which is a name the API stores beside the event.
+    pub device_id: &'a str,
+
+    /// When the event happened, as seconds since the Unix epoch.
+    ///
+    /// A count and not a string because the firmware does not format a time here: it has one
+    /// number and this is where it is handed over. What the number becomes is [`Timestamp`]'s
+    /// business, and it is [`Timestamp`]'s business because that is the part that cannot be checked
+    /// by looking at it.
+    pub timestamp_secs: u64,
+
+    /// What kind of event this is, which is [`EVENT_TELEMETRY`] for everything this firmware sends.
+    pub event_type: &'a str,
+
+    /// The state line, as [`crate::Status`] renders it.
+    ///
+    /// The whole sentence rather than the three fields behind it, so that what is stored is what the
+    /// chip would have printed at that moment. Three fields in a payload would be a second way of
+    /// writing the same line, and the two would drift.
+    pub status: &'a Status,
+}
+
+impl fmt::Display for Event<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Written through a helper because a JSON string has one rule — a quote ends it — and four
+        // places where getting it wrong produces something the server parses as a different document
+        // rather than as an error. The status line is the only field here that could contain one: it
+        // is a sentence this crate wrote, and a sentence that grows a quote is a bug worth a failing
+        // test rather than a corrupt row in somebody's database.
+        write!(
+            f,
+            "{{\"device_id\":{},\"timestamp\":\"{}\",\"event_type\":{},\"payload\":{}}}",
+            Quoted(&self.device_id),
+            Timestamp::at(self.timestamp_secs),
+            Quoted(&self.event_type),
+            Quoted(self.status),
+        )
+    }
+}
+
+/// A value inside a JSON string, quoted and with the characters that would end it escaped.
+///
+/// A `Display` rather than an `as_str`-and-paste so that escaping cannot be forgotten at one of the
+/// call sites: the places above call this, and nothing else in this crate builds a JSON string by
+/// hand. Over any `Display` rather than over `&str` because the payload is a [`Status`] — a sentence
+/// this crate formats — and there is no allocator here to turn a formatted value into a `&str`.
+///
+/// `\` before `"` because JSON strings are what an escape is *for*, and a body with an unescaped
+/// quote in it is a body the server rejects with a 400 rather than one it stores wrong. The control
+/// characters are escaped as `\uXXXX` rather than left alone: JSON forbids them raw, and a status
+/// line that grows one is a status line the API would refuse.
+struct Quoted<'a>(&'a dyn fmt::Display);
+
+impl fmt::Display for Quoted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The two quotes go straight to the formatter rather than through the escaping below, which
+        // would escape them: they are the delimiters, and the thing being quoted is what goes
+        // between them.
+        //
+        // Written this way rather than into a `String` that is then quoted, because this crate has no
+        // allocator: escaping has to happen as the characters are produced.
+        f.write_char('"')?;
+
+        {
+            let mut escaping = Escaping { inner: f };
+
+            write!(escaping, "{}", self.0)?;
+        }
+
+        f.write_char('"')
+    }
+}
+
+/// A [`fmt::Write`] that escapes what is written to it before it reaches the writer underneath.
+///
+/// There rather than as a `String` because the value being escaped is formatted, not borrowed: a
+/// [`Status`] becomes its sentence through `fmt`, and the only place the sentence exists before the
+/// bytes go out is here.
+struct Escaping<'a, 'b> {
+    /// Where the escaped characters go.
+    inner: &'a mut fmt::Formatter<'b>,
+}
+
+impl fmt::Write for Escaping<'_, '_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for character in text.chars() {
+            match character {
+                '"' => self.inner.write_str("\\\"")?,
+                '\\' => self.inner.write_str("\\\\")?,
+                '\n' => self.inner.write_str("\\n")?,
+                '\r' => self.inner.write_str("\\r")?,
+                '\t' => self.inner.write_str("\\t")?,
+                // The rest of the control characters, as JSON spells them: `\u0000` and a name for
+                // each of the twenty or so that are not printable. JSON has no name for a null or a
+                // bell, so the number is the only spelling available.
+                control if control < ' ' => write!(self.inner, "\\u{:04x}", u32::from(control))?,
+                other => self.inner.write_char(other)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// An instant, in the form RFC 3339 writes one in UTC.
+///
+/// `2026-10-05T20:41:59Z`, and it is a type rather than a call to [`fmt::Write`] in the middle of
+/// [`Event`]'s because the format is the decision and the format is what a host can check: an API
+/// that stores the string and a reader of the state line that prints `2026-10-05 20:41:59` want two
+/// different renderings of one number, and which is which is not obvious from either.
+///
+/// UTC with a `Z` and no offset, for the same reason [`Clock::Utc`] is UTC: this is what an API
+/// expects, and a rendering with an offset in it would be a rendering this firmware has no way to
+/// produce — there is no timezone on this chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    /// The instant that many seconds after 1970-01-01T00:00:00Z.
+    #[must_use]
+    pub const fn at(epoch_secs: u64) -> Self {
+        Self(epoch_secs)
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let civil = civil(self.0);
+
+        write!(
+            f,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
+        )
+    }
+}
+
+/// What a reply from the API is: the number it said, what that means, and the body it said it in.
+///
+/// One type rather than a bare [`Verdict`] because the three are three answers to one parse and the
+/// caller wants all three. The status code is the most concrete fact a reply carries and a verdict
+/// alone throws it away for every case it has a name for; the body is the API's own explanation, and
+/// on a 400 it is the only thing that says *which* field was wrong.
+///
+/// The bytes are borrowed, not decoded: nothing here parses the body. Deciding is [`Verdict`]'s job
+/// and the status line is enough for it, but logging is a different question, and for logging the
+/// body is text a person reads. See [`logged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reply<'a> {
+    /// The three digits of the status code, or `None` when the first line was not a status line.
+    status: Option<u16>,
+
+    /// What the status line means.
+    verdict: Verdict,
+
+    /// Everything after the first blank line, which is where a body is.
+    body: &'a [u8],
+}
+
+impl<'a> Reply<'a> {
+    /// A reply, from the bytes that have arrived.
+    ///
+    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
+    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
+    /// pass it a line it has not finished collecting. See [`status_line_arrived`].
+    #[must_use]
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        let Some(line) = first_line(bytes) else {
+            return Self {
+                status: None,
+                verdict: Verdict::NothingCameBack,
+                body: &[],
+            };
+        };
+
+        let status = status_code(line);
+
+        // The body is what follows the first blank line, and an empty slice when there is not one —
+        // a 401 with no body and a 401 whose body has not arrived yet are the same thing to log, and
+        // both are better described by what the status line says than by a guess about the framing.
+        let body = bytes
+            .windows(4)
+            .position(|blank| blank == b"\r\n\r\n")
+            .map_or(&[][..], |blank| &bytes[blank + 4..]);
+
+        Self {
+            status,
+            verdict: match status {
+                Some(201) => Verdict::Stored,
+                Some(400) => Verdict::Malformed,
+                Some(401) => Verdict::Unauthorized,
+                Some(405) => Verdict::NotAllowed,
+                Some(other) => Verdict::Unexpected(other),
+                None => Verdict::NotTheApi,
+            },
+            body,
+        }
+    }
+
+    /// What the reply meant, in words.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// The status code, or `None` when the first line was not a status line.
+    ///
+    /// `Option` and not a number, because a reply that is not HTTP has no status and inventing one —
+    /// a zero, say — is exactly the guess this module exists to refuse. A reader of a log that sees
+    /// no number is being told the truth; one that sees `0` would go and read the API's
+    /// documentation about status zero.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// The bytes after the headers, for [`logged`].
+    #[must_use]
+    pub fn body(&self) -> &'a [u8] {
+        self.body
+    }
+}
+
+/// How many bytes of a body [`logged`] will write.
+///
+/// 120, which is more than any message this API sends — its longest is `{"error":"Unauthorized"}` at
+/// 24 — and short enough that a line with the greeting's worth of context in front of it stays
+/// readable on a serial log. A Cloudflare error page gets cut, which costs nothing: its first 120
+/// characters already say it is HTML.
+pub const LOGGED_LEN: usize = 120;
+
+/// The bytes of a body as something safe to write into a serial log.
+///
+/// Bytes off the network cannot go into a log as they are, and this is the reason:
+///
+/// - **They may not be text.** `{"error":"Unauthorized"}` is, and a truncated read in the middle of a
+///   multi-byte character is not. There is no `Display` or `defmt::Format` for `[u8]`, and guessing
+///   UTF-8 would mean either a lossy conversion nobody asked for or a panic on a network task.
+/// - **They may contain control characters.** A reply is untrusted input and a `0x00` or an escape
+///   sequence in a serial log garbles the terminal of whoever is reading it, which destroys the very
+///   output the line exists to produce. Anything unprintable is written as `·`.
+///
+/// Truncated at [`LOGGED_LEN`] and marked when it is, so that a cut-off body does not read as a
+/// complete one.
+///
+/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the escaping
+/// are decisions, and a decision made in a private function returning a `String` would be one this
+/// crate has no allocator to make.
+#[must_use]
+pub fn logged(body: &[u8]) -> impl fmt::Display {
+    Logged(body)
+}
+
+/// A body that knows how to write itself safely, in [`logged`].
+struct Logged<'a>(&'a [u8]);
+
+impl fmt::Display for Logged<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("(no body)");
+        }
+
+        let cut = self.0.len().min(LOGGED_LEN);
+
+        for byte in &self.0[..cut] {
+            match byte {
+                // Printable ASCII and nothing else. Above 0x7e is a decision too: a UTF-8 body would
+                // be valid text but there is no way to know that from one byte, and a byte rendered
+                // on its own is at best a replacement character. So this is honest about what it has.
+                0x20..=0x7e => f.write_char(char::from(*byte))?,
+                _ => f.write_str("·")?,
+            }
+        }
+
+        if self.0.len() > LOGGED_LEN {
+            f.write_str("…")?;
+        }
+
+        Ok(())
+    }
+}
+
+/// What a status line from the API means.
+///
+/// The number is not in here: it is in [`Reply`], because a name for a case and the code that named
+/// it are two different things and a reader of a log wants both. What is here is what to do about
+/// it — a 401 here means one specific thing, which is that the request went out with no credentials
+/// on it, and it is going to keep meaning that until a token is added.
+///
+/// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
+/// before it can say anything is a place for the handling to be forgotten. Every variant has a
+/// sentence, because the sentence is what ends up in the serial log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 201: the event was stored.
+    Stored,
+
+    /// 401: the API refused the event because the request carried no credentials it accepts.
+    ///
+    /// What this firmware gets today, on purpose. It sends no `Authorization` header at all, so
+    /// this is the answer that says the plumbing works and the authentication is missing, which is
+    /// two facts in one status line.
+    Unauthorized,
+
+    /// 400: the API could not read the event, which is a body this firmware built wrongly.
+    Malformed,
+
+    /// 405: the path was reached by a method the API does not take, which would be a bug here.
+    NotAllowed,
+
+    /// Any other status: reported as the number rather than guessed at.
+    ///
+    /// A named case for the ones that mean something specific to this exchange and `Unexpected` for
+    /// the rest, because an API that grows a status code should land somewhere a reader recognizes
+    /// as "the API said no, and here is which no" rather than in a sentence written for a case it
+    /// is not.
+    Unexpected(u16),
+
+    /// Something answered, and it was not the API: the reply's first line is not a status line.
+    ///
+    /// Its own case rather than folded into `Unexpected`, because it is a different problem: the
+    /// other means the API answered and this means whatever answered was not the API. A captive
+    /// portal is the usual one, and a board on a hotel network is exactly where that happens.
+    NotTheApi,
+
+    /// The connection produced no bytes at all.
+    ///
+    /// Separate from [`Self::NotTheApi`] because the two have nothing in common beyond "this did not
+    /// work". One means something answered and it was the wrong thing; this means nothing answered,
+    /// which is the network, the server going away, or a peer that closed without a word.
+    NothingCameBack,
+}
+
+/// Whether a reply has a whole first line in it yet.
+///
+/// The reader's question before it judges anything, and the reason [`Reply::from_bytes`] cannot be
+/// asked sooner: a first line that has half arrived cannot be told apart from one that is wrong.
+/// Measured on the real 401 this API sends, the first eleven bytes of it are `HTTP/1.1 40` — a
+/// truncated status line, a line with no status in it, and a line that looks like a nonsense reply.
+/// All three at once, and nothing in the bytes says which.
+///
+/// So a caller that judges a reply before this is true has to guess, and the guess is the expensive
+/// one: it blames something that was not the API for a reply the API had already sent, which is
+/// exactly what this firmware did until the read loop started asking.
+#[must_use]
+pub fn status_line_arrived(reply: &[u8]) -> bool {
+    reply.windows(2).any(|pair| pair == b"\r\n")
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stored => f.write_str("the API stored the event"),
+            Self::Unauthorized => {
+                f.write_str("the API refused the event: no credentials were sent with it")
+            }
+            Self::Malformed => {
+                f.write_str("the API could not read the event: it rejected the body")
+            }
+            Self::NotAllowed => f.write_str("the API would not take a POST on this path"),
+            Self::Unexpected(status) => {
+                write!(
+                    f,
+                    "the API answered with a status this firmware does not name: {status}"
+                )
+            }
+            Self::NotTheApi => {
+                f.write_str("what answered was not the API: the first line was not a status line")
+            }
+            Self::NothingCameBack => {
+                f.write_str("nothing came back: the connection closed silently")
+            }
+        }
+    }
+}
+
+/// The first line of a reply, or `None` when there are no bytes at all.
+///
+/// `None` and not an empty slice, because "a line that arrived as nothing" and "a line that is not a
+/// status line" are different problems and this is where they are told apart. An empty read is a
+/// server that closed without answering; a portal's login page is a thousand bytes that do not start
+/// with a version number.
+///
+/// The line runs to the first `CRLF`, and a reply with no `CRLF` in it at all yields everything there
+/// is. That last case is the caller asking too early, which [`status_line_arrived`] exists to stop
+/// them doing; it yields the whole buffer rather than nothing, because a caller who got here anyway is
+/// better served by a sentence about a reply this firmware does not recognize than by one about
+/// silence.
+fn first_line(reply: &[u8]) -> Option<&[u8]> {
+    if reply.is_empty() {
+        return None;
+    }
+
+    let end = reply.windows(2).position(|pair| pair == b"\r\n");
+
+    Some(&reply[..end.unwrap_or(reply.len())])
+}
+
+/// The three digits of a status code, from the first line of a reply.
+///
+/// Reads the code rather than the reason phrase, because the phrase is prose that a server may
+/// change and the code is the part of the line that means something. Everything after the three
+/// digits is ignored, so a reason phrase that is missing or one this firmware has never seen does not
+/// change what the code was.
+///
+/// `None` for anything that is not `HTTP/x.y NNN`, which is what makes [`Verdict::NotTheApi`]
+/// reachable at all — a portal's login page is HTML, and the first fifteen bytes of it are a
+/// `<!DOCTYPE` that is not a version number.
+fn status_code(line: &[u8]) -> Option<u16> {
+    let after_version = line.strip_prefix(b"HTTP/")?;
+    // The version and its single digit, then the space. `strip_prefix` and a search for the space
+    // rather than `split_once`, which is still unstable for slices on the pinned toolchain — and a
+    // hand-rolled one would be the third spelling of the same two operations in this crate.
+    let space = after_version.iter().position(u8::is_ascii_whitespace)?;
+    let after_space = after_version.get(space + 1..)?;
+    let digits = after_space.get(..3)?;
+
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    // A space or the end of the buffer after the code, so that `HTTP/1.1 2011 Created` is not read
+    // as 201: a four-digit field is not a status code, and a parser that takes the first three
+    // digits of it is reading a length or a version that happens to be next door.
+    match after_space.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => return None,
+    }
+
+    // The digits as text rather than accumulated as a number, so that a line saying `HTTP/1.1 20`
+    // or `HTTP/1.1 2011` is refused instead of read as 20 or 201: the code is three digits, and a
+    // parser that takes what it finds would make a length or a version out of the field next to it.
+    let digits = core::str::from_utf8(digits).ok()?;
+
+    digits.parse().ok()
+}
+
+/// The bytes of one HTTP request, head and body, as they go on the wire.
+///
+/// A `Display` rather than something that writes into a buffer this crate owns, because this crate
+/// does not know how big the request is: the body carries a [`Status`], whose length depends on the
+/// address DHCP handed out and on how long the sentence about the radio is. The firmware writes it
+/// into a buffer it sized, and if the buffer is too small that is a fact about the buffer rather than
+/// about the request.
+///
+/// `content_length` is a parameter rather than something derived, for the same reason: it is the
+/// number of bytes of body that were written, and the caller is the only thing that knows it. The
+/// head cannot be built without it, which is why the body goes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Request<'a> {
+    /// The host to send to, which is what the `Host` header carries.
+    ///
+    /// The name and not the address: `embassy-net` resolves it, and an HTTP client that sent the
+    /// resolved address in this header would produce a request a server may refuse and a log that
+    /// cannot be read against the name somebody typed.
+    pub host: &'a str,
+
+    /// The path, which is [`EVENTS_PATH`] for this exchange.
+    pub path: &'a str,
+
+    /// How many bytes of body follow the head.
+    pub content_length: usize,
+}
+
+impl fmt::Display for Request<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // CRLF and not `\n`, because this is HTTP/1.1 and not a text file: a server is entitled to
+        // refuse a request whose lines end in a bare newline, and "entitled to" is the whole reason
+        // this is written down rather than left to whatever the format string felt like.
+        //
+        // `Content-Length` is here rather than a `Transfer-Encoding` because the body was written
+        // into a buffer before any of this was: its length is known without counting the bytes as
+        // they go past, which is what a chunked request would need.
+        //
+        // `Connection: close` because this client reads the answer and does nothing else with the
+        // connection. Without it the server may hold the socket open and the read above waits for
+        // bytes that are not coming, which is a timeout on every single report rather than once.
+        write!(
+            f,
+            "POST {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            self.path, self.host, self.content_length,
+        )
     }
 }

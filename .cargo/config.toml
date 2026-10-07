@@ -1,8 +1,19 @@
 # Keep compilation settings in this file and user/runtime settings in `esp-config.toml`.
 #
 # `local.toml` is the same idea for anything that must not be committed: the Wi-Fi credentials the
-# firmware is compiled with. Cargo reads both, and a missing `include` is not an error, so a fresh
-# checkout builds without it.
+# firmware is compiled with, and a machine's own API override. Cargo reads both, and it reads them in
+# order: a key in `local.toml` overrides the same key in `esp-config.toml`, and a variable set in the
+# shell overrides both. All three of those were measured rather than assumed.
+#
+# **The order of this list is load-bearing.** Cargo concatenates configuration arrays rather than
+# replacing them, so this cannot be overridden from a command line and cannot be appended to from a
+# closer file — the second entry is the only way anything in `local.toml` is read at all. That is why
+# regenerating, which rewrites this line as `include = ["esp-config.toml"]`, is a trap rather than a
+# diff: the build still succeeds and a developer's own configuration is simply ignored. See AGENTS.md.
+#
+# A file named here that does not exist **is** an error: measured, `cargo check` fails with "failed to
+# read configuration file" rather than treating the entry as empty. So `.cargo/esp-config.toml` has to
+# stay in the tree, which it does by being tracked.
 include = ["esp-config.toml", "local.toml"]
 
 # One `runner` per chip rather than one per build. A runner is keyed by target triple, and the two

@@ -87,6 +87,7 @@ esp32c3 = [
   "esp-println/esp32c3",
   "esp-radio/esp32c3",
   "esp-rtos/esp32c3",
+  "mbedtls-rs/esp32c3",
 ]
 esp32c6 = [
   "esp-hal/esp32c6",
@@ -96,6 +97,7 @@ esp32c6 = [
   "esp-println/esp32c6",
   "esp-radio/esp32c6",
   "esp-rtos/esp32c6",
+  "mbedtls-rs/esp32c6",
 ]
 
 [dependencies]
@@ -138,13 +140,16 @@ esp-alloc       = "0.11.0"
 embassy-executor = "0.10.0"
 # `defmt` is what makes the stack's own error types printable, `dns` and `udp` are what `src/ntp.rs`
 # asks the stack for — without them there is no resolver to turn a server's name into an address, and
-# no way to send it a datagram. The `dns` and `udp` features are also a socket each out of the
-# fixed-size set that `SOCKETS` in `src/wifi.rs` sizes.
+# no way to send it a datagram. `tcp` is what `src/report.rs` sends an HTTP request over. The `dns`,
+# `udp` and `tcp` features are a socket each out of the fixed-size set that `SOCKETS` in
+# `src/wifi.rs` sizes, on top of the one DHCP takes.
+#
 embassy-net     = { version = "0.9.0", features = [
   "defmt",
   "dhcpv4",
   "dns",
   "medium-ethernet",
+  "tcp",
   "udp",
 ] }
 embassy-time    = "0.5.0"
@@ -152,6 +157,32 @@ embassy-time    = "0.5.0"
 # rather than left to track stable. The alternative is a hand-rolled macro around `StaticCell`, which
 # is what esp-hal's own examples do while their toolchain is stable.
 static_cell     = { version = "2.1.0", features = ["nightly"] }
+
+# The TLS stack `src/report.rs` speaks HTTPS through, which is what makes `https://` reachable at all.
+#
+# Pinned to an exact version, and the pin is not only about a 0.x API: the crate selects MbedTLS's
+# configuration from its enabled features, and it only uses the static libraries committed under
+# `mbedtls-rs-sys/libs/<target>` when the active features match what those were built with byte for
+# byte. Anything else compiles MbedTLS from C source, which needs CMake and a RISC-V C cross-compiler
+# that nothing else in this project requires. So a different feature set is a build that works on one
+# machine and not another, and a patch release is a change to this line on purpose rather than
+# something `cargo update` may do by itself.
+#
+# `defmt` is what makes MbedTLS's error types printable in a `defmt` log. The chip features are in the
+# `[features]` block above, like every other Espressif dependency: they select the chip, and one list
+# says which chip is being built.
+mbedtls-rs = { version = "=0.3.0", features = ["defmt"] }
+
+# The C library's `memchr`, which MbedTLS calls from `x509.c` and which nothing else on the chip
+# provides. Measured, not assumed: without this the link fails with `undefined symbol: memchr`,
+# "referenced by x509.c", and the gate's `build` step is where that shows up.
+#
+# `default-features = false` because the default is `all`, which is twenty-odd functions this firmware
+# never calls and each of which is a symbol the linker then has to be told about. Only `memchr` is
+# asked for above because only `memchr` is needed: what else MbedTLS calls is a property of its
+# configuration, which `mbedtls-rs` derives from the features on the line above, so a change to those
+# features is what would bring the next one.
+tinyrlibc = { version = "0.5.1", default-features = false, features = ["memchr"] }
 
 # The sentences the firmware prints about the network, and the address it prints them with. The only
 # dependency here that is not firmware: it has none of its own, which is what lets it be built for the
