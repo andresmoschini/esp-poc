@@ -57,9 +57,10 @@ use crate::{clock, status};
 /// `local.toml` at all, and `esp-generate` owns `.cargo/esp-config.toml`, so a regeneration can drop
 /// the keys. With the constants here, either case still builds and still points at the same API.
 ///
-/// The host is printed in the log lines about a name not resolving and nowhere else: it is fixed at
-/// build time, so a reader of any other line already knows which API this build talks to, and a name
-/// repeated in every line of a log is a name nobody reads.
+/// The host is printed once, in the line [`start`] logs before the task exists, and again in the
+/// lines about a name that does not resolve — those are the two moments where knowing it is the
+/// difference between a diagnosis and a guess. Everywhere else it would be noise: it is fixed at
+/// build time, and a name repeated in every line of a log is a name nobody reads.
 const HOST: &str = match option_env!("EVENTS_API_HOST") {
     Some(host) => host,
     None => "cfpoc.andresmoschini.workers.dev",
@@ -150,6 +151,24 @@ const ID_LEN: usize = 32;
 /// If the executor has no room left for another task. All four are allocated once, at boot, so this
 /// is a fact about the size of the task pool rather than something that can happen later.
 pub fn start(spawner: Spawner, stack: Stack<'static>) {
+    // Where this build reports to, before anything else about it, because the two halves come from
+    // the environment and the reader of a serial log cannot see an environment. A log that starts
+    // with "joining my-network" and never says which API it is talking to cannot answer the question
+    // a reader has when the API is somebody else's: *which* API.
+    //
+    // Written as a URL rather than as three values because that is the form the API's own
+    // documentation and its `demo.http` use, so this line can be compared against them directly. The
+    // scheme is spelled out rather than left implicit because it is the one thing here that is a
+    // decision rather than a value: it is `http`, and it is `http` because there is no TLS in this
+    // firmware.
+    info!(
+        "reporting to http://{}:{}{} every {} seconds",
+        HOST,
+        port(),
+        EVENTS_PATH,
+        REPORT_EVERY_SECS,
+    );
+
     // Opened here rather than inside the task below, for the reason `src/ntp.rs` opens its socket in
     // the same place: `make_static!` builds its type out of `impl Trait`, and a task's body is itself
     // an opaque type to the compiler, so one inside the other is a cycle it cannot resolve.

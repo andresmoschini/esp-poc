@@ -54,7 +54,14 @@ puts the answers together; `src/report.rs` sends that line to an HTTP API every 
 ### Reporting to an API
 
 Once the network is up, the firmware sends that same state line to an HTTP endpoint every five
-minutes, and prints what came back:
+minutes. It says which one before anything else, because the host comes from the environment and a
+reader of a serial log cannot see an environment:
+
+```text
+[INFO ] reporting to http://cfpoc.andresmoschini.workers.dev:80/events every 300 seconds
+```
+
+and then, every five minutes, what came back:
 
 ```text
 [INFO ] the API stored the event, 201 after 2 minutes
