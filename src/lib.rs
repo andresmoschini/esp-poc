@@ -13,6 +13,7 @@
 #![feature(type_alias_impl_trait)]
 
 pub mod clock;
+pub mod dns;
 pub mod ntp;
 pub mod report;
 pub mod status;

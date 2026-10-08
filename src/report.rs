@@ -63,8 +63,7 @@ use edge_nal::{Close, TcpShutdown as _};
 use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
 use edge_nal_tls::TlsConnector;
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsQueryType;
-use embassy_net::{IpAddress, Stack};
+use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::rng::Trng;
 use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Reply, Time, Verdict};
@@ -572,35 +571,28 @@ fn say(reply: Reply<'_>) {
 
 /// The address of [`HOST`], once DHCP has given the resolver some to ask.
 ///
-/// Its own function rather than the one in `src/ntp.rs` because that one is private to it and this is
-/// another server in another exchange. The two refusals mean different things, so the sentences are
-/// different too: a name that does not resolve is DNS or the network, and the name is in both
-/// sentences because a log line about a name is not answerable without the name.
+/// The lookup itself is [`crate::dns::resolve`], which this shares with `src/ntp.rs`; the sentences
+/// are here because a name that does not resolve means something different for an API than for a
+/// time server, and a log line about a name is not answerable without the name.
 async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, ()> {
-    let found = match with_timeout(TIMEOUT, stack.dns_query(HOST, DnsQueryType::A)).await {
-        Err(_) => {
+    match crate::dns::resolve(stack, HOST).await {
+        Ok(address) => Ok(address),
+        Err(crate::dns::Failure::TimedOut) => {
             error!("the name of the API did not resolve in time: {}", HOST);
 
-            return Err(());
+            Err(())
         }
-        Ok(Err(e)) => {
+        Err(crate::dns::Failure::Refused(e)) => {
             error!("the name of the API did not resolve: {} ({:?})", HOST, e);
 
-            return Err(());
+            Err(())
         }
-        Ok(Ok(found)) => found,
-    };
+        Err(crate::dns::Failure::NoIpv4) => {
+            error!("the name of the API is not one this can send to: {}", HOST);
 
-    // An A record is a question about IPv4 and this firmware has no other protocol to send over, so an
-    // answer that is empty or IPv6-only is not a name that did not exist: it is a name this cannot be
-    // reached at.
-    if let Some(IpAddress::Ipv4(address)) = found.first() {
-        return Ok(*address);
+            Err(())
+        }
     }
-
-    error!("the name of the API is not one this can send to: {}", HOST);
-
-    Err(())
 }
 
 /// Writes this chip's name: the chip, a dash, and the MAC address in hex.
