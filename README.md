@@ -551,11 +551,12 @@ failure, each behind a lock another task takes to read — is the value itself r
 of it, so there is no second representation for the words to drift apart from. The round trips
 through those words used to be checked here too and are gone with the encoding: a lock holding the
 value cannot hand back a word that means something else. The reported event is the same story one
-step further out: the JSON body, the timestamp's format, and the sentence each status maps to are
-all checked on the host, plus the one test that keeps every sentence quotable without escaping,
-including the two cases where there is no status at all — nothing came back, and something that was
-not the API answered, which is what a network with a login portal sends. None of it can check that
-the value published is the one the radio meant: that is still only knowable from the board.
+step further out: the JSON body, the timestamp's format, and the alphabet every sentence stays
+inside are all checked on the host, plus the one test that keeps every sentence quotable without
+escaping. What an answer means is deliberately not checked: a status code is reported as the number
+it is, because a mapping from numbers to sentences goes stale the day a status changes what it
+means. None of it can check that the value published is the one the radio meant: that is still only
+knowable from the board.
 
 **What is no longer tested here, and why.** This crate used to hold the HTTP framing: the request
 head with its CRLF lines, a predicate for whether a status line had arrived whole, and a parser for

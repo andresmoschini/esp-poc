@@ -1,30 +1,27 @@
-// The tests for what this firmware sends to the events API, and for what an answer from it means.
+// The tests for what this firmware sends to the events API.
 //
 // They are here in `tests/` for the reason `tests/report.rs` opens with: this crate is `#![no_std]`,
 // and an integration test is a separate crate with the standard prelude, so `assert_eq!` and `String`
 // are available without the library giving up `no_std` for its own build.
 //
-// What is worth testing is the body and what an answer means. The body is JSON written by hand, and a
-// body that is wrong is wrong in a way nothing on the board can see: a missing brace is a 400 from a
-// server, an unescaped quote is a 400, and a timestamp in the wrong format is stored as a string
-// nobody can sort. An answer off the network is untrusted input, and what to say about it is what
-// ends up in a serial log.
+// What is worth testing is the body. The body is JSON written by hand, and a body that is wrong is
+// wrong in a way nothing on the board can see: a missing brace is a 400 from a server, and
+// a timestamp in the wrong format is stored as a string nobody can sort. What an answer means is
+// deliberately not tested: a status code is reported as the number it is, because a mapping from
+// numbers to sentences goes stale the day a status changes what it means.
 //
 // **The HTTP framing is not tested here because this crate no longer does any.** It used to: this
 // file held the request head, a `status_line_arrived` predicate, and a parser for the status line, and
 // the read-boundary bug that shipped — reading a reply once and judging whatever arrived — was caught
 // by a test right here. All of that is `edge-http`'s now, and `src/report.rs` builds a
-// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What arrives here is a
-// status number, a body, or the fact that neither came: three constructors rather than one parse. So
-// the tests below are about the wording, which is what a reader of the log actually sees, and about
-// the mapping from a number to a sentence — the parts a general-purpose client cannot decide.
+// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What is logged there
+// is a status code and a body: a number, these bytes, or the fact that neither came.
 
 use std::fmt::Write as _;
 
 use poc_report::{
     Address, Clock, EVENT_TELEMETRY, Event, JoinFailure, LOGGED_LEN, Link, Obstruction,
-    REPORT_EVERY_SECS, Reason, Refusal, Reply, STALE_AFTER_SECS, Status, Time, Timestamp, Verdict,
-    logged,
+    REPORT_EVERY_SECS, Reason, Refusal, STALE_AFTER_SECS, Status, Time, Timestamp, logged,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
@@ -33,10 +30,9 @@ const AT: u64 = 20_730 * 24 * 60 * 60 + 18 * 3_600 + 22 * 60 + 31;
 
 /// The body of a real 401 from this API, captured on 2026-10-07.
 ///
-/// Taken out of the reply it arrived in: the head is [`edge-http`]'s to write and parse now, so this
+/// Taken out of the reply it arrived in: the head is [`edge-http`]'s to write and parse, so this
 /// file has no opinion about CRLF, about a status line arriving in pieces, or about where the blank
-/// line is. What is left is what this crate is given — a number, these bytes, or the fact that
-/// neither arrived — and that is what the tests below are about.
+/// line is. What is left is these bytes, the API's own wording rather than a fixture's.
 const BODY_401: &[u8] = br#"{"error":"Unauthorized"}"#;
 
 /// The status line of an event from a chip that has joined and has a time.
@@ -284,74 +280,20 @@ fn the_payload_is_the_state_line() {
     );
 }
 
-/// Nothing at all is its own answer, and it is not the same thing as a portal's login page: one means
-/// nothing answered and the other means something that is not the API answered. They want different
-/// fixes, so they do not share a sentence.
-///
-/// Both are **constructed** rather than parsed, because `edge-http` decides which of the two happened
-/// and hands over the fact rather than the bytes. That is the trade this crate made: the decision of
-/// where a reply ends moves to a library, and what stays here is the wording — which is what the gate
-/// can check and what a log actually shows.
-#[test]
-fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
-    assert_eq!(
-        Reply::nothing_came_back().verdict(),
-        Verdict::NothingCameBack
-    );
-    assert_eq!(
-        render(&Verdict::NothingCameBack),
-        "nothing came back: the connection closed silently",
-    );
-
-    assert_eq!(Reply::not_the_api().verdict(), Verdict::NotTheApi);
-    assert_eq!(
-        render(&Verdict::NotTheApi),
-        "what answered was not the API: the first line was not a status line",
-    );
-}
-
-/// Both ways of not having an answer report no status, rather than a zero. Inventing a number would be
-/// a guess: a zero in a log reads as a status the API sent, and there is no such status. `None` is
-/// the truth and the caller says so.
-#[test]
-fn a_reply_without_a_status_has_no_status_code() {
-    for reply in [Reply::nothing_came_back(), Reply::not_the_api()] {
-        assert_eq!(reply.status(), None, "{reply:?}");
-    }
-}
-
-/// The status code is the one thing in a reply that is not this firmware's opinion, so it has to be
-/// readable for every status and not only for the ones this crate happens to have a name for. That
-/// was the actual gap: a verdict on its own throws 401 away and keeps 503, which is backwards.
-#[test]
-fn the_status_code_is_readable_for_every_status() {
-    for status in [200u16, 201, 204, 400, 401, 403, 404, 405, 429, 500, 503] {
-        assert_eq!(
-            Reply::answered(status, b"").status(),
-            Some(status),
-            "{status}",
-        );
-    }
-}
-
 /// The body is the API's own words, and on a 400 it is the only thing that says *which* field was
 /// wrong. This is the body of the real 401 captured on 2026-10-07, so it is the API's wording rather
-/// than a fixture's.
+/// than a fixture's — and it is logged as-is, because a mapping from numbers to sentences would go
+/// stale the day a status changes what it means.
 #[test]
 fn the_body_is_the_apis_own_words() {
-    let reply = Reply::answered(401, BODY_401);
-
-    assert_eq!(reply.body(), BODY_401);
-    assert_eq!(render(&logged(reply.body())), r#"{"error":"Unauthorized"}"#);
+    assert_eq!(render(&logged(BODY_401)), r#"{"error":"Unauthorized"}"#);
 }
 
 /// A reply with no body logs as saying so, rather than as an empty line. By the time this crate is
 /// handed one, `edge-http` has already said where the body ended, so there is nothing here to guess
-/// at: an empty slice is a body of no bytes. The reason is in [`logged`] — the body is the only thing
-/// the status line does not already say.
+/// at: an empty slice is a body of no bytes.
 #[test]
 fn a_reply_with_no_body_logs_as_saying_so() {
-    assert_eq!(Reply::answered(204, b"").body(), b"");
     assert_eq!(render(&logged(b"")), "(no body)");
 }
 
@@ -432,108 +374,6 @@ fn printable_ascii_survives_logging() {
         render(&logged(&printable)).contains('~'),
         "0x7e did not survive"
     );
-}
-
-/// The 201 the API answers a stored event with is the one that means the exchange worked, and it is
-/// the only answer that does.
-#[test]
-fn a_stored_event_is_recognized() {
-    assert_eq!(Reply::answered(201, b"").verdict(), Verdict::Stored,);
-    assert_eq!(render(&Verdict::Stored), "the API stored the event");
-}
-
-/// The 401 this firmware gets today is the point of the exercise: the request went out, the API read
-/// it, and it was refused for want of credentials. That is three facts and the status line carries
-/// all three.
-#[test]
-fn a_refusal_for_want_of_credentials_is_recognized() {
-    assert_eq!(
-        Reply::answered(401, BODY_401).verdict(),
-        Verdict::Unauthorized,
-    );
-    assert_eq!(
-        render(&Verdict::Unauthorized),
-        "the API refused the event: no credentials were sent with it",
-    );
-}
-
-/// Every other status is named as a number rather than guessed at, because a status this firmware
-/// does not know is a status somebody has to go and read about.
-#[test]
-fn an_unnamed_status_is_reported_as_the_number_it_is() {
-    for status in [200u16, 204, 301, 404, 429, 500, 503] {
-        assert_eq!(
-            Reply::answered(status, b"").verdict(),
-            Verdict::Unexpected(status),
-            "{status}",
-        );
-    }
-
-    assert_eq!(
-        render(&Verdict::Unexpected(503)),
-        "the API answered with a status this firmware does not name: 503",
-    );
-}
-
-/// Every verdict has a sentence, because the sentence is what ends up in the serial log, and a log
-/// line saying `Unauthorized` answers "what happened" and not "what now".
-#[test]
-fn every_verdict_says_something() {
-    let expected = [
-        (Verdict::Stored, "the API stored the event"),
-        (
-            Verdict::Unauthorized,
-            "the API refused the event: no credentials were sent with it",
-        ),
-        (
-            Verdict::Malformed,
-            "the API could not read the event: it rejected the body",
-        ),
-        (
-            Verdict::NotAllowed,
-            "the API would not take a POST on this path",
-        ),
-        (
-            Verdict::Unexpected(500),
-            "the API answered with a status this firmware does not name: 500",
-        ),
-        (
-            Verdict::NotTheApi,
-            "what answered was not the API: the first line was not a status line",
-        ),
-        (
-            Verdict::NothingCameBack,
-            "nothing came back: the connection closed silently",
-        ),
-    ];
-
-    for (verdict, words) in expected {
-        assert_eq!(render(&verdict), words, "sentence for {verdict:?}");
-    }
-}
-
-/// Two verdicts that read alike are two that will be confused, and the set here has one case per
-/// thing the API can do with this exchange: take it, refuse it for want of credentials, fail to
-/// parse it, refuse the method, say something else, answer with something that is not the API, or
-/// not answer at all.
-#[test]
-fn the_answers_are_distinguishable() {
-    let sentences = [
-        Verdict::Stored,
-        Verdict::Unauthorized,
-        Verdict::Malformed,
-        Verdict::NotAllowed,
-        Verdict::Unexpected(500),
-        Verdict::NotTheApi,
-        Verdict::NothingCameBack,
-    ]
-    .map(|verdict| render(&verdict));
-
-    let mut unique = sentences.to_vec();
-    unique.sort_unstable();
-    unique.dedup();
-
-    assert_eq!(unique.len(), sentences.len(), "two answers read the same");
 }
 
 /// Five minutes, and it is a constant here rather than a number in the task that waits so that the

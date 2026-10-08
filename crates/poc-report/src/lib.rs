@@ -20,11 +20,13 @@
 //! - What the line the firmware prints twice a second reads, and whether the time on it is real.
 //!   That line is the whole of what this repository says about itself to whoever is reading it, and
 //!   it was assembled from three `format!`s in a generated file.
-//! - What the body of a reported event looks like, and what an answer from the API means. The body is
-//!   JSON written by hand and an answer is untrusted bytes off the network: right in the common case,
-//!   wrong in the detail nobody reads, and impossible to check on a board. **The HTTP framing around
-//!   both is not here** — `edge-http` writes the request and parses the reply in `src/report.rs`, and
-//!   what arrives here is a status code and a body rather than a buffer to parse.
+//! - What the body of a reported event looks like. The body is JSON written by hand: right in the
+//!   common case, wrong in the detail nobody reads, and impossible to check on a board. What an
+//!   answer from the API means is deliberately not here — a status code is reported as the number
+//!   it is, because a mapping from numbers to sentences goes stale the day a status changes what
+//!   it means. **The HTTP framing around both is not here** — `edge-http` writes the request and
+//!   parses the reply in `src/report.rs`, and what is logged there is a status code and a body
+//!   rather than a buffer to parse.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
@@ -1011,114 +1013,6 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// What a reply from the API is: the number it said, what that means, and the body it said it in.
-///
-/// One type rather than a bare [`Verdict`] because the three are three answers to one read and the
-/// caller wants all three. The status code is the most concrete fact a reply carries and a verdict
-/// alone throws it away for every case it has a name for; the body is the API's own explanation, and
-/// on a 400 it is the only thing that says *which* field was wrong.
-///
-/// The bytes are borrowed, not decoded: nothing here parses the body. Deciding is [`Verdict`]'s job
-/// and the status line is enough for it, but logging is a different question, and for logging the
-/// body is text a person reads. See [`logged`].
-///
-/// Constructed rather than parsed, which is the shape this had when it read bytes off a socket and
-/// found the status line in them. **It does not parse anything any more.** `edge-http` does that —
-/// see `src/report.rs` — and this type is what its answer looks like once it has one: a number, a
-/// body, or the fact that neither arrived. Three constructors rather than one parse, because each
-/// of the three is a different event and saying which one happened is the whole value here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reply<'a> {
-    /// The three digits of the status code, or `None` when no status line was read.
-    status: Option<u16>,
-
-    /// What the status line means.
-    verdict: Verdict,
-
-    /// Everything after the blank line, which is where a body is.
-    body: &'a [u8],
-}
-
-impl<'a> Reply<'a> {
-    /// A reply that carried a status line, and whatever followed it.
-    ///
-    /// `body` is empty rather than guessed when nothing followed: a 401 with no body and a 401 whose
-    /// body has not arrived yet are the same thing to log, and both are better described by what the
-    /// status line says than by a guess about the framing.
-    #[must_use]
-    pub const fn answered(status: u16, body: &'a [u8]) -> Self {
-        Self {
-            status: Some(status),
-            verdict: verdict_of(status),
-            body,
-        }
-    }
-
-    /// Something answered, and it was not the API: no status line was in what came back.
-    ///
-    /// A captive portal is the usual one, and a board on a hotel network is exactly where that
-    /// happens. Distinct from [`Self::nothing_came_back`] because the two have nothing in common
-    /// beyond "this did not work": one means something answered and it was the wrong thing, the other
-    /// means nothing answered.
-    #[must_use]
-    pub const fn not_the_api() -> Self {
-        Self {
-            status: None,
-            verdict: Verdict::NotTheApi,
-            body: &[],
-        }
-    }
-
-    /// The connection produced no bytes at all.
-    #[must_use]
-    pub const fn nothing_came_back() -> Self {
-        Self {
-            status: None,
-            verdict: Verdict::NothingCameBack,
-            body: &[],
-        }
-    }
-
-    /// What the reply meant, in words.
-    #[must_use]
-    pub const fn verdict(&self) -> Verdict {
-        self.verdict
-    }
-
-    /// The status code, or `None` when no status line was read.
-    ///
-    /// `Option` and not a number, because a reply that is not HTTP has no status and inventing one —
-    /// a zero, say — is exactly the guess this crate exists to refuse. A reader of a log that sees
-    /// no number is being told the truth; one that sees `0` would go and read the API's
-    /// documentation about status zero.
-    #[must_use]
-    pub const fn status(&self) -> Option<u16> {
-        self.status
-    }
-
-    /// The bytes after the headers, for [`logged`].
-    #[must_use]
-    pub const fn body(&self) -> &'a [u8] {
-        self.body
-    }
-}
-
-/// What one status code means.
-///
-/// A function rather than something folded into [`Reply`] so that the mapping is one list rather than
-/// one list per constructor: there are three ways to build a [`Reply`] and one set of statuses, and a
-/// status that meant two different things depending on which constructor was used would be a bug
-/// nobody would look for.
-const fn verdict_of(status: u16) -> Verdict {
-    match status {
-        201 => Verdict::Stored,
-        400 => Verdict::Malformed,
-        401 => Verdict::Unauthorized,
-        405 => Verdict::NotAllowed,
-        other => Verdict::Unexpected(other),
-    }
-}
-
 /// How many bytes of a body [`logged`] will write.
 ///
 /// 120, which is more than any message this API sends — its longest is `{"error":"Unauthorized"}` at
@@ -1175,83 +1069,5 @@ impl fmt::Display for Logged<'_> {
         }
 
         Ok(())
-    }
-}
-
-/// What a status line from the API means.
-///
-/// The number is not in here: it is in [`Reply`], because a name for a case and the code that named
-/// it are two different things and a reader of a log wants both. What is here is what to do about
-/// it — a 401 here means one specific thing, which is that the request went out with no credentials
-/// on it, and it is going to keep meaning that until a token is added.
-///
-/// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
-/// before it can say anything is a place for the handling to be forgotten. Every variant has a
-/// sentence, because the sentence is what ends up in the serial log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// 201: the event was stored.
-    Stored,
-
-    /// 401: the API refused the event because the request carried no credentials it accepts.
-    ///
-    /// What this firmware gets today, on purpose. It sends no `Authorization` header at all, so
-    /// this is the answer that says the plumbing works and the authentication is missing, which is
-    /// two facts in one status line.
-    Unauthorized,
-
-    /// 400: the API could not read the event, which is a body this firmware built wrongly.
-    Malformed,
-
-    /// 405: the path was reached by a method the API does not take, which would be a bug here.
-    NotAllowed,
-
-    /// Any other status: reported as the number rather than guessed at.
-    ///
-    /// A named case for the ones that mean something specific to this exchange and `Unexpected` for
-    /// the rest, because an API that grows a status code should land somewhere a reader recognizes
-    /// as "the API said no, and here is which no" rather than in a sentence written for a case it
-    /// is not.
-    Unexpected(u16),
-
-    /// Something answered, and it was not the API: the reply's first line is not a status line.
-    ///
-    /// Its own case rather than folded into `Unexpected`, because it is a different problem: the
-    /// other means the API answered and this means whatever answered was not the API. A captive
-    /// portal is the usual one, and a board on a hotel network is exactly where that happens.
-    NotTheApi,
-
-    /// The connection produced no bytes at all.
-    ///
-    /// Separate from [`Self::NotTheApi`] because the two have nothing in common beyond "this did not
-    /// work". One means something answered and it was the wrong thing; this means nothing answered,
-    /// which is the network, the server going away, or a peer that closed without a word.
-    NothingCameBack,
-}
-
-impl fmt::Display for Verdict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stored => f.write_str("the API stored the event"),
-            Self::Unauthorized => {
-                f.write_str("the API refused the event: no credentials were sent with it")
-            }
-            Self::Malformed => {
-                f.write_str("the API could not read the event: it rejected the body")
-            }
-            Self::NotAllowed => f.write_str("the API would not take a POST on this path"),
-            Self::Unexpected(status) => {
-                write!(
-                    f,
-                    "the API answered with a status this firmware does not name: {status}"
-                )
-            }
-            Self::NotTheApi => {
-                f.write_str("what answered was not the API: the first line was not a status line")
-            }
-            Self::NothingCameBack => {
-                f.write_str("nothing came back: the connection closed silently")
-            }
-        }
     }
 }

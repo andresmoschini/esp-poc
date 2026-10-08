@@ -26,9 +26,7 @@
 //! about what it said back.
 //!
 //! **It sends no credentials.** There is no `Authorization` header, so the API answers 401 and
-//! [`poc_report::Verdict::Unauthorized`] is what this logs. That is the point of the exercise as it
-//! stands: a 401 says the request reached the API, was understood, and was refused for want of a
-//! token — three facts in one status line, where a timeout says only the first. Adding the token is
+//! the log says so on every pass — that line is the feature working, not a bug. Adding the token is
 //! the next piece of work, and nothing here has to change for it.
 //!
 //! ## What is here now, and what is not
@@ -66,7 +64,7 @@ use embassy_executor::Spawner;
 use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::rng::Trng;
-use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Reply, Time, Verdict};
+use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
 use crate::{clock, status, tls};
 
@@ -423,7 +421,7 @@ async fn exchange(stream: &mut tls::Stream<'_>, head: &RequestHeaders<'_, HEADER
                 // sentence — one names the API being unreachable, the other names a portal.
                 close(stream).await;
 
-                say(Reply::nothing_came_back());
+                say(None, &[]);
 
                 return;
             }
@@ -434,7 +432,7 @@ async fn exchange(stream: &mut tls::Stream<'_>, head: &RequestHeaders<'_, HEADER
 
                 close(stream).await;
 
-                say(Reply::not_the_api());
+                say(None, &[]);
 
                 return;
             }
@@ -514,7 +512,7 @@ async fn exchange(stream: &mut tls::Stream<'_>, head: &RequestHeaders<'_, HEADER
     // on every failed exchange would be a warning about the reporting, not about the failure.
     close(stream).await;
 
-    say(Reply::answered(answer.code, &collected[..total]));
+    say(Some(answer.code), &collected[..total]);
 }
 
 /// Closes the connection politely, and says when it could not.
@@ -531,40 +529,37 @@ async fn close(stream: &mut tls::Stream<'_>) {
 
 /// Says what the API answered, which is the whole of what this file is for.
 ///
-/// Takes a [`Reply`] rather than a status and a body so that the two ways of not having an answer —
-/// nothing came back, and something that was not the API — are values the caller constructs rather
-/// than a shape this function has to be told about.
-fn say(reply: Reply<'_>) {
-    // The status code goes on every line, and it is the one thing here that is not this firmware's
-    // opinion: it is what the API actually did, where the sentence beside it is what to make of it. A
-    // reader who does not believe the sentence can still go and read the number.
-    match reply.status() {
-        // No code at all, for a reply that was not HTTP. Saying "no status" beats printing a zero,
-        // which is not a thing this API can send and would read as a status.
-        None => warn!(
-            "the API did not store the event: {}",
-            defmt::Display2Format(&reply.verdict())
-        ),
-        Some(status) if reply.verdict() == Verdict::Stored => info!(
-            "the API stored the event, {} after {}",
-            status,
+/// Says what the API answered, which is the whole of what this file is for.
+///
+/// Takes the status code and the body rather than a verdict on them: 201 is the one status that
+/// means the exchange worked, and every other status is reported as the number it is plus the
+/// API's own words. A mapping from numbers to sentences would be a claim about what each status
+/// means — tomorrow a 401 can mean a token that expired rather than one that was never sent —
+///
+/// `None` for the code when no status line was read at all: nothing came back, or something that
+/// was not the API answered. Saying "no status" beats printing a zero, which is not a thing this
+/// API can send and would read as a status.
+fn say(code: Option<u16>, body: &[u8]) {
+    // The status code goes on every line that has one, and it is the one thing here that is not
+    // this firmware's opinion: it is what the API actually did. A reader who wants more than the
+    // number has the body on the next line.
+    match code {
+        Some(201) => info!(
+            "the API stored the event, 201 after {}",
             defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
         ),
-        Some(status) => warn!(
-            "the API did not store the event: {} {}",
-            status,
-            defmt::Display2Format(&reply.verdict())
-        ),
+        Some(status) => warn!("the API did not store the event: {}", status),
+        None => warn!("the API did not store the event: no status"),
     }
 
     // The API's own words, on anything that was not a store. On a 400 this is the only thing that
-    // says which field was wrong; on a status this firmware does not name, it is the only thing the
-    // API said at all. Left out for a store, whose body is eleven bytes saying "ok" — every five
-    // minutes, forever, and a log line nobody reads is a log line that costs time to skip.
-    if reply.verdict() != Verdict::Stored {
+    // says which field was wrong; on a status nobody named, it is the only thing the API said at
+    // all. Left out for a store, whose body is eleven bytes saying "ok" — every five minutes,
+    // forever, and a log line nobody reads is a log line that costs time to skip.
+    if code != Some(201) {
         info!(
             "the API said: {}",
-            defmt::Display2Format(&poc_report::logged(reply.body()))
+            defmt::Display2Format(&poc_report::logged(body))
         );
     }
 }
