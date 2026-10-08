@@ -938,11 +938,11 @@ pub struct Event<'a> {
 
 impl fmt::Display for Event<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Written through a helper because a JSON string has one rule — a quote ends it — and four
-        // places where getting it wrong produces something the server parses as a different document
-        // rather than as an error. The status line is the only field here that could contain one: it
-        // is a sentence this crate wrote, and a sentence that grows a quote is a bug worth a failing
-        // test rather than a corrupt row in somebody's database.
+        // Every field below stays inside plain printable text with no quotes in it, which is the
+        // one rule a JSON string has — a quote ends it. The id is hex from `src/report.rs`, the
+        // timestamp is digits and fixed punctuation, the event type is a constant, and the status
+        // is a sentence this crate wrote whose alphabet a test pins. A field that grows a quote
+        // fails that test rather than corrupting a row in somebody's database.
         write!(
             f,
             "{{\"device_id\":{},\"timestamp\":\"{}\",\"event_type\":{},\"payload\":{}}}",
@@ -954,67 +954,27 @@ impl fmt::Display for Event<'_> {
     }
 }
 
-/// A value inside a JSON string, quoted and with the characters that would end it escaped.
+/// A value inside a JSON string, quoted and nothing else.
 ///
-/// A `Display` rather than an `as_str`-and-paste so that escaping cannot be forgotten at one of the
-/// call sites: the places above call this, and nothing else in this crate builds a JSON string by
-/// hand. Over any `Display` rather than over `&str` because the payload is a [`Status`] — a sentence
+/// No escaping, because there is nothing to escape: every sentence this crate can put in a body is
+/// pinned by a test to hold no `"`, no `\` and nothing below `U+0020`, and the id and the event
+/// type are a hex string and a constant. Quoting stays a wrapper rather than an `as_str`-and-paste
+/// so that it cannot be forgotten at one of the call sites: the places above call this, and
+/// nothing else in this crate builds a JSON string by hand.
+///
+/// Over any `Display` rather than over `&str` because the payload is a [`Status`] — a sentence
 /// this crate formats — and there is no allocator here to turn a formatted value into a `&str`.
-///
-/// `\` before `"` because JSON strings are what an escape is *for*, and a body with an unescaped
-/// quote in it is a body the server rejects with a 400 rather than one it stores wrong. The control
-/// characters are escaped as `\uXXXX` rather than left alone: JSON forbids them raw, and a status
-/// line that grows one is a status line the API would refuse.
 struct Quoted<'a>(&'a dyn fmt::Display);
 
 impl fmt::Display for Quoted<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The two quotes go straight to the formatter rather than through the escaping below, which
-        // would escape them: they are the delimiters, and the thing being quoted is what goes
-        // between them.
+        // The two quotes are the delimiters, and the thing being quoted is what goes between them.
         //
         // Written this way rather than into a `String` that is then quoted, because this crate has no
-        // allocator: escaping has to happen as the characters are produced.
+        // allocator: the value is formatted straight into the body.
         f.write_char('"')?;
-
-        {
-            let mut escaping = Escaping { inner: f };
-
-            write!(escaping, "{}", self.0)?;
-        }
-
+        write!(f, "{}", self.0)?;
         f.write_char('"')
-    }
-}
-
-/// A [`fmt::Write`] that escapes what is written to it before it reaches the writer underneath.
-///
-/// There rather than as a `String` because the value being escaped is formatted, not borrowed: a
-/// [`Status`] becomes its sentence through `fmt`, and the only place the sentence exists before the
-/// bytes go out is here.
-struct Escaping<'a, 'b> {
-    /// Where the escaped characters go.
-    inner: &'a mut fmt::Formatter<'b>,
-}
-
-impl fmt::Write for Escaping<'_, '_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for character in text.chars() {
-            match character {
-                '"' => self.inner.write_str("\\\"")?,
-                '\\' => self.inner.write_str("\\\\")?,
-                '\n' => self.inner.write_str("\\n")?,
-                '\r' => self.inner.write_str("\\r")?,
-                '\t' => self.inner.write_str("\\t")?,
-                // The rest of the control characters, as JSON spells them: `\u0000` and a name for
-                // each of the twenty or so that are not printable. JSON has no name for a null or a
-                // bell, so the number is the only spelling available.
-                control if control < ' ' => write!(self.inner, "\\u{:04x}", u32::from(control))?,
-                other => self.inner.write_char(other)?,
-            }
-        }
-
-        Ok(())
     }
 }
 

@@ -323,12 +323,12 @@ part of the reasoning; read them before changing what reads what.
   to be trusted stays in `src/tls.rs` untested, because moving any of them would mean moving the
   hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
   SNTP header, the whole of the state line — its wording and its order — and the whole of what goes
-  on the wire when that line is reported: the JSON body and its escaping, the timestamp's format,
-  and the sentence each status maps to. **The HTTP framing is the exception and went the other
-  way:** the request head, the read-until-whole loop, and the status-line parser were here once, are
-  `edge-http`'s now, and took about a dozen tests with them. So this bullet is no longer "everything
-  on the wire is here" and should not be read that way: what is here is what the _API_ means, not
-  how HTTP is spelled.
+  on the wire when that line is reported: the JSON body and the alphabet its sentences stay inside,
+  the timestamp's format, and the sentence each status maps to. **The HTTP framing is the exception
+  and went the other way:** the request head, the read-until-whole loop, and the status-line parser
+  were here once, are `edge-http`'s now, and took about a dozen tests with them. So this bullet is
+  no longer "everything on the wire is here" and should not be read that way: what is here is what
+  the _API_ means, not how HTTP is spelled.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

@@ -22,8 +22,9 @@
 use std::fmt::Write as _;
 
 use poc_report::{
-    Address, EVENT_TELEMETRY, Event, LOGGED_LEN, Link, REPORT_EVERY_SECS, Reply, Status, Time,
-    Timestamp, Verdict, logged,
+    Address, Clock, EVENT_TELEMETRY, Event, JoinFailure, LOGGED_LEN, Link, Obstruction,
+    REPORT_EVERY_SECS, Reason, Refusal, Reply, STALE_AFTER_SECS, Status, Time, Timestamp, Verdict,
+    logged,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
@@ -138,71 +139,117 @@ fn the_timestamp_handles_the_ends_of_a_leap_year() {
     );
 }
 
-/// A quote in any string field would end the JSON string early and turn the rest of the body into
-/// something the server either rejects or, worse, parses as a different document.
+/// Every sentence this crate can put in a body stays quotable without escaping: no `"`, no `\`,
+/// nothing below `U+0020`.
 ///
-/// The status line is the field that could grow one without anybody deciding to: it is a sentence
-/// this crate writes, and a sentence about a radio is exactly the kind of thing that eventually
-/// quotes the firmware. A device id comes from outside in principle and an event type from a
-/// constant, so all three are exercised here.
+/// `Quoted` writes a `'"'` and the sentence and another `'"'`, so a sentence that grew one of
+/// those would end the JSON string early and turn the rest of the body into something the server
+/// either rejects or, worse, parses as a different document. This is the one test that keeps that
+/// from happening: a wording that needs quoting fails here rather than in somebody's database.
+///
+/// One table rather than one test per sentence, because the property is that the set is covered: a
+/// sentence added to the firmware without staying inside the alphabet fails to compile, which is
+/// the point. The id and the event type are not here — a hex string and a constant, quotable by
+/// construction at the call site — and neither is the timestamp, which is digits and fixed
+/// punctuation. If the payload ever grows a field from outside (an SSID, a driver's words), this
+/// test is where it lands, or the escaping comes back.
 #[test]
-fn a_quote_in_a_field_is_escaped_rather_than_ending_the_string() {
-    let body = render(&Event {
-        device_id: r#"esp"32c3"#,
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
+fn every_sentence_in_a_body_stays_quotable() {
+    let mut sentences = vec![
+        render(&Address {
+            ip: "192.168.0.225".parse().unwrap(),
+            prefix_len: 24,
+        }),
+        render(&Address {
+            ip: "10.0.0.7".parse().unwrap(),
+            prefix_len: 0,
+        }),
+        render(&Reason::NoSuchNetwork),
+        render(&Reason::SecurityRefused),
+        render(&Reason::NoAnswer),
+        render(&Reason::HandshakeStalled),
+        render(&Reason::LinkLost),
+        render(&Reason::Other),
+        render(&JoinFailure {
+            reason: Reason::NoAnswer,
+            signal: Some(-81),
+        }),
+        render(&JoinFailure {
+            reason: Reason::NoSuchNetwork,
+            signal: None,
+        }),
+        render(&Link::NoNetwork),
+        render(&Link::UnusableCredential),
+        render(&Link::NoRadio),
+        render(&Link::Joining),
+        render(&Link::Joined),
+        render(&Link::Failed(JoinFailure {
+            reason: Reason::HandshakeStalled,
+            signal: Some(-55),
+        })),
+        render(&Clock::since_boot(0)),
+        render(&Clock::since_boot(u64::MAX)),
+        render(&Clock::utc(0)),
+        render(&Clock::utc(AT)),
+        render(&Clock::utc(u64::MAX)),
+        render(&Timestamp::at(0)),
+        render(&Timestamp::at(AT)),
+        render(&Timestamp::at(u64::MAX)),
+        render(&Time::since_boot(63)),
+        render(&Time::since_boot_after(63, Obstruction::AnswerTimedOut)),
+        render(&Time::since_boot_after(
+            63,
+            Obstruction::Refused(Refusal::KissOfDeath),
+        )),
+        render(&Time::answered(AT, 2, 5)),
+        render(&Time::answered(AT, 3, STALE_AFTER_SECS + 5 * 60)),
+        render(&status()),
+        render(&Status {
+            time: Time::since_boot_after(63, Obstruction::AnswerTimedOut),
+            link: Link::Failed(JoinFailure {
+                reason: Reason::NoSuchNetwork,
+                signal: Some(-81),
+            }),
+            address: None,
+        }),
+    ];
 
-    // The quote is still in the body — as part of the device id — but escaped, so the document has
-    // one string where it had one before.
-    assert!(body.starts_with(r#"{"device_id":"esp\"32c3","#), "{body}");
-    // One escaped quote, and the four fields are still four strings: a quote that ended the string
-    // early would have swallowed the rest of the document into one field.
-    assert_eq!(body.matches(r#"\""#).count(), 1, "{body}");
-    // All four fields are still there, in order: a quote that ended the string early would have
-    // swallowed the rest of the document into the device id.
-    let mut rest = body.as_str();
+    let refusals = [
+        Refusal::Short,
+        Refusal::NotAReply,
+        Refusal::Version,
+        Refusal::KissOfDeath,
+        Refusal::NotAServer,
+        Refusal::Unsynchronized,
+        Refusal::NotOurs,
+        Refusal::NoTime,
+        Refusal::BeforeTheEpoch,
+    ];
 
-    for field in ["device_id", "timestamp", "event_type", "payload"] {
-        let found = rest
-            .find(field)
-            .unwrap_or_else(|| panic!("{field} is gone: {body}"));
+    let obstructions = [
+        Obstruction::LookupTimedOut,
+        Obstruction::RequestTimedOut,
+        Obstruction::AnswerTimedOut,
+        Obstruction::NoServer,
+        Obstruction::Stranger,
+        Obstruction::WouldNotSend,
+        Obstruction::TooLong,
+    ];
 
-        rest = &rest[found + field.len()..];
-    }
-}
-
-/// A backslash is the other half of the same rule: JSON spells `\"` as an escape, so a literal
-/// backslash has to become `\\` or the character after it is swallowed as part of an escape.
-#[test]
-fn a_backslash_in_a_field_is_escaped() {
-    let body = render(&Event {
-        device_id: r"domain\chip",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
-
-    assert!(
-        body.starts_with(r#"{"device_id":"domain\\chip","#),
-        "{body}"
+    sentences.extend(refusals.iter().map(render));
+    sentences.extend(obstructions.iter().map(render));
+    sentences.extend(
+        refusals
+            .iter()
+            .map(|refusal| render(&Obstruction::Refused(*refusal))),
     );
-}
 
-/// JSON forbids raw control characters in a string. The one that can appear here without anybody
-/// trying is a newline, and a status line is the sort of thing that grows one.
-#[test]
-fn a_control_character_in_a_field_is_escaped() {
-    let body = render(&Event {
-        device_id: "two\nlines",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
-
-    assert!(body.starts_with(r#"{"device_id":"two\nlines","#), "{body}");
-    assert!(!body.contains('\n'), "{body}");
+    for sentence in &sentences {
+        assert!(
+            !sentence.chars().any(|c| c == '"' || c == '\\' || c < ' '),
+            "a sentence that would end its JSON string: {sentence:?}",
+        );
+    }
 }
 
 /// Two events from the same chip differ in the timestamp and nothing else, and the payload is the
