@@ -1129,19 +1129,14 @@ pub const LOGGED_LEN: usize = 120;
 
 /// The bytes of a body as something safe to write into a serial log.
 ///
-/// Bytes off the network cannot go into a log as they are, and this is the reason:
-///
-/// - **They may not be text.** `{"error":"Unauthorized"}` is, and a truncated read in the middle of a
-///   multi-byte character is not. There is no `Display` or `defmt::Format` for `[u8]`, and guessing
-///   UTF-8 would mean either a lossy conversion nobody asked for or a panic on a network task.
-/// - **They may contain control characters.** A reply is untrusted input and a `0x00` or an escape
-///   sequence in a serial log garbles the terminal of whoever is reading it, which destroys the very
-///   output the line exists to produce. Anything unprintable is written as `·`.
-///
-/// Truncated at [`LOGGED_LEN`] and marked when it is, so that a cut-off body does not read as a
+/// Bytes off the network cannot go into a log as they are: they may not be text at all, and a
+/// `0x00` or an escape sequence in a serial log garbles the terminal of whoever is reading it,
+/// which destroys the very output the line exists to produce. So a body that is not UTF-8 is not
+/// rendered — it is counted — and one that is has its control characters blanked, is cut at
+/// [`LOGGED_LEN`], and is marked when it is cut, so that a truncated body does not read as a
 /// complete one.
 ///
-/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the escaping
+/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the counting
 /// are decisions, and a decision made in a private function returning a `String` would be one this
 /// crate has no allocator to make.
 #[must_use]
@@ -1158,19 +1153,24 @@ impl fmt::Display for Logged<'_> {
             return f.write_str("(no body)");
         }
 
-        let cut = self.0.len().min(LOGGED_LEN);
+        let Ok(text) = core::str::from_utf8(self.0) else {
+            return write!(f, "({} non-utf8 bytes)", self.0.len());
+        };
 
-        for byte in &self.0[..cut] {
-            match byte {
-                // Printable ASCII and nothing else. Above 0x7e is a decision too: a UTF-8 body would
-                // be valid text but there is no way to know that from one byte, and a byte rendered
-                // on its own is at best a replacement character. So this is honest about what it has.
-                0x20..=0x7e => f.write_char(char::from(*byte))?,
-                _ => f.write_str("·")?,
-            }
+        let mut cut = text.len().min(LOGGED_LEN);
+
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
         }
 
-        if self.0.len() > LOGGED_LEN {
+        for c in text[..cut].chars() {
+            // A newline in a body would split the log line it is printed on, and an escape would
+            // reach the reader's terminal. Bodies from this API are JSON without either, so
+            // blanking is a guard rather than a rendering.
+            f.write_char(if c.is_control() { ' ' } else { c })?;
+        }
+
+        if text.len() > LOGGED_LEN {
             f.write_str("…")?;
         }
 

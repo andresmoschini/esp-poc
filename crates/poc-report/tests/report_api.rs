@@ -355,23 +355,39 @@ fn a_reply_with_no_body_logs_as_saying_so() {
     assert_eq!(render(&logged(b"")), "(no body)");
 }
 
-/// A body is untrusted bytes and it goes into a serial log, so anything unprintable is replaced
-/// rather than written through: a NUL or an escape sequence in a reply would garble the terminal of
-/// whoever is reading, which destroys the output the line exists to produce.
+/// A body that is not text is counted rather than rendered: the bytes cannot go into a serial log
+/// as they are, and there is no lossy conversion worth having for a line a person reads once.
+///
+/// The body below mixes printable text with a NUL, a bell, an escape sequence and two bytes no
+/// UTF-8 text holds. What the log gets is the count and nothing else, so no byte in it can garble
+/// the terminal of whoever is reading.
 #[test]
-fn a_body_that_is_not_text_cannot_break_the_log() {
+fn a_body_that_is_not_text_is_counted_rather_than_rendered() {
     let body = b"{\"n\":0}\x00\x07\x1b[31m\xff\xfe end";
 
-    let line = render(&logged(body));
+    assert_eq!(render(&logged(body)), "(20 non-utf8 bytes)");
+}
 
-    // The escape is replaced and the `[31m` after it is not: what follows an escape sequence is
-    // ordinary printable text once the escape that introduced it is gone, and there is nothing left
-    // for a terminal to interpret. What matters is that the `0x1b` itself did not reach the log.
-    assert_eq!(line, "{\"n\":0}···[31m·· end");
-    assert!(
-        !line.chars().any(|character| character.is_control()),
-        "a control character reached the log: {line:?}",
-    );
+/// Every byte value is safe to hand over, because nothing is rendered before the UTF-8 check: a
+/// body from the wire has no type, so there is no value a caller could have promised anything
+/// about. All 256 of them together are not UTF-8, so the sweep's own tail is not in the output.
+#[test]
+fn every_byte_value_can_be_logged() {
+    let all: Vec<u8> = (0..=255).collect();
+
+    assert_eq!(render(&logged(&all)), "(256 non-utf8 bytes)");
+}
+
+/// A body cut mid-character is cut at the character before it rather than in the middle of its
+/// bytes: 119 `a` followed by a two-byte `é` is 121 bytes, so the bound of 120 falls inside the
+/// second byte of the `é` and the line holds the 119 `a` plus the mark — never half a character.
+#[test]
+fn a_body_cut_inside_a_character_is_cut_before_it() {
+    let body = "a".repeat(119) + "é";
+
+    let line = render(&logged(body.as_bytes()));
+
+    assert_eq!(line, format!("{}…", "a".repeat(119)));
 }
 
 /// The body is cut at a bound and marked when it is, so that a truncated body cannot read as a
@@ -393,23 +409,13 @@ fn a_body_longer_than_the_bound_is_cut_and_says_so() {
     assert_eq!(render(&logged(&exact)), "x".repeat(LOGGED_LEN));
 }
 
-/// Every byte value survives `logged` without becoming a control character or a panic. This is the
-/// property that makes it safe to hand it anything off the network, and a sweep is the only way to
-/// check all 256 of them — a body from the wire has no type, so there is no value a caller could have
-/// promised anything about.
+/// Control characters in an otherwise printable body are blanked rather than written through: a
+/// newline would split the log line it is printed on, and an escape would reach the reader's
+/// terminal. Bodies from this API are JSON without either, so this is a guard rather than
+/// a rendering.
 #[test]
-fn every_byte_value_can_be_logged() {
-    let all: Vec<u8> = (0..=255).collect();
-
-    let line = render(&logged(&all));
-
-    assert!(
-        !line.chars().any(|character| character.is_control()),
-        "a control character reached the log: {line:?}",
-    );
-    // Cut at the bound, so the sweep's own tail is not in the output; every byte that was written
-    // came out as one character and none of them was a control character.
-    assert_eq!(line.chars().count(), LOGGED_LEN + 1, "the ellipsis");
+fn control_characters_in_a_body_are_blanked() {
+    assert_eq!(render(&logged(b"a\nb\tc\x1bd")), "a b c d");
 }
 
 /// Printable ASCII comes through as itself, which is the other half: replacing everything unprintable
