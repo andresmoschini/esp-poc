@@ -8,7 +8,7 @@
 //! - What a failed join says. The radio names about fifty reasons, and printing its own words for
 //!   them answers the question "what did the hardware say" rather than the question an operator is
 //!   asking, which is what to do next.
-//! - What the radio is doing, and the word that state is published in. A link that is down is
+//! - What the radio is doing, and the state published for the greeting. A link that is down is
 //!   something a reader of a serial log has to be told about, and it is something the radio knows
 //!   and the greeting does not.
 //! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
@@ -169,7 +169,9 @@ fn write_reason(reason: Reason) -> &'static str {
 ///
 /// `src/wifi.rs` publishes this and `src/status.rs` reads it. It is a published value rather than a
 /// return value because the radio runs in its own task and the greeting runs in the main one, and
-/// nothing either of them waits for the other.
+/// nothing either of them waits for the other. Published as the value itself, behind a lock, rather
+/// than as one word: six states fit in one word only as an encoding, and an encoding is a second
+/// thing for the two tasks to agree about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     /// There was never a network to join, because no `SSID` was compiled in.
@@ -196,14 +198,6 @@ pub enum Link {
 
     /// The last attempt did not work, and this is what it said.
     Failed(JoinFailure),
-
-    /// A word this build of the firmware did not write.
-    ///
-    /// Not reachable from this crate — it is what [`Link::from_word`] answers for a word whose tag
-    /// names no state here, which is the honest reading of a value another build published with a
-    /// different idea of the layout. An explicit variant rather than an `Option` so that the reader
-    /// of the greeting, which runs twice a second, has nothing to do about it either.
-    Unknown,
 }
 
 impl fmt::Display for Link {
@@ -219,151 +213,7 @@ impl fmt::Display for Link {
             Self::Joining => f.write_str("joining"),
             Self::Joined => f.write_str("joined"),
             Self::Failed(failure) => write!(f, "not joined: {failure}"),
-            Self::Unknown => f.write_str("in a state this firmware does not name"),
         }
-    }
-}
-
-/// The word each state is published as.
-///
-/// Written down rather than derived from the order of the variants, because a word is a thing that
-/// two builds of this firmware have to agree about and `as u8` would make that agreement a property
-/// of an enum that anyone may reorder. `Unknown` is last and not `6`, so that the tags a build does
-/// not recognize are the ones in the middle.
-const TAG_NO_NETWORK: u8 = 0;
-const TAG_UNUSABLE: u8 = 1;
-const TAG_NO_RADIO: u8 = 2;
-const TAG_JOINING: u8 = 3;
-const TAG_JOINED: u8 = 4;
-const TAG_FAILED: u8 = 5;
-const TAG_UNKNOWN: u8 = 255;
-
-/// The byte saying that the one beside it is a measurement rather than an absence.
-///
-/// `0 dBm` and "no reading at all" are the same byte and not the same claim, and the radio is willing
-/// to report one as though it were the other — `src/wifi.rs` maps its "no reading" of -128 to `None`
-/// — so the presence of the reading is a byte of its own rather than a value the byte cannot hold.
-const SIGNAL_MEASURED: u8 = 1;
-
-/// The byte that says the signal beside it is not a reading.
-const SIGNAL_NONE: u8 = 0;
-
-impl Link {
-    /// The four bytes this state is published as, lowest first.
-    const fn bytes(self) -> [u8; 4] {
-        match self {
-            Self::NoNetwork => [TAG_NO_NETWORK, 0, 0, 0],
-            Self::UnusableCredential => [TAG_UNUSABLE, 0, 0, 0],
-            Self::NoRadio => [TAG_NO_RADIO, 0, 0, 0],
-            Self::Joining => [TAG_JOINING, 0, 0, 0],
-            Self::Joined => [TAG_JOINED, 0, 0, 0],
-            Self::Unknown => [TAG_UNKNOWN, 0, 0, 0],
-            Self::Failed(JoinFailure { reason, signal }) => {
-                let [measured, reading] = signal_bytes(signal);
-
-                [TAG_FAILED, reason_byte(reason), reading, measured]
-            }
-        }
-    }
-
-    /// The word this state is published as, for [`Self::from_word`] to read back.
-    ///
-    /// One word rather than several held in a fixed order, because several is more than one write
-    /// and an ordering argument between them — one that a reader from another task can only get
-    /// right by trusting the order two writers happened to use. A single word cannot be half
-    /// written.
-    ///
-    /// `const` because the static in `src/wifi.rs` that holds it has to be initialized by one.
-    #[must_use]
-    pub const fn to_word(self) -> u32 {
-        u32::from_le_bytes(self.bytes())
-    }
-
-    /// The state a published word stands for.
-    ///
-    /// Total rather than an `Option`: the greeting reads this twice a second, and a value it has to
-    /// match on before it can print anything is a place for a match to be wrong. Every tag no build
-    /// of this firmware writes — including [`Link::Unknown`]'s own — reads as [`Link::Unknown`],
-    /// which is the sentence for a word that means nothing here.
-    #[must_use]
-    pub fn from_word(word: u32) -> Self {
-        let [tag, reason, reading, measured] = word.to_le_bytes();
-
-        match tag {
-            TAG_FAILED => Self::Failed(JoinFailure {
-                reason: reason_from_byte(reason),
-                signal: signal_from_byte([measured, reading]),
-            }),
-            TAG_NO_NETWORK => Self::NoNetwork,
-            TAG_UNUSABLE => Self::UnusableCredential,
-            TAG_NO_RADIO => Self::NoRadio,
-            TAG_JOINING => Self::Joining,
-            TAG_JOINED => Self::Joined,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-/// The presence of a signal and the signal itself, as the two bytes they are published as.
-///
-/// The reading is read out of its own bytes rather than cast: `clippy::cast_sign_loss` is on, it is
-/// right about what the cast does, and an `i8` and the `u8` holding the same eight bits are the same
-/// number — there is no sign here to lose, only a number that happens to be negative.
-const fn signal_bytes(signal: Option<i8>) -> [u8; 2] {
-    match signal {
-        Some(dbm) => {
-            let [byte] = dbm.to_le_bytes();
-
-            [SIGNAL_MEASURED, byte]
-        }
-        None => [SIGNAL_NONE, 0],
-    }
-}
-
-/// The signal two published bytes stand for, or `None` when the first says there is none.
-const fn signal_from_byte(bytes: [u8; 2]) -> Option<i8> {
-    match bytes[0] {
-        SIGNAL_MEASURED => {
-            let [byte] = bytes[1].to_le_bytes();
-
-            Some(i8::from_le_bytes([byte]))
-        }
-        _ => None,
-    }
-}
-
-/// The byte a reason is published as.
-///
-/// A match rather than `as u8` for the reason given on [`TAG_NO_NETWORK`]: this is a wire format, and
-/// a match is something a reader can check against the enum it encodes without knowing Rust.
-const fn reason_byte(reason: Reason) -> u8 {
-    match reason {
-        Reason::NoSuchNetwork => 0,
-        Reason::SecurityRefused => 1,
-        Reason::NoAnswer => 2,
-        // 3 and 4 are the two this one was added between: `LinkLost` and `Other` keep the bytes they
-        // had. Both are within one firmware build, so renumbering them would change nothing the gate
-        // can see — and a published word that means something else after an edit is not worth the
-        // tidiness of consecutive numbers.
-        Reason::HandshakeStalled => 5,
-        Reason::LinkLost => 3,
-        Reason::Other => 4,
-    }
-}
-
-/// The reason a published byte stands for.
-///
-/// A byte no build of this firmware writes reads as [`Reason::Other`], which is the sentence the
-/// enum already has for a reason this firmware does not name — and which is what
-/// `src/wifi.rs` publishes for a reason added upstream, since the two are the same case.
-const fn reason_from_byte(byte: u8) -> Reason {
-    match byte {
-        0 => Reason::NoSuchNetwork,
-        1 => Reason::SecurityRefused,
-        2 => Reason::NoAnswer,
-        3 => Reason::LinkLost,
-        5 => Reason::HandshakeStalled,
-        _ => Reason::Other,
     }
 }
 
@@ -765,9 +615,9 @@ pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
 /// between a name that does not resolve and a server that does not answer, and those want opposite
 /// fixes — the first is a DNS or a network problem, the second is a server or a firewall.
 ///
-/// Published as a word by [`Self::to_word`] and read back by [`Self::from_word`], for the same
-/// reason [`Link`] is: the task that asks a server and the task that keeps the clock are different
-/// tasks, and what the first one learned has to reach the second one.
+/// Published as the value itself for the task that keeps the clock to read: what the one attempt
+/// that failed came to, written once per attempt and read until the next one. `None` before the
+/// first attempt rather than an explanation of nothing having gone wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Obstruction {
     /// The server's name did not resolve before the exchange gave up on it.
@@ -815,98 +665,6 @@ impl fmt::Display for Obstruction {
             Self::TooLong => f.write_str("the reply was larger than the receive buffer"),
             Self::Refused(refused) => write!(f, "{refused}"),
         }
-    }
-}
-
-impl Obstruction {
-    /// The word for "no attempt has failed", which is the state a chip boots in.
-    ///
-    /// Zero because it is not an obstruction to anything, and it is also what
-    /// [`Self::from_word`] answers for a word no build of this firmware writes: before the first
-    /// attempt, and something this build cannot describe, are both "nothing has gone wrong that this
-    /// firmware has words for".
-    pub const NONE: u32 = 0;
-
-    /// The four bytes this is published as, lowest first.
-    ///
-    /// The tag is a number written down rather than derived from the order of the variants, for the
-    /// same reason [`TAG_NO_NETWORK`] is: this is a wire format, and a match that can be read
-    /// against the enum it encodes is worth more here than the few lines a derived number saves.
-    /// Only [`Self::Refused`] puts anything in the second byte, and it is a [`Refusal`] whole rather
-    /// than a name for one, because the refusal is eight sentences and each of them is the answer to
-    /// a different thing a server can do wrong.
-    const fn bytes(self) -> [u8; 4] {
-        match self {
-            Self::LookupTimedOut => [1, 0, 0, 0],
-            Self::RequestTimedOut => [2, 0, 0, 0],
-            Self::AnswerTimedOut => [3, 0, 0, 0],
-            Self::NoServer => [4, 0, 0, 0],
-            Self::Stranger => [5, 0, 0, 0],
-            Self::WouldNotSend => [6, 0, 0, 0],
-            Self::TooLong => [7, 0, 0, 0],
-            Self::Refused(refusal) => [8, refusal_byte(refusal), 0, 0],
-        }
-    }
-
-    /// The word this is published as, for [`Self::from_word`] to read back.
-    ///
-    /// `const` because the static in `src/clock.rs` that holds it has to be initialized by one.
-    #[must_use]
-    pub const fn to_word(self) -> u32 {
-        u32::from_le_bytes(self.bytes())
-    }
-
-    /// The obstruction a published word stands for, or `None` for [`Self::NONE`] and for a word no
-    /// build of this firmware writes.
-    #[must_use]
-    pub fn from_word(word: u32) -> Option<Self> {
-        let [tag, refused, _, _] = word.to_le_bytes();
-
-        match tag {
-            1 => Some(Self::LookupTimedOut),
-            2 => Some(Self::RequestTimedOut),
-            3 => Some(Self::AnswerTimedOut),
-            4 => Some(Self::NoServer),
-            5 => Some(Self::Stranger),
-            6 => Some(Self::WouldNotSend),
-            7 => Some(Self::TooLong),
-            8 => Some(Self::Refused(refusal_from_byte(refused))),
-            _ => None,
-        }
-    }
-}
-
-/// The byte a refusal is published as.
-const fn refusal_byte(refusal: Refusal) -> u8 {
-    match refusal {
-        Refusal::Short => 0,
-        Refusal::NotAReply => 1,
-        Refusal::Version => 2,
-        Refusal::KissOfDeath => 3,
-        Refusal::NotAServer => 4,
-        Refusal::Unsynchronized => 5,
-        Refusal::NotOurs => 6,
-        Refusal::NoTime => 7,
-        Refusal::BeforeTheEpoch => 8,
-    }
-}
-
-/// The refusal a published byte stands for.
-///
-/// A byte no build of this firmware writes reads as [`Refusal::Short`], which is the one refusal that
-/// is a fact about the packet rather than about its contents, and the one whose sentence describes
-/// something that could not be read at all.
-const fn refusal_from_byte(byte: u8) -> Refusal {
-    match byte {
-        0 => Refusal::Short,
-        1 => Refusal::NotAReply,
-        2 => Refusal::Version,
-        3 => Refusal::KissOfDeath,
-        4 => Refusal::NotAServer,
-        5 => Refusal::Unsynchronized,
-        6 => Refusal::NotOurs,
-        7 => Refusal::NoTime,
-        _ => Refusal::BeforeTheEpoch,
     }
 }
 

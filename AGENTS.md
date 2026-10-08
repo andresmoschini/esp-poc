@@ -171,9 +171,13 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   behind it, and on the C3 it is the hardware RNG that seeds the network stack — `esp-metadata`
   marks `RNG` as unstable for that chip and not for the other. Every new `unstable` API used is one
   more thing a future `esp-hal` may rename, so prefer the stable surface where one exists.
-- The statics in `src/clock.rs` and `src/wifi.rs` are one word wide deliberately rather than by
-  default. Each holds a value that another task reads, so it is published as a single atomic that a
-  reader can take whole; no RISC-V target here has an atomic wider than a word, so `AtomicU64` is
+- `src/wifi.rs` holds what the radio is doing and `src/clock.rs` the last failure behind one
+  `embassy-sync` lock each, taken as a brief critical section: on a chip with one core that is the
+  whole of the contention story at two reads a second, and what a lock holds is the value itself
+  rather than an encoding of it. The `RefCell` inside is what makes the write safe without an
+  `unsafe` — nothing locks again inside a lock closure and no interrupt handler touches either
+  static, so the borrow cannot fail. The clock's own numbers stay one-word atomics deliberately
+  rather than by default: no RISC-V target here has an atomic wider than a word, so `AtomicU64` is
   not a type this firmware can name on either chip. Widening one of them is a design change, not a
   simplification.
 - `esp-radio` is pinned to an exact pre-release (`=1.0.0-beta.1`) and needs `opt-level = 3` in both
@@ -318,13 +322,13 @@ part of the reasoning; read them before changing what reads what.
   that needs a TCP connection stays in `src/report.rs` untested, and logic that needs a certificate
   to be trusted stays in `src/tls.rs` untested, because moving any of them would mean moving the
   hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
-  SNTP header, the whole of the state line — its wording, its order, and the encoding each state is
-  published in for another task to read — and the whole of what goes on the wire when that line is
-  reported: the JSON body and its escaping, the timestamp's format, and the sentence each status
-  maps to. **The HTTP framing is the exception and went the other way:** the request head, the
-  read-until-whole loop, and the status-line parser were here once, are `edge-http`'s now, and took
-  about a dozen tests with them. So this bullet is no longer "everything on the wire is here" and
-  should not be read that way: what is here is what the _API_ means, not how HTTP is spelled.
+  SNTP header, the whole of the state line — its wording and its order — and the whole of what goes
+  on the wire when that line is reported: the JSON body and its escaping, the timestamp's format,
+  and the sentence each status maps to. **The HTTP framing is the exception and went the other
+  way:** the request head, the read-until-whole loop, and the status-line parser were here once, are
+  `edge-http`'s now, and took about a dozen tests with them. So this bullet is no longer "everything
+  on the wire is here" and should not be read that way: what is here is what the _API_ means, not
+  how HTTP is spelled.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

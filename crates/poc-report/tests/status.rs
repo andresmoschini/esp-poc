@@ -3,14 +3,12 @@
 //
 // They are here in `tests/` for the reason `tests/report.rs` opens with, and they cover the same
 // ground from the other side. That file checks how a value reads; this one checks how a state is
-// chosen, how it is published for another task to read, and how the parts of the line are ordered —
-// which is the half of the greeting that decides rather than spells.
+// chosen and how the parts of the line are ordered — which is the half of the greeting that
+// decides rather than spells.
 //
 // Two of the types here exist only to be published from one task and read in another ([`Link`] and
-// [`Obstruction`]), so the round trips through their words are the tests that matter most here: a
-// sentence that reads well beside a word that means something else is precisely the failure a board
-// would not show anybody, because the board has one value and no way to compare it with the one that
-// was meant.
+// [`Obstruction`]), behind a lock each rather than as one word: what the lock holds is the value
+// itself, so there is no encoding for a test to round-trip and the sentences are what is pinned.
 
 use std::fmt::Write as _;
 
@@ -196,7 +194,6 @@ fn every_link_has_a_sentence() {
             }),
             "not joined: the network refused these credentials",
         ),
-        (Link::Unknown, "in a state this firmware does not name"),
     ];
 
     for (link, sentence) in expected {
@@ -217,176 +214,6 @@ fn the_three_ways_of_having_no_network_are_distinguishable() {
     unique.dedup();
 
     assert_eq!(unique.len(), sentences.len(), "two states read the same");
-}
-
-/// A link is published as one word for another task to read, so every state has to survive being
-/// written and read back. This is the test that the words and the enum mean the same thing, and it is
-/// the one that fails when a variant is added to the enum and its tag is not.
-#[test]
-fn every_link_survives_being_published() {
-    let links = [
-        Link::NoNetwork,
-        Link::UnusableCredential,
-        Link::NoRadio,
-        Link::Joining,
-        Link::Joined,
-        Link::Failed(JoinFailure {
-            reason: Reason::LinkLost,
-            signal: None,
-        }),
-        Link::Unknown,
-    ];
-
-    for link in links {
-        assert_eq!(
-            Link::from_word(link.to_word()),
-            link,
-            "the word for {link:?} read back as something else",
-        );
-    }
-}
-
-/// A failure carries two fields behind the one tag, and each has to survive the trip on its own: the
-/// reason is what to do about it and the signal is what tells two reasons apart, so a word that kept
-/// one and lost the other would be a log that sends the wrong person to the wrong place.
-#[test]
-fn every_reason_survives_being_published() {
-    let reasons = [
-        Reason::NoSuchNetwork,
-        Reason::SecurityRefused,
-        Reason::NoAnswer,
-        Reason::HandshakeStalled,
-        Reason::LinkLost,
-        Reason::Other,
-    ];
-
-    for reason in reasons {
-        let link = Link::Failed(JoinFailure {
-            reason,
-            signal: None,
-        });
-
-        assert_eq!(
-            Link::from_word(link.to_word()),
-            link,
-            "the word for {reason:?} read back as something else",
-        );
-    }
-}
-
-/// Every dBm value a radio can report, and the absence of one. The driver fills in -128 when it has
-/// no reading, and `src/wifi.rs` maps that to `None` before publishing — so the interesting case is
-/// that `None` and a real reading are different words, which is what the next test says and what this
-/// one has to make true of every value.
-#[test]
-fn every_signal_a_radio_can_report_survives_being_published() {
-    for dbm in i8::MIN..=i8::MAX {
-        let link = Link::Failed(JoinFailure {
-            reason: Reason::NoAnswer,
-            signal: Some(dbm),
-        });
-
-        assert_eq!(
-            Link::from_word(link.to_word()),
-            link,
-            "a signal of {dbm} dBm read back as something else",
-        );
-    }
-
-    let unmeasured = Link::Failed(JoinFailure {
-        reason: Reason::NoAnswer,
-        signal: None,
-    });
-
-    assert_eq!(
-        Link::from_word(unmeasured.to_word()),
-        unmeasured,
-        "a failure with no measurement read back as one that has",
-    );
-}
-
-/// 0 dBm is a reading — a very loud one, at the edge of what a radio reports — and "none" is not a
-/// reading. They are the same byte if the word encodes one as zero, so the word carries a byte saying
-/// whether the one beside it is a reading at all. A firmware that spent the byte and lost this would
-/// print "-128 dBm" or "0 dBm" as though a station had measured it, which is a contradiction a
-/// reader would go and look for in the hardware.
-#[test]
-fn zero_dbm_is_not_the_absence_of_a_signal() {
-    let loud = Link::Failed(JoinFailure {
-        reason: Reason::LinkLost,
-        signal: Some(0),
-    });
-
-    let unmeasured = Link::Failed(JoinFailure {
-        reason: Reason::LinkLost,
-        signal: None,
-    });
-
-    assert_ne!(
-        loud.to_word(),
-        unmeasured.to_word(),
-        "0 dBm and no signal share a word"
-    );
-    assert_eq!(Link::from_word(loud.to_word()), loud);
-    assert_eq!(Link::from_word(unmeasured.to_word()), unmeasured);
-}
-
-/// A word this build did not write reads as the state for a word this build did not write, rather
-/// than as whichever state happens to be first or as a panic. Every tag in the gap is walked, because
-/// the gap is the whole of what another build could have written: a newer one adds its states above
-/// `Unknown` and leaves this build reading a tag it does not know.
-#[test]
-fn a_word_no_build_of_this_firmware_wrote_is_a_state_this_build_does_not_name() {
-    for tag in 6u8..=254 {
-        assert_eq!(
-            Link::from_word(u32::from(tag)),
-            Link::Unknown,
-            "the tag {tag} read as a state this build has",
-        );
-    }
-
-    // The all-ones word is what an uninitialized or clobbered word looks like most often, and it is
-    // `Unknown`'s own tag, so it is the one case that must not read as anything else.
-    assert_eq!(Link::from_word(u32::MAX), Link::Unknown);
-}
-
-/// A failure written by a build with a different idea of the rest of the word is still a failure. This
-/// is the case where the tag is understood and the bytes behind it are not, and it matters because
-/// the alternative is `Unknown` — which reads as a state the radio is not in.
-#[test]
-fn a_failed_join_this_build_cannot_read_all_the_way_is_still_a_failed_join() {
-    // The tag of a failure, with reason and signal bytes no build of this firmware writes.
-    let word = Link::Failed(JoinFailure {
-        reason: Reason::Other,
-        signal: None,
-    })
-    .to_word()
-        | 0x00FF_FF00;
-
-    match Link::from_word(word) {
-        Link::Failed(failure) => {
-            assert_eq!(
-                failure.reason,
-                Reason::Other,
-                "a reason no build wrote is not named"
-            );
-            assert_eq!(
-                failure.signal, None,
-                "a byte that is not a measurement is not one"
-            );
-        }
-        other => panic!("a failed join read as {other:?}"),
-    }
-}
-
-/// The bytes behind the tag are the spare half of the word, and a state that does not use them must
-/// not care what is in them. Otherwise a word written by a newer build would read as `Unknown` in
-/// states where the tag alone says everything there is to say.
-#[test]
-fn the_spare_bytes_of_a_word_do_not_change_what_it_means() {
-    let word = Link::Joined.to_word() | 0x00FF_FF00;
-
-    assert_eq!(Link::from_word(word), Link::Joined);
 }
 
 /// Every obstruction has a sentence, and the three timeouts are three of them rather than one
@@ -462,70 +289,6 @@ fn the_obstructions_are_distinguishable() {
         sentences.len(),
         "two obstructions read the same"
     );
-}
-
-/// An obstruction is published from the task that asks a server and read by the task that keeps the
-/// clock, so it has to survive being written and read back — and the refusal inside one has to
-/// survive with it, or a bad packet would be reported as some other bad packet.
-#[test]
-fn every_obstruction_survives_being_published() {
-    let obstructions = [
-        Obstruction::LookupTimedOut,
-        Obstruction::RequestTimedOut,
-        Obstruction::AnswerTimedOut,
-        Obstruction::NoServer,
-        Obstruction::Stranger,
-        Obstruction::WouldNotSend,
-        Obstruction::TooLong,
-    ];
-
-    for obstruction in obstructions {
-        assert_eq!(
-            Obstruction::from_word(obstruction.to_word()),
-            Some(obstruction),
-            "the word for {obstruction:?} read back as something else",
-        );
-    }
-}
-
-/// Every refusal a server's packet can be refused for, carried whole through the word. This is the
-/// one case where an obstruction is a pair rather than a single value, and it is where a word with
-/// room for one byte and a need for two would quietly lose which of the eight happened.
-#[test]
-fn every_refusal_survives_being_published_inside_an_obstruction() {
-    let refusals = [
-        Refusal::Short,
-        Refusal::NotAReply,
-        Refusal::Version,
-        Refusal::KissOfDeath,
-        Refusal::NotAServer,
-        Refusal::Unsynchronized,
-        Refusal::NotOurs,
-        Refusal::NoTime,
-        Refusal::BeforeTheEpoch,
-    ];
-
-    for refusal in refusals {
-        let obstruction = Obstruction::Refused(refusal);
-
-        assert_eq!(
-            Obstruction::from_word(obstruction.to_word()),
-            Some(obstruction),
-            "the word for {refusal:?} read back as something else",
-        );
-    }
-}
-
-/// Before the first attempt there is nothing to explain, and that is a word rather than a variant:
-/// it is the word the clock's static starts as, and a build that cannot read a word at all has
-/// nothing to say about a time it never asked for.
-#[test]
-fn no_attempt_yet_publishes_as_nothing_at_all() {
-    assert_eq!(Obstruction::from_word(Obstruction::NONE), None);
-
-    // And a word no build wrote reads as the same thing rather than as the first obstruction.
-    assert_eq!(Obstruction::from_word(9), None);
-    assert_eq!(Obstruction::from_word(u32::MAX), None);
 }
 
 /// An age is written in the two largest units that are not zero, in words, with an `s` on the ones

@@ -114,6 +114,12 @@ defmt                  = { version = "1.0.1", features = ["ip_in_core"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt"] }
 
 critical-section = "1.2.0"
+
+# What publishes one task's answer for another task to read: the radio's `Link` in `src/wifi.rs`
+# and the last failure in `src/clock.rs`, each behind a lock taken as a brief critical section.
+# Version 0.8 is already in the tree through `edge-http`'s `io` feature, so this line names it
+# rather than adding it.
+embassy-sync = "0.8.0"
 esp-backtrace = { version = "0.20.0", features = [
   "defmt",
   "panic-handler",

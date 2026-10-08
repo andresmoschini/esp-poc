@@ -223,8 +223,10 @@ otherwise fails as `esp-metadata` saying the target is wrong.
 The triple is not `imac` for both, and the difference is worth knowing: the `a` is the RISC-V atomic
 extension and the C3 does not have it, so on the C3 `compare_exchange` is not offered at any width
 and anything needing read-modify-write goes through `portable-atomic` in a critical section. Both
-chips have no atomic wider than a word, which is why the statics in `src/clock.rs` and `src/wifi.rs`
-are 32 bits.
+chips have no atomic wider than a word, which is why the clock's numbers in `src/clock.rs` are still
+one-word atomics. What the radio is doing and the last failure reach the greeting through a mutex
+instead: on a chip with one core the lock is a brief critical section, taken twice a second, and
+what it holds is the value itself rather than an encoding of it.
 
 What is _not_ per-chip, and is the reason this is one branch and two features rather than two
 directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
@@ -544,14 +546,16 @@ says about them is the log line and the run above.
 
 What that buys, and what it does not, is worth being specific about. The line the firmware prints is
 a `Status` in `poc-report`, so its wording, its order and the decision of when a time has gone stale
-are all checked on the host. What publishes the state — the radio writing a word another task reads,
-and the clock remembering which server set it and when — is the same encoding, so the words and the
-values they stand for cannot drift apart. The reported event is the same story one step further out:
-the JSON body, the timestamp's format, and the sentence each status maps to are all checked on the
-host, including the two cases where there is no status at all — nothing came back, and something
-that was not the API answered, which is what a network with a login portal sends. None of it can
-check that the value published is the one the radio meant: that is still only knowable from the
-board.
+are all checked on the host. What publishes the state — the radio's `Link` and the clock's last
+failure, each behind a lock another task takes to read — is the value itself rather than an encoding
+of it, so there is no second representation for the words to drift apart from. The round trips
+through those words used to be checked here too and are gone with the encoding: a lock holding the
+value cannot hand back a word that means something else. The reported event is the same story one
+step further out: the JSON body, the timestamp's format, and the sentence each status maps to are
+all checked on the host, including the two cases where there is no status at all — nothing came
+back, and something that was not the API answered, which is what a network with a login portal
+sends. None of it can check that the value published is the one the radio meant: that is still only
+knowable from the board.
 
 **What is no longer tested here, and why.** This crate used to hold the HTTP framing: the request
 head with its CRLF lines, a predicate for whether a status line had arrived whole, and a parser for

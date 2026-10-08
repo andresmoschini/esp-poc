@@ -26,9 +26,10 @@
 //! second. A build with no credentials says so on that line, rather than leaving a reader to work
 //! out from a missing address that nothing was ever attempted.
 //!
-//! The state is published as one word rather than as the enum itself, because a value published as
-//! several words is a value whose parts can be read at different moments. [`Link::to_word`] is the
-//! other end of that.
+//! The state is published as the value itself, behind a lock the greeting takes to read it, rather
+//! than as one word: a value published as several words is a value whose parts can be read at
+//! different moments, and a single word for six states is an encoding with a test for every byte of
+//! it. The lock is a brief critical section on a chip with one core, taken twice a second.
 //!
 //! ## Credentials
 //!
@@ -41,11 +42,12 @@
 //! still has to build, because the gate and CI are such a build. There, [`join`] says so and
 //! returns `None`, and the rest of the firmware runs exactly as it did before Wi-Fi existed.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::RefCell;
 
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_net::{Runner, Stack, StackResources, StaticConfigV4};
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
@@ -79,15 +81,18 @@ const SOCKETS: usize = 5;
 
 /// What the radio is doing, published for [`link`] to read.
 ///
-/// One atomic rather than a lock around a [`Link`]: the greeting reads this from a different task
-/// than the one that writes it, twice a second, and a lock to protect one small answer is a lock
-/// the radio could block on while it is trying to join. The word is written whole, so a reader sees
-/// a state the writer had finished rather than half of an answer.
+/// A lock around the [`Link`] rather than one atomic holding a word for it: on a chip with one
+/// core the lock is a brief critical section, taken twice a second by the greeting and written on
+/// every join attempt, and what it holds is the value itself rather than an encoding of it. The
+/// `RefCell` is what makes the write safe without an `unsafe`: nothing locks again inside a lock
+/// closure and no interrupt handler touches this static, so the borrow cannot fail — and if that
+/// ever stops being true it panics rather than corrupting.
 ///
 /// It starts as [`Link::Joining`] because that is the state this chip is in from the moment it
 /// starts: the radio is expected to be trying, and `join` replaces this with something more specific
 /// within a few lines of returning.
-static LINK: AtomicU32 = AtomicU32::new(Link::Joining.to_word());
+static LINK: Mutex<CriticalSectionRawMutex, RefCell<Link>> =
+    Mutex::new(RefCell::new(Link::Joining));
 
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///
@@ -162,20 +167,19 @@ pub fn join(spawner: Spawner, device: WIFI<'static>) -> Option<Stack<'static>> {
 /// What the radio is doing right now, as of the last thing this file published.
 ///
 /// Never waits and never fails, which is what lets the greeting call it twice a second without
-/// knowing anything about the radio. Six of the seven states it can be in were only ever decided in
-/// this file's own task: what the hardware said is here, and so is what to do about it.
+/// knowing anything about the radio. Every state it can be in was only ever decided in this file's
+/// own task: what the hardware said is here, and so is what to do about it.
 #[must_use]
 pub fn link() -> Link {
-    Link::from_word(LINK.load(Ordering::Acquire))
+    LINK.lock(|link| *link.borrow())
 }
 
 /// Records what the radio is doing, for [`link`] to read.
 ///
-/// One whole word, so there is no order to get right between two halves of an answer. Release and
-/// acquire rather than `Relaxed` because the word is written by the radio's task and read by the
-/// greeting's, and the chip has one core: this is the ordering that makes the write visible.
+/// The whole value under one lock, so a reader sees a state the writer had finished rather than
+/// half of an answer.
 fn publish(link: Link) {
-    LINK.store(link.to_word(), Ordering::Release);
+    LINK.lock(|slot| *slot.borrow_mut() = link);
 }
 
 /// The address in a stack's IPv4 configuration, in the form the firmware prints.

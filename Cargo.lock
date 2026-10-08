@@ -1407,6 +1407,7 @@ dependencies = [
  "edge-nal-tls",
  "embassy-executor",
  "embassy-net",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "esp-alloc",
  "esp-backtrace",
