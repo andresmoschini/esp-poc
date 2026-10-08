@@ -300,16 +300,10 @@ async fn once(
     // report carries has to be the state at the moment it is stamped.
     let state = status::report(Some(stack));
 
-    let mut id = [0; ID_LEN];
-    let id_len = write_id(&mut id, esp_hal::efuse::base_mac_address());
-
-    // The bytes are ASCII because a hex digit is ASCII and nothing else was written into them, so
-    // this cannot fail. An `expect` on something that cannot is the honest way to say so without
-    // writing `unsafe`.
-    let device_id = core::str::from_utf8(&id[..id_len]).expect("a hex device id is ASCII");
+    let id = write_id(esp_hal::efuse::base_mac_address());
 
     let event = Event {
-        device_id,
+        device_id: id.as_str(),
         timestamp_secs: now_secs(),
         event_type: EVENT_TELEMETRY,
         status: &state,
@@ -318,8 +312,7 @@ async fn once(
     // The body is built before the head because `Content-Length` is its length and the head goes
     // first on the wire. A body that does not fit is a report that is not sent, and [`fill`] says so
     // in the log rather than sending a truncated one.
-    let mut body = [0; BODY_LEN];
-    let Some(body_len) = fill(&mut body, &event) else {
+    let Some(body) = fill::<BODY_LEN>(&event) else {
         return;
     };
 
@@ -342,7 +335,7 @@ async fn once(
     // timeout on every single report rather than once.
     head.headers.set_host(HOST);
     head.headers.set_content_type("application/json");
-    head.headers.set_content_len(body_len as u64, &mut length);
+    head.headers.set_content_len(body.len() as u64, &mut length);
     head.headers.set_connection_close();
 
     // Each step returns having already said what went wrong, so the caller only has to stop. Nothing
@@ -357,7 +350,7 @@ async fn once(
         return;
     };
 
-    exchange(&mut stream, &head, &body[..body_len]).await;
+    exchange(&mut stream, &head, body.as_bytes()).await;
 }
 
 /// One exchange over an open connection: write the head, write the body, read the answer, say what
@@ -610,28 +603,26 @@ async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, ()> {
     Err(())
 }
 
-/// Writes this chip's name into `into`: the chip, a dash, and the MAC address in hex.
+/// Writes this chip's name: the chip, a dash, and the MAC address in hex.
 ///
 /// Six bytes in and twelve out, so [`ID_LEN`] is twice what is needed and there is room for the chip
-/// name and the dash. A length rather than a `&str` because the buffer belongs to the caller, which is
-/// what lets this run on the stack of the task that is reporting.
-fn write_id(into: &mut [u8; ID_LEN], mac: esp_hal::efuse::MacAddress) -> usize {
-    let mut writer = Slice {
-        buffer: into,
-        written: 0,
-    };
+/// name and the dash. A value rather than a `&str` into a buffer of the caller's, because
+/// `heapless::String` is already what the body is rendered into — one way of building text on this
+/// chip rather than two.
+fn write_id(mac: esp_hal::efuse::MacAddress) -> heapless::String<ID_LEN> {
+    let mut id = heapless::String::new();
 
-    // The `.ok()`s rather than an `unwrap`: a `fmt::Write` into a fixed buffer fails when it is full,
+    // The `.ok()`s rather than an `unwrap`: a `fmt::Write` into a fixed string fails when it is full,
     // and this one is sized from what goes into it — twelve hex digits and at most seven for the chip
-    // name, in a buffer of thirty-two. If that ever stops being true the id is written as far as it
+    // name, in a string of thirty-two. If that ever stops being true the id is written as far as it
     // went, which is visible in the API's table, rather than a panic in a network task.
-    write!(writer, "{CHIP}-").ok();
+    write!(id, "{CHIP}-").ok();
 
     for byte in mac.as_bytes() {
-        write!(writer, "{byte:02x}").ok();
+        write!(id, "{byte:02x}").ok();
     }
 
-    writer.written
+    id
 }
 
 /// The time the event is stamped with, in seconds since the epoch.
@@ -647,47 +638,20 @@ fn now_secs() -> u64 {
     }
 }
 
-/// Formats one value into a buffer, and says how many bytes it took.
+/// Formats one value into a [`heapless::String`], and says what it took.
 ///
 /// `None` when the value does not fit, which is a report that is not sent. A function rather than an
-/// inline `write!` because that failure is worth one line in the log naming the buffer, and
+/// inline `write!` because that failure is worth one line in the log naming the capacity, and
 /// `core::fmt::Error` says nothing of the sort.
-fn fill<const N: usize>(buffer: &mut [u8; N], value: &impl core::fmt::Display) -> Option<usize> {
-    let mut writer = Slice { buffer, written: 0 };
+fn fill<const N: usize>(value: &impl core::fmt::Display) -> Option<heapless::String<N>> {
+    let mut rendered = heapless::String::new();
 
-    match write!(writer, "{value}") {
-        Ok(()) => Some(writer.written),
+    match write!(rendered, "{value}") {
+        Ok(()) => Some(rendered),
         Err(e) => {
             error!("a {} byte buffer was too small for this report: {:?}", N, e);
 
             None
         }
-    }
-}
-
-/// A [`core::fmt::Write`] that writes into a fixed slice and counts what it wrote.
-///
-/// `core` has no such thing and `heapless` would be a dependency for one adapter. `Err` on a full
-/// buffer is what [`core::fmt::Write`] says to do, and the count is what `Content-Length` needs.
-struct Slice<'a, const N: usize> {
-    /// Where the bytes go.
-    buffer: &'a mut [u8; N],
-
-    /// How many of them have gone so far.
-    written: usize,
-}
-
-impl<const N: usize> core::fmt::Write for Slice<'_, N> {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let room = self
-            .buffer
-            .get_mut(self.written..self.written + text.len())
-            .ok_or(core::fmt::Error)?;
-
-        room.copy_from_slice(text.as_bytes());
-
-        self.written += text.len();
-
-        Ok(())
     }
 }

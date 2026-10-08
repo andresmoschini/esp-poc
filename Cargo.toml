@@ -193,9 +193,10 @@ edge-nal-tls     = { version = "0.3.0", features = ["defmt"] }
 # moves. `httparse`, `sha1_smol` and `base64` are new, and all three are small and `no_std`.
 edge-http = { version = "0.8.0", features = ["defmt"] }
 
-# `edge-http`'s own `String`, which `Headers::set_content_len` takes a borrow of because a
-# `Content-Length` has to be rendered as text before it can be a header. It is already in the tree
-# as a transitive dependency of three crates; this line makes it nameable.
+# The text this firmware renders on the chip: the event body and the device id in
+# `src/report.rs`, besides the `Content-Length` that `Headers::set_content_len` takes a borrow of
+# (a `Content-Length` has to be rendered as text before it can be a header). It is already in the
+# tree as a transitive dependency of three crates; this line makes it nameable.
 heapless = "0.9.3"
 
 # The C library's `memchr`, which MbedTLS calls from `x509.c` and which nothing else on the chip
