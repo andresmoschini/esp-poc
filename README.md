@@ -71,7 +71,7 @@ then, once per exchange, who the thing on the other end turned out to be:
 and then, every five minutes, what came back:
 
 ```text
-[INFO ] the API stored the event, 201 after 2 minutes
+[INFO ] the API stored the event, 201 after 63s
 ```
 
 The endpoint takes a JSON body with four string fields — a device id, an RFC 3339 timestamp, an
@@ -79,11 +79,10 @@ event type and a payload — and this firmware sends the state line as the paylo
 the chip plus its MAC address, so two boards flashed from the same image are still two rows.
 
 **It sends no credentials, on purpose.** There is no `Authorization` header, so the API answers
-`401 Unauthorized` and the log says exactly that — the number first, then what it means, then the
-API's own words:
+`401 Unauthorized` and the log says exactly that — the number, then the API's own words:
 
 ```text
-[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[WARN ] the API did not store the event: 401
 [INFO ] the API said: {"error":"Unauthorized"}
 ```
 
@@ -93,23 +92,24 @@ timeout would say only the first. Adding the token is the next piece of work, an
 speaks HTTPS: a bearer token in cleartext is a password on the wire, so the TLS stack came first.
 Both notes are in `src/report.rs`, which is the file that would change.
 
-The status code is on every line and the body is not, and the split is deliberate. The code is the
-one thing in a reply that is not this firmware's opinion, so it is there even when the sentence
-beside it is one of the named cases. The body is the API's own explanation, which on a `400` is the
-only thing that says _which_ field was wrong — and it is left out for a `201`, whose body is eleven
-bytes saying `ok`, every five minutes, forever.
+The status code is logged as the number it is, and the body after it, and the split is deliberate.
+The code is the one thing in a reply that is not this firmware's opinion. The body is the API's own
+explanation, which on a `400` is the only thing that says _which_ field was wrong — and it is left
+out for a `201`, whose body is eleven bytes saying `ok`, every five minutes, forever. No sentence in
+either line tells the reader what to do about the number, because a mapping from numbers to meanings
+goes stale the day a status changes what it means.
 
 #### What is `edge-http` and what is not
 
 The HTTP itself is a library's job, and it is [`edge-http`](https://crates.io/crates/edge-http) —
 the same author's crate as the `edge-nal` pieces below it, speaking the same socket, so it layers on
-rather than beside. `src/report.rs` builds a request head, writes it, writes the body, and reads
-back a response head and a body. What it still owns is everything a general-purpose client cannot
-know: which host and path this build reports to, which four headers go out and why each is there,
-and what to say about what came back.
+rather than beside. `src/report.rs` builds a `Connection`, sends the head and the body through it,
+and reads back the answer — connect included, which is why there is no `tls::open` any more. What it
+still owns is everything a general-purpose client cannot know: which host and path this build
+reports to, which four headers go out and why each is there, and what to say about what came back.
 
-That last part is the point of the three lines above, and it is what remains host-tested. What is no
-longer tested here is the framing — see
+That last part is the point of the lines above; what remains host-tested is the body they carry, not
+the lines. What is no longer tested here is the framing — see
 [what the tests do and do not cover](#what-the-tests-do-and-do-not-cover) for what that cost.
 
 #### What the API's certificate is checked against

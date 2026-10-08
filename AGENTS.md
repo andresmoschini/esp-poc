@@ -219,24 +219,25 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   version half-closed the connection itself before reading, which left the socket in a state the
   next `connect` tolerated, and **nothing shorter than two intervals can show this class of bug at
   all** — one exchange has to succeed before a second can fail.
-- **`edge-http` is reached through `RequestHeaders`/`ResponseHeaders`, not through its
-  `Connection`.** Its `io::client::Connection` state machine calls `connect` itself, which would
-  take the handshake away from `src/tls.rs` — and that handshake is what owns the 20-second budget
-  and the `the API's certificate verified: …` line, which are the only evidence in this repository
-  that the certificate was checked rather than merely received. So `src/report.rs` uses the
-  lower-level pieces over the `Stream` that `crate::tls::open` returns, and `src/tls.rs` is
-  unchanged by any of this. Two things about those pieces are not negotiable: `Headers::set`
-  **panics** with `No space left` rather than returning an error, so `HEADERS` in `src/report.rs` is
-  a promise the compiler does not check (it is 8 for 4 sent, leaving room for the `Authorization`
-  header that is next), and `Headers::set_content_len` needs a `heapless::String<20>` that must
-  outlive the header borrowing from it.
+- **The exchange runs through `edge-http`'s `Connection`, connect included.** Its
+  `io::client::Connection` state machine calls `connect` itself — TCP and the TLS handshake with it
+  — so there is no `tls::open` any more: the handshake's twenty-second budget lives on the
+  `initiate_request` in `src/report.rs`, and the `the API's certificate verified: …` line is read
+  back off the connection right after it, which is still the only evidence in this repository that
+  the certificate was checked rather than merely received. What that costs is one lost distinction:
+  a refused connection, a failed handshake and a head that did not go out are one call now, and one
+  line when it fails. Two things about the pieces are not negotiable: the answer head is parsed into
+  `Headers`, whose `set` **panics** with `No space left` rather than returning an error, so
+  `HEADERS` in `src/report.rs` is a promise the compiler does not check (it is 16 for the 10 the
+  Worker answers with), and the `Content-Length` tuple borrows from a `heapless::String<20>` that
+  must outlive the headers borrowing from it.
 - **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
   closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
   as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
-  so `exchange` reads first and closes afterwards. Close on **every** path: `MbedTLS` warns on a
-  session dropped while still open, and a warning on every failed exchange would be a warning about
-  the reporting rather than about the failure. The `Body` reader is scoped so it is gone before
-  `close` needs the stream it borrows.
+  so `once` reads first and closes afterwards. Close on **every** path: `MbedTLS` warns on a session
+  dropped while still open, and a warning on every failed exchange would be a warning about the
+  reporting rather than about the failure. The split borrow of the answer is over before `close`
+  takes the connection back.
 - **A reply is not a read, and that is now `edge-http`'s problem rather than ours.** `stream.read`
   returns whatever has arrived, which is not the same thing as a whole HTTP reply: the 401 this API
   sends is 650 bytes against a 25-byte status line, and nothing in TCP promises where the boundary
@@ -244,12 +245,12 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   against a working API** — the read had landed inside the status line, and the first eleven bytes
   of a valid `401` (`HTTP/1.1 40`) parse as no status at all. This firmware used to own the loop and
   the predicate, and `tests/report_api.rs` pinned it against a captured real reply one byte at a
-  time; both are gone. `exchange` now calls `ResponseHeaders::receive` with **`exact = false`**,
-  which is the load-bearing argument: `true` takes the head one byte at a time looking for
-  `\r\n\r\n`, and `false` reads in bulk and re-parses, which is what makes a reply that arrives in
-  pieces a reply. **Reinstating a hand-written read loop over a raw `read` would reintroduce the
-  bug**, and the test that caught it went with the code it was testing, so nothing here would
-  notice.
+  time; both are gone. `Connection` reads the head with `exact = true`, one byte at a time looking
+  for `\r\n\r\n` — over TLS each of those is a session read rather than a packet, and a few hundred
+  of them is what a head costs. What matters is that it keeps reading until the head is whole, which
+  is what makes a reply that arrives in pieces a reply. **Reinstating a hand-written read loop over
+  a raw `read` would reintroduce the bug**, and the test that caught it went with the code it was
+  testing, so nothing here would notice.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled

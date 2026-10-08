@@ -186,13 +186,12 @@ edge-nal         = "0.7.0"
 edge-nal-embassy = "0.9.0"
 edge-nal-tls     = { version = "0.3.0", features = ["defmt"] }
 
-# The HTTP framing: the request head and the reading of a reply, which is the part that is fiddly in
-# the detail nobody reads and that already cost this firmware one bug. `edge-http` is the same
-# author's crate as the three above and speaks the same `edge-nal` 0.7 socket, so it layers onto
-# `crate::tls`'s `TlsSocket` rather than beside it — which is why `src/report.rs` uses its
-# `RequestHeaders`/`ResponseHeaders`/`Body` directly instead of `edge_http::io::client::Connection`:
-# the state machine in `Connection` does the `connect` itself, and the handshake with its own
-# timeout and its own line in the log is what `src/tls.rs` is for.
+# The HTTP framing: the connect, the request head and the reading of a reply, which is the part
+# that is fiddly in the detail nobody reads and that already cost this firmware one bug. `edge-http`
+# is the same author's crate as the three above and speaks the same `edge-nal` 0.7 socket, so its
+# `io::client::Connection` layers onto `crate::tls`'s factory rather than beside it: the state
+# machine does the `connect` itself, and the handshake's budget and the line saying what it settled
+# on live on the exchange in `src/report.rs`.
 #
 # The `io` feature is default and is what brings `edge-nal`, `embedded-io-async`, `embassy-sync` and
 # `embassy-futures` — all four already in this tree at the versions it asks for, so nothing above

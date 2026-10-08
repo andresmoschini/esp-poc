@@ -18,8 +18,8 @@
 //! `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a pool when the
 //! connection is dropped, which makes both of the first two facts the library's problem rather than
 //! this file's. `edge-nal-tls` layers the TLS session on top of a factory rather than on a borrowed
-//! socket. What is left here is the part neither knows about: which root the API's certificate has
-//! to chain to, and what to say when the handshake does not happen.
+//! socket, and `edge-http`'s `Connection` drives the connect itself. What is left here is the part
+//! none of them knows about: which root the API's certificate has to chain to.
 //!
 //! `mbedtls-rs` is still a direct dependency, and deliberately so. It is what puts the bytes on the
 //! wire, `edge-nal-tls` re-exports it, and the trust anchor is built from its types — but nothing
@@ -40,14 +40,10 @@
 //! it is its own piece of work.
 
 use core::ffi::CStr;
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use defmt::{error, info};
-use edge_nal::TcpConnect as _;
 use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
 use edge_nal_tls::{TlsConnector, TlsSocket};
 use embassy_net::Stack;
-use embassy_time::{Duration, with_timeout};
 use esp_hal::rng::Trng;
 use mbedtls_rs::{Certificate, ClientSessionConfig, Tls};
 
@@ -59,20 +55,6 @@ use mbedtls_rs::{Certificate, ClientSessionConfig, Tls};
 /// about a kilobyte and a byte on every boot. DER rather than PEM because that is the encoding
 /// `MbedTLS` can parse that way at all.
 const ROOT: &[u8] = include_bytes!("../certs/isrg-root-x1.der");
-
-/// How long the handshake may take before it is given up on.
-///
-/// Its own budget rather than the reporter's per-step one because it is not the same kind of wait:
-/// every other step is a request going out or a reply coming back over an established connection,
-/// while this one is the API proving who it is, which on a 160 MHz RISC-V running `MbedTLS`' own
-/// arithmetic rather than the chip's accelerators is seconds rather than milliseconds. The handshake
-/// is also renegotiated from scratch every five minutes, because the connection is built fresh each
-/// time and paid for in full every time.
-///
-/// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
-/// inside the reporter's own five-second budget, so this only bounds the failure where nothing comes
-/// back at all.
-const HANDSHAKE: Duration = Duration::from_secs(20);
 
 /// How many socket buffer pairs this reporter keeps.
 ///
@@ -93,8 +75,8 @@ const POOL: usize = 1;
 /// this would have it split across reads rather than truncated. Measured on the deployed Worker: one
 /// 634-byte reply, arriving in one read.
 ///
-/// Public because [`crate::report`] sizes its own reply buffer from it: a buffer smaller than the
-/// socket's would stop the read early and a reply that did not fit is not a shorter reply.
+/// Public because [`crate::report`] sizes the scratch of its `Connection` from it: the head is parsed
+/// out of that scratch, and a scratch smaller than the socket's would stop the read early.
 pub const RX_LEN: usize = 1024;
 
 /// Transmit buffer for the socket, in bytes, which has to hold the head and the body.
@@ -102,17 +84,8 @@ const TX_LEN: usize = 512;
 
 /// The connection the reporter writes its request through, once the handshake is done.
 ///
-/// A type alias rather than the type spelled out at each use: the type is the awkward part, and three
-/// of them in [`crate::report`] is three places to get subtly wrong.
+/// A type alias rather than the type spelled out: the type is the awkward part.
 pub type Stream<'a> = TlsSocket<'a, edge_nal_embassy::TcpSocket<'a>>;
-
-/// What a failed read, write or handshake on that stream comes back as.
-///
-/// Named because [`crate::report`] has to name it too: `edge-http` is generic over the error type of
-/// whatever it reads and writes, and the one thing it is reading and writing here is a TLS socket. A
-/// type alias rather than the `SessionError` spelled out, so the two files cannot drift apart on which
-/// error this is.
-pub type Error = edge_nal_tls::mbedtls::SessionError;
 
 /// The one `MbedTLS` instance this firmware has, holding the entropy source it draws from.
 ///
@@ -141,6 +114,12 @@ pub fn instance(trng: Trng) -> &'static Tls<'static> {
 /// `TlsSocket` borrows the factory that made it, so a factory on the stack would return a socket
 /// that could not leave. `TlsConnector::new` takes the configuration by reference and clones it,
 /// which is why a local here is enough and no self-reference is involved.
+///
+/// The handshake is driven by whoever writes through the socket first — in practice `edge-http`'s
+/// `Connection`, which also owns the connect — so the twenty-second budget for it and the line
+/// saying what it settled on live on the exchange in `src/report.rs` rather than here. What stays
+/// here is the part neither the factory nor the client knows about: which root the API's
+/// certificate has to chain to.
 ///
 /// # Panics
 ///
@@ -171,70 +150,4 @@ pub fn connector(
         EmbassyTcp::new(stack, pool),
         &config
     ))
-}
-
-/// Connects to the API at `address` and negotiates TLS with it.
-///
-/// Everything about the socket is the factory's: one is built for this call and returned to the pool
-/// when the returned stream is dropped, which is what makes a second call five minutes later work at
-/// all. What this adds is the one thing the factory cannot do — give the handshake its own timeout
-/// and say what it settled on.
-///
-/// The handshake is driven explicitly rather than left to the first read, because a lazy handshake
-/// would report its failure as a failed _read_, a long way from the certificate that caused it, and
-/// because the negotiation it agreed on is worth a line in the log.
-///
-/// The server name is not a parameter: the factory holds it, from [`connector`], because `MbedTLS`
-/// wants it NUL-terminated for both SNI and the certificate's hostname check.
-///
-/// Returns `None` having already said why in the log, because every way this can fail is a
-/// different problem with a different fix: a connection that is refused, a certificate this
-/// firmware does not trust, and a handshake that ran out of time are three of them.
-pub async fn open(
-    connector: &'static TlsConnector<'static, EmbassyTcp<'static>>,
-    address: Ipv4Addr,
-    port: u16,
-) -> Option<Stream<'static>> {
-    let mut socket = match connector
-        .connect(SocketAddr::new(IpAddr::V4(address), port))
-        .await
-    {
-        Ok(socket) => socket,
-        Err(e) => {
-            error!("the API would not accept the connection: {:?}", e);
-
-            return None;
-        }
-    };
-
-    let session = socket.session_mut();
-
-    match with_timeout(HANDSHAKE, session.connect()).await {
-        Err(_) => {
-            error!(
-                "the API did not complete a TLS handshake in {} seconds",
-                HANDSHAKE.as_secs()
-            );
-
-            None
-        }
-        Ok(Err(e)) => {
-            error!("the API's TLS handshake failed: {:?}", e);
-
-            None
-        }
-        Ok(Ok(())) => {
-            // The version and the verification flags together are what says the API was checked and
-            // not merely reached: a zero flag is the only value that means the chain, the signature
-            // and the hostname all agreed, and the version says what was agreed about. Neither
-            // replaces the log line the refusal itself produces.
-            info!(
-                "the API's certificate verified: {:?}, flags {:#x}",
-                session.tls_version(),
-                session.tls_verification_details()
-            );
-
-            Some(socket)
-        }
-    }
 }

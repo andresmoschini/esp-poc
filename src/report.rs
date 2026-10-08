@@ -13,17 +13,23 @@
 //! timestamp's format are in `poc-report` because those are decisions a host can check; this file is
 //! the part that needs a network.
 //!
-//! **The HTTP framing is `edge-http`'s.** The request head, the reading of a reply, and the loop that
-//! keeps reading until one is whole are all [`edge_http`]: this file builds a [`RequestHeaders`],
-//! writes it, hands over the body, and reads back a [`ResponseHeaders`] and a [`Body`]. That is not
-//! an arbitrary line to draw. The framing is the part of an HTTP client that is fiddly in the detail
-//! nobody reads — `Content-Length` versus a header the library guesses, CRLF, a reply that arrives in
-//! as many reads as the network decides — and this firmware shipped the resulting bug: it read the
-//! reply once and judged whatever arrived, so a read landing inside the 25-byte status line of a
-//! 650-byte reply reported "what answered was not the API" for a reply the API had sent correctly.
-//! What `edge-http` removes is that class of bug, and what is left here is the one thing a
-//! general-purpose HTTP client cannot decide: **which API this build reports to**, and what to say
-//! about what it said back.
+//! **The HTTP framing is `edge-http`'s.** The connect, the request head, the reading of a reply,
+//! and the loop that keeps reading until one is whole are all [`edge_http`]: this file builds a
+//! [`Connection`], sends the head and the body through it, and
+//! reads back the answer. That is not an arbitrary line to draw. The framing is the part of an HTTP
+//! client that is fiddly in the detail nobody reads — `Content-Length` versus a header the library
+//! guesses, CRLF, a reply that arrives in as many reads as the network decides — and this firmware
+//! shipped the resulting bug: it read the reply once and judged whatever arrived, so a read landing
+//! inside the 25-byte status line of a 650-byte reply reported "what answered was not the API" for
+//! a reply the API had sent correctly. What `edge-http` removes is that class of bug, and what is
+//! left here is the one thing a general-purpose HTTP client cannot decide: **which API this build
+//! reports to**, and what to say about what it said back.
+//!
+//! The `Connection` does the `connect` itself — TCP and the TLS handshake with it — which is why
+//! there is no `tls::open` any more: the handshake's twenty-second budget and the line saying what
+//! the handshake settled on live on this exchange rather than in [`crate::tls`]. What that costs is
+//! one lost distinction: a refused connection, a failed handshake and a head that did not go out
+//! are one call now, and one line when it fails.
 //!
 //! **It sends no credentials.** There is no `Authorization` header, so the API answers 401 and
 //! the log says so on every pass — that line is the feature working, not a bug. Adding the token is
@@ -51,13 +57,13 @@
 
 use core::ffi::CStr;
 use core::fmt::Write as _;
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use defmt::{error, info, warn};
+use edge_http::Method;
 use edge_http::io::Body;
-use edge_http::{ConnectionType, Method, RequestHeaders, ResponseHeaders};
+use edge_http::io::client::Connection;
 use edge_nal::io::{Read, Write};
-use edge_nal::{Close, TcpShutdown as _};
 use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
 use edge_nal_tls::TlsConnector;
 use embassy_executor::Spawner;
@@ -164,12 +170,31 @@ fn server_name(buffer: &'static mut [u8; NAME_LEN]) -> &'static CStr {
     CStr::from_bytes_until_nul(buffer).expect("a NUL was just written")
 }
 
-/// How long any single step of an exchange may take.
+/// How long any single step of an exchange may take, save the first one.
 ///
 /// Each step is timed on its own, as in `src/ntp.rs`, so that a line saying an exchange failed also
-/// says which part of it failed: a name that does not resolve and a server that does not answer are
-/// different problems with different fixes.
+/// says which part of it failed: a body that does not go out and a server that does not answer are
+/// different problems with different fixes. The first step — connect, shake hands, send the head —
+/// is one call inside `edge-http`'s `Connection` and keeps its own budget in [`HANDSHAKE`].
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the connect, the handshake and the request head may take together.
+///
+/// One budget rather than three because `edge-http`'s `Connection` does all three inside one call:
+/// the TCP connect, the TLS handshake and the head going out are a single `initiate_request`, so a
+/// line saying "the handshake failed" and a line saying "the head did not go out" would be two names
+/// for one timeout.
+///
+/// The handshake is what makes this longer than [`TIMEOUT`]: every other step is a request going out
+/// or a reply coming back over an established connection, while this one is the API proving who it
+/// is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the chip's
+/// accelerators is seconds rather than milliseconds. The handshake is also renegotiated from scratch
+/// every five minutes, because the connection is built fresh each time and paid for in full every
+/// time.
+///
+/// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
+/// inside five seconds, so this only bounds the failure where nothing comes back at all.
+const HANDSHAKE: Duration = Duration::from_secs(20);
 
 /// How many bytes of body to build.
 ///
@@ -179,24 +204,23 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// that is silently not sent.
 const BODY_LEN: usize = 512;
 
-/// How many headers this exchange sends, and how many it will accept back.
+/// How many headers this exchange will accept back.
 ///
 /// `edge-http`'s `Headers` is `[httparse::Header; N]` held **by value**, so `N` is stack rather than
 /// heap: its default of 64 is about a kilobyte of the reporting task's stack for no benefit, since
-/// this exchange sends four headers (`Host`, `Content-Type`, `Content-Length`, `Connection`) and the
-/// deployed Worker answers with ten.
+/// the deployed Worker answers with ten.
 ///
-/// Sixteen rather than four because `Headers::set` **panics** with `No space left` rather than
-/// returning an error, so the count is a promise the type system does not check. Four is exactly
-/// what is sent today and has no room for the `Authorization` header that is the next piece of work;
-/// sixteen leaves room for it without another visit to this constant.
+/// Sixteen rather than ten because `Headers::set` **panics** with `No space left` rather than
+/// returning an error, so the count is a promise the type system does not check. The request headers
+/// are a slice of tuples and grow without one — the `Authorization` header that is the next piece of
+/// work is one more tuple, not another visit to this constant.
 const HEADERS: usize = 16;
 
 /// How many bytes of scratch `Content-Length` is rendered into.
 ///
-/// `edge-http` takes a `heapless::String` to write the number into rather than a `&str`, because a
-/// header value is text and the number is not one yet. Twenty is `Content-Length: ` plus a `u64`:
-/// more than any length this body can have, and the type says so.
+/// The length goes out as one of the header tuples, and a header value is text while the number is
+/// not one yet. Twenty is a `u64` in full: more than any length this body can have, and the type
+/// says so.
 const LENGTH_LEN: usize = 20;
 
 /// How many bytes of the API's answer to keep.
@@ -328,14 +352,11 @@ async fn once(
         return;
     };
 
-    // The scratch `Content-Length` is rendered into has to outlive the header that borrows from it:
-    // `Headers::set_content_len` takes a `&'b mut` and stores a `&'b str` into it, so both live here
-    // rather than the buffer inside whatever builds the head.
+    // The scratch `Content-Length` is rendered into outlives the headers borrowing from it: the
+    // tuples below hold a `&str` each, so the string they borrow lives here rather than inside
+    // whatever builds them.
     let mut length = heapless::String::<LENGTH_LEN>::new();
-
-    let mut head = RequestHeaders::<HEADERS>::new();
-    head.method = Method::Post;
-    head.path = EVENTS_PATH;
+    write!(length, "{}", body.len()).ok();
 
     // Four headers, and each is here for a reason rather than by habit. `Host` is the name this
     // firmware asked for rather than the address it resolved to, because that is what a server routes
@@ -343,60 +364,76 @@ async fn once(
     // because the body was written into a buffer before any of this and a length that disagrees with
     // it is a request the server waits on until it gives up. `Connection: close` because this client
     // reads the answer and does nothing else with the connection: without it the server may hold the
-    // socket open, and the read in [`exchange`] then waits for bytes that are not coming, which is a
-    // timeout on every single report rather than once.
-    head.headers.set_host(HOST);
-    head.headers.set_content_type("application/json");
-    head.headers.set_content_len(body.len() as u64, &mut length);
-    head.headers.set_connection_close();
+    // socket open, and the read below then waits for bytes that are not coming, which is a timeout
+    // on every single report rather than once.
+    let headers = [
+        ("Host", HOST),
+        ("Content-Type", "application/json"),
+        ("Content-Length", length.as_str()),
+        ("Connection", "close"),
+    ];
 
-    // Each step returns having already said what went wrong, so the caller only has to stop. Nothing
-    // here has to arrange for the connection to be reusable: `crate::tls` builds the socket out of a
-    // pool and the connection is dropped on the way out whatever the outcome, which is also what a
-    // handshake that timed out needs — `smoltcp` refuses the next `connect` on a socket that is still
-    // open as an invalid state.
+    // The scratch the exchange runs in: `Connection` parses the answer's head out of it and hands
+    // back what arrived past the blank line as the start of the body. About a kilobyte of stack for
+    // the life of one exchange, freed on the way out rather than held across five-minute sleeps.
+    let mut scratch = [0; tls::RX_LEN];
+    let mut connection = Connection::new(
+        &mut scratch,
+        connector,
+        SocketAddr::new(IpAddr::V4(address), port()),
+    );
+
+    // Connect, shake hands and send the head in one call, under the handshake's own budget: the
+    // handshake is seconds of `MbedTLS` arithmetic on this chip rather than milliseconds of
+    // network, and twenty seconds bounds only the failure where nothing comes back at all. Each
+    // step below returns having already said what went wrong, so the caller only has to stop.
     //
-    // This is the first moment at which a certificate could be checked, and the first at which the API
-    // is known to be the API.
-    let Some(mut stream) = tls::open(connector, address, port()).await else {
-        return;
-    };
-
-    exchange(&mut stream, &head, body.as_bytes()).await;
-}
-
-/// One exchange over an open connection: write the head, write the body, read the answer, say what
-/// it was, and close.
-///
-/// Its own function rather than more of [`once`] because the buffers are its locals. Between them
-/// they are about a kilobyte and a half of stack — the head buffer is the socket's receive buffer —
-/// and a reporting task that held them for its whole life would be holding them across every one of
-/// its five-minute sleeps.
-///
-/// Nothing is closed before the answer is read. The head says `Connection: close`, so the server
-/// closes when it has answered, and the answer is what this is waiting for: shutting the write half
-/// first measured as a `ConnectionReset` before a single byte came back, which is this server's
-/// answer to being told the conversation was over before it had replied to it.
-async fn exchange(stream: &mut tls::Stream<'_>, head: &RequestHeaders<'_, HEADERS>, body: &[u8]) {
-    // `false` for `chunked_if_unspecified`: this request has a body whose length is already known, so
-    // a chunked encoding would be a second way of saying the same thing and one more thing to go
-    // wrong. The head and the body then go out as two writes, which is what went on the wire before
-    // `edge-http` too.
-    match with_timeout(TIMEOUT, head.send(false, &mut *stream)).await {
+    // Nothing here has to arrange for the connection to be reusable: the factory builds the socket
+    // out of a pool and the connection is dropped on the way out whatever the outcome, which is
+    // also what a handshake that timed out needs — `smoltcp` refuses the next `connect` on a socket
+    // that is still open as an invalid state.
+    match with_timeout(
+        HANDSHAKE,
+        connection.initiate_request(true, Method::Post, EVENTS_PATH, &headers),
+    )
+    .await
+    {
         Err(_) => {
-            error!("the request head did not go out: it timed out");
+            error!("the request did not go out: it timed out");
 
             return;
         }
         Ok(Err(e)) => {
-            error!("the request head did not go out: {:?}", e);
+            error!("the request did not go out: {:?}", e);
 
             return;
         }
-        Ok(Ok(_)) => {}
+        Ok(Ok(())) => {}
     }
 
-    match with_timeout(TIMEOUT, stream.write_all(body)).await {
+    // The version and the verification flags together are what says the API was checked and not
+    // merely reached: a zero flag is the only value that means the chain, the signature and the
+    // hostname all agreed, and the version says what was agreed about. The handshake is already
+    // over — the head above went out through it — so this reads what it settled on rather than
+    // driving it.
+    match connection.raw_connection() {
+        Err(e) => {
+            error!("the handshake could not be read back: {:?}", e);
+
+            return;
+        }
+        Ok(socket) => {
+            let session = socket.session_mut();
+
+            info!(
+                "the API's certificate verified: {:?}, flags {:#x}",
+                session.tls_version(),
+                session.tls_verification_details()
+            );
+        }
+    }
+
+    match with_timeout(TIMEOUT, connection.write_all(body.as_bytes())).await {
         Err(_) => {
             error!("the request body did not go out: it timed out");
 
@@ -410,140 +447,124 @@ async fn exchange(stream: &mut tls::Stream<'_>, head: &RequestHeaders<'_, HEADER
         Ok(Ok(())) => {}
     }
 
-    // The head is read out of the socket's own receive buffer, and whatever arrived in the same read
-    // past the blank line is handed back as the start of the body. `false` for `exact` is the whole
-    // point of this call: with `exact = true` the reader takes the head one byte at a time until it
-    // finds `\r\n\r\n`, and with `false` it reads in bulk and re-parses what it has, which is what
-    // makes a reply that arrives in pieces a reply rather than a series of malformed prefixes. The bug
-    // this firmware shipped was reading the reply once and judging whatever arrived — against this
-    // API, a 650-byte reply whose status line is 25 of those bytes, so a read landing inside the line
-    // is the ordinary case rather than the exotic one. This line is where that stops being possible.
-    let mut buffer = [0; tls::RX_LEN];
-    let mut answer = ResponseHeaders::<HEADERS>::new();
+    match with_timeout(TIMEOUT, connection.initiate_response()).await {
+        Err(_) => {
+            error!("the API did not finish answering in time");
 
-    let head_read =
-        match with_timeout(TIMEOUT, answer.receive(&mut buffer, &mut *stream, false)).await {
-            Err(_) => {
-                error!("the API did not finish answering in time");
-
-                close(stream).await;
-
-                return;
-            }
-            Ok(Err(edge_http::io::Error::ConnectionClosed)) => {
-                // Nothing at all came back: a peer that accepted the connection and then stopped. That is
-                // not the same as something answering that was not the API, and it wants a different
-                // sentence — one names the API being unreachable, the other names a portal.
-                close(stream).await;
-
-                say(None, &[]);
-
-                return;
-            }
-            Ok(Err(e)) => {
-                // Something answered and it was not HTTP, which is the captive-portal case: on a network
-                // with a login page, the first bytes of the answer are a `<!DOCTYPE`.
-                error!("what answered was not HTTP: {:?}", e);
-
-                close(stream).await;
-
-                say(None, &[]);
-
-                return;
-            }
-            Ok(Ok(read)) => read,
-        };
-
-    // `ConnectionType::Close` is what the head above asked for, and it is what the answer is resolved
-    // against: a server that answers `Keep-Alive` to a `close` is a mismatch, and refusing it here
-    // rather than reading a body whose end nothing declared is the difference between a sentence and
-    // a hang.
-    //
-    // The error parameter is the *socket's* error type rather than an erased one, so a caller who
-    // wanted to know what MbedTLS said about a malformed head could still get at it. This function
-    // does not, because the sentence is the same either way and the two are told apart by which of
-    // them produced the failure.
-    let body_type = match answer.resolve::<tls::Error>(ConnectionType::Close) {
-        Ok((_, body_type)) => body_type,
-        Err(e) => {
-            error!("the API's answer does not make sense as HTTP: {:?}", e);
-
-            close(stream).await;
+            close(connection).await;
 
             return;
         }
-    };
+        Ok(Err(edge_http::io::Error::ConnectionClosed)) => {
+            // Nothing at all came back: a peer that accepted the connection and then stopped. That is
+            // not the same as something answering that was not the API, and it wants a different
+            // sentence — one names the API being unreachable, the other names a portal.
+            close(connection).await;
+
+            say(None, &[]);
+
+            return;
+        }
+        Ok(Err(e)) => {
+            // Something answered and it was not HTTP, which is the captive-portal case: on a network
+            // with a login page, the first bytes of the answer are a `<!DOCTYPE`.
+            error!("what answered was not HTTP: {:?}", e);
+
+            close(connection).await;
+
+            say(None, &[]);
+
+            return;
+        }
+        Ok(Ok(())) => {}
+    }
+
+    let (head, reader) = connection.split();
+    let code = head.code;
 
     let mut collected = [0; BODY_REPLY_LEN];
+    let total = collect(reader, &mut collected).await;
+
+    // Finished asking, once whatever was coming has come: closing the connection politely, which is
+    // the protocol's own way of saying there is no more of this exchange. On every path rather than
+    // only the happy one: MbedTLS warns on a session dropped while still open, and a warning that
+    // fires on every failed exchange would be a warning about the reporting, not about the failure.
+    close(connection).await;
+
+    say(Some(code), &collected[..total]);
+}
+
+/// Reads the answer's body into `collected`, and says how many bytes it took.
+///
+/// Its own function rather than more of [`once`] because that function is long enough already, and
+/// the loop is the one part of the exchange with a buffer of its own.
+///
+/// Cut rather than refused when the body does not fit, and said so in the log when it happens: a
+/// body too long for this is a Cloudflare error page, and the first 120 characters of one already
+/// say it is HTML.
+async fn collect(
+    reader: &mut Body<'_, tls::Stream<'_>>,
+    collected: &mut [u8; BODY_REPLY_LEN],
+) -> usize {
     let mut total = 0;
 
-    {
-        // Scoped so the body reader — which borrows the stream — is gone before [`close`] needs it.
-        let mut reader = Body::new(body_type, head_read.0, head_read.1, &mut *stream);
+    loop {
+        match with_timeout(TIMEOUT, reader.read(&mut collected[total..])).await {
+            Err(_) => {
+                error!(
+                    "the API stopped answering after {} of {} bytes",
+                    total,
+                    collected.len()
+                );
 
-        loop {
-            match with_timeout(TIMEOUT, reader.read(&mut collected[total..])).await {
-                Err(_) => {
-                    error!(
-                        "the API stopped answering after {} of {} bytes",
-                        total,
+                return total;
+            }
+            // Zero bytes is the end of the body rather than a failure, and for a `Connection:
+            // close` reply with no `Content-Length` it is the *only* way to learn where the body
+            // stopped: nothing declared a length, so nothing else says.
+            Ok(Ok(0)) => return total,
+            Ok(Ok(got)) => {
+                total += got;
+
+                if total == collected.len() {
+                    // The buffer is full with the body still going, which is only possible for a
+                    // body whose length was never declared. Said rather than passed off as
+                    // complete: a Cloudflare error page cut at 256 bytes and one cut at 255 read
+                    // the same otherwise.
+                    warn!(
+                        "the API's answer is longer than {} bytes and was cut",
                         collected.len()
                     );
 
-                    break;
+                    return total;
                 }
-                // Zero bytes is the end of the body rather than a failure, and for a `Connection:
-                // close` reply with no `Content-Length` it is the *only* way to learn where the body
-                // stopped: nothing declared a length, so nothing else says.
-                Ok(Ok(0)) => break,
-                Ok(Ok(got)) => {
-                    total += got;
+            }
+            Ok(Err(e)) => {
+                error!("the API's answer could not be read: {:?}", e);
 
-                    if total == collected.len() {
-                        // The buffer is full with the body still going, which is only possible for a
-                        // body whose length was never declared. Said rather than passed off as
-                        // complete: a Cloudflare error page cut at 256 bytes and one cut at 255 read
-                        // the same otherwise.
-                        warn!(
-                            "the API's answer is longer than {} bytes and was cut",
-                            collected.len()
-                        );
-
-                        break;
-                    }
-                }
-                Ok(Err(e)) => {
-                    error!("the API's answer could not be read: {:?}", e);
-
-                    break;
-                }
+                return total;
             }
         }
     }
-
-    // Finished asking, once whatever was coming has come — TLS `close_notify`, which is the
-    // protocol's own way of saying there is no more of this exchange. On every path rather than only
-    // the happy one: MbedTLS warns on a session dropped while still open, and a warning that fires
-    // on every failed exchange would be a warning about the reporting, not about the failure.
-    close(stream).await;
-
-    say(Some(answer.code), &collected[..total]);
 }
 
 /// Closes the connection politely, and says when it could not.
 ///
 /// Its own function because it is on the failure paths as well as the happy one, and a closure
 /// repeated at five call sites would be five chances to word the same event five different ways.
-async fn close(stream: &mut tls::Stream<'_>) {
-    match with_timeout(TIMEOUT, stream.close(Close::Write)).await {
+///
+/// Nothing is closed before the answer is read. The head says `Connection: close`, so the server
+/// closes when it has answered, and the answer is what this is waiting for: shutting the write half
+/// first measured as a `ConnectionReset` before a single byte came back, which is this server's
+/// answer to being told the conversation was over before it had replied to it.
+async fn close(connection: Connection<'_, TlsConnector<'static, EmbassyTcp<'static>>, HEADERS>) {
+    match with_timeout(TIMEOUT, connection.close()).await {
         Err(_) => warn!("the exchange was not closed politely: it timed out"),
         Ok(Err(e)) => warn!("the exchange was not closed politely: {:?}", e),
         Ok(Ok(())) => {}
     }
 }
 
-/// Says what the API answered, which is the whole of what this file is for.
-///
 /// Says what the API answered, which is the whole of what this file is for.
 ///
 /// Takes the status code and the body rather than a verdict on them: 201 is the one status that
