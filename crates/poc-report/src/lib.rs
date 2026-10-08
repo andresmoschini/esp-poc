@@ -778,17 +778,16 @@ impl fmt::Display for Time {
     }
 }
 
-/// How long something took, in as few words as say it: "45 seconds", "3 minutes", "1 hour 5 minutes".
+/// How long something took, in seconds.
 ///
-/// The two largest units that are not zero, and no more than two, because this goes at the end of a
-/// line that already has a date on it and a third unit is a precision nobody acts on — an hour is
-/// either enough to go and look at the radio or it is not.
+/// A bare count rather than words: "3661s" instead of "1 hour 1 minute". Two units with
+/// singulars and plurals is a precision nobody acts on at the end of a line that already has a
+/// date on it, and a count is nothing to test beyond the number.
 ///
 /// Public, and returning something that formats rather than a `String`, for one reason: this is a
-/// decision — which units, how many, singular or plural — and a decision made in a private function
-/// is a decision nothing checks. The choice of units is the same one the calendar in [`Clock`] makes
-/// and is tested in the same place for the same reason. A `String` would have needed an allocator,
-/// which this crate does not have and does not need for two numbers and two words.
+/// decision — seconds, always — and a decision made in a private function is a decision nothing
+/// checks. A `String` would have needed an allocator, which this crate does not have and does not
+/// need for one number and one letter.
 #[must_use]
 pub fn age(secs: u64) -> impl fmt::Display {
     Age(secs)
@@ -799,54 +798,8 @@ struct Age(u64);
 
 impl fmt::Display for Age {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        /// The units of an age, largest first: the first two that are not zero are the two written.
-        const UNITS: [(u64, &str); 4] = [
-            (24 * 60 * 60, "day"),
-            (60 * 60, "hour"),
-            (60, "minute"),
-            (1, "second"),
-        ];
-
-        let mut secs = self.0;
-        let mut said = 0;
-
-        for (size, name) in UNITS {
-            let count = secs / size;
-
-            // The remainder is carried into the next unit rather than dropped, because the units
-            // below are the ones that share it: 1 hour 5 minutes is not 1 hour and 65 minutes.
-            secs -= count * size;
-
-            if count == 0 {
-                continue;
-            }
-
-            if said == 2 {
-                break;
-            }
-
-            if said > 0 {
-                f.write_str(" ")?;
-            }
-
-            write!(f, "{count} {name}{}", plural(count))?;
-            said += 1;
-        }
-
-        // Only an age of nothing reaches this, which nothing calls [`age`] with today. It is here
-        // rather than left to write nothing, because a sentence with a hole in the middle of it is
-        // worse than one that says zero.
-        if said == 0 {
-            return f.write_str("0 seconds");
-        }
-
-        Ok(())
+        write!(f, "{}s", self.0)
     }
-}
-
-/// The `s` on the end of a unit of time, for the counts that need one.
-const fn plural(count: u64) -> &'static str {
-    if count == 1 { "" } else { "s" }
 }
 
 /// Everything the firmware knows about itself, right now, as the line it prints.

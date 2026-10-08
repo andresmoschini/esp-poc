@@ -127,7 +127,7 @@ fn a_time_nobody_has_confirmed_recently_says_how_long_ago() {
 
     assert_eq!(
         render(&status),
-        "2026-10-04 18:22:31 UTC (from a stratum 3 server, last confirmed 1 hour 5 minutes ago), \
+        "2026-10-04 18:22:31 UTC (from a stratum 3 server, last confirmed 3900s ago), \
          no address yet, wifi: joined",
     );
 }
@@ -148,7 +148,7 @@ fn the_second_an_answer_goes_stale_is_the_second_it_stops_being_current() {
     );
     assert_eq!(
         stale,
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server, last confirmed 1 hour ago)",
+        "2026-10-04 18:22:31 UTC (from a stratum 2 server, last confirmed 3600s ago)",
     );
 }
 
@@ -291,32 +291,19 @@ fn the_obstructions_are_distinguishable() {
     );
 }
 
-/// An age is written in the two largest units that are not zero, in words, with an `s` on the ones
-/// that need it. Two units because this goes at the end of a line that already has a date on it, and
-/// a third is a precision nobody acts on.
+/// An age is written as a count of seconds: "45s", "3600s". A count is nothing to format beyond
+/// the number, and the largest count there is still just digits — which in a debug build is where
+/// an unchecked arithmetic would panic rather than wrap.
 #[test]
-fn an_age_is_written_in_at_most_two_units() {
+fn an_age_is_written_in_seconds() {
     let expected = [
-        (0, "0 seconds"),
-        (1, "1 second"),
-        (2, "2 seconds"),
-        (45, "45 seconds"),
-        (60, "1 minute"),
-        (119, "1 minute 59 seconds"),
-        (3 * 60, "3 minutes"),
-        (60 * 60 - 1, "59 minutes 59 seconds"),
-        (60 * 60, "1 hour"),
-        (60 * 60 + 5 * 60, "1 hour 5 minutes"),
-        (60 * 60 + 1, "1 hour 1 second"),
-        (2 * 24 * 60 * 60, "2 days"),
-        (3 * 24 * 60 * 60 + 4 * 60 * 60, "3 days 4 hours"),
-        // The third unit is dropped rather than shown: two days, an hour and 59 minutes is "2 days
-        // 1 hour", not a number of minutes.
-        (2 * 24 * 60 * 60 + 60 * 60 + 59 * 60, "2 days 1 hour"),
-        // The largest count there is, which in a debug build is where an unchecked addition would
-        // panic rather than wrap. The number of days is absurd; the point is that it gets as far as
-        // the formatting.
-        (u64::MAX, "213503982334601 days 7 hours"),
+        (0, "0s"),
+        (1, "1s"),
+        (45, "45s"),
+        (60, "60s"),
+        (3_661, "3661s"),
+        (3 * 24 * 60 * 60 + 4 * 60 * 60, "273600s"),
+        (u64::MAX, "18446744073709551615s"),
     ];
 
     for (secs, written) in expected {
