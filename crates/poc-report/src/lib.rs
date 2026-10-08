@@ -228,7 +228,8 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// battery-backed clock on this chip, so [`Self::SinceBoot`] is the only reading it can make on its
 /// own: the scheduler's counter, which starts at zero when the firmware starts. A real time has to
 /// come from the network, and until one has arrived the two are told apart by their shape rather
-/// than by anything else, which is why [`Self::Utc`] prints a date and this one does not.
+/// than by anything else, which is why [`Self::Utc`] prints a count of seconds and this one a
+/// time of day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clock {
     /// How long the chip has been running, wrapped into a day.
@@ -244,6 +245,8 @@ pub enum Clock {
     /// disagrees with it by a timezone has been adjusted by somebody, which is not this crate's
     /// business. The count is unsigned because a time before 1970 is not a time this can print,
     /// and an SNTP server that reports one is refused rather than rendered — see [`sntp_reply`].
+    /// Printed as the number rather than as a date: the greeting that carries it is read twice a
+    /// second, and the date is what the reported event's [`Timestamp`] is for.
     Utc(u64),
 }
 
@@ -274,17 +277,10 @@ impl fmt::Display for Clock {
 
                 write!(f, "{hours:02}:{minutes:02}:{seconds:02}")
             }
-            // A date as well as a time: a clock that cannot say which day the hours belong to is
-            // half a clock, and the date is the part that catches a reading that is a century out.
-            Self::Utc(epoch_secs) => {
-                let civil = civil(*epoch_secs);
-
-                write!(
-                    f,
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
-                )
-            }
+            // The count of seconds since the epoch, printed as the number: the greeting that
+            // carries it is read twice a second, and a date is what the reported event's
+            // [`Timestamp`] is for.
+            Self::Utc(epoch_secs) => write!(f, "{epoch_secs}"),
         }
     }
 }
@@ -313,7 +309,8 @@ struct Civil {
 ///
 /// It is here rather than in the firmware because it is arithmetic that cannot be checked by
 /// looking at it. Month lengths and leap years are exactly the sort of thing that is right in the
-/// common cases and wrong in February, and `tests/report.rs` pins the ends of each of them.
+/// common cases and wrong in February, and `tests/report_api.rs` pins the ends of each of them
+/// through [`Timestamp`].
 fn civil(epoch_secs: u64) -> Civil {
     let seconds_of_day = epoch_secs % SECONDS_PER_DAY;
 

@@ -13,7 +13,7 @@ accident, then join a Wi-Fi network, print the address DHCP hands out, and set t
 SNTP server over that network — and every 500 ms print one line that says all of it:
 
 ```text
-Hello world! 2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined
+Hello world! 1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined
 ```
 
 It reads as the time and where it came from, then the address, then the state of the radio — the
@@ -23,24 +23,24 @@ gate can check rather than things assembled next to the printer.
 
 It also says when something is wrong, and what:
 
-| What the line says                                                                       | What it means                                                             |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `00:00:42 (counting from boot: nothing has answered yet)`                                | no server has answered yet                                                |
-| `00:01:03 (counting from boot: the time server's answer did not arrive)`                 | the last attempt, and the step of it that failed                          |
-| `2026-10-04 18:22:31 UTC (from a stratum 2 server, last confirmed 1 hour 5 minutes ago)` | a real time, from a server, and nobody has confirmed it since             |
-| `wifi: joined`                                                                           | the station is on the network                                             |
-| `wifi: joining`                                                                          | an attempt is in progress or due                                          |
-| `wifi: not joined: nothing with that name was heard (signal -81 dBm)`                    | the last failure, in words and with the signal that separates two of them |
-| `wifi: not joined: the handshake started and did not finish (signal -55 dBm)`            | the radio ran out of time mid-handshake and did not say why               |
-| `wifi: nothing to join: no credentials were compiled in`                                 | a build with no `WIFI_SSID`, which is what the gate and CI are            |
+| What the line says                                                            | What it means                                                             |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `00:00:42 (counting from boot: nothing has answered yet)`                     | no server has answered yet                                                |
+| `00:01:03 (counting from boot: the time server's answer did not arrive)`      | the last attempt, and the step of it that failed                          |
+| `1791138151 UTC (from a stratum 2 server, last confirmed 3900s ago)`          | a real time, from a server, and nobody has confirmed it since             |
+| `wifi: joined`                                                                | the station is on the network                                             |
+| `wifi: joining`                                                               | an attempt is in progress or due                                          |
+| `wifi: not joined: nothing with that name was heard (signal -81 dBm)`         | the last failure, in words and with the signal that separates two of them |
+| `wifi: not joined: the handshake started and did not finish (signal -55 dBm)` | the radio ran out of time mid-handshake and did not say why               |
+| `wifi: nothing to join: no credentials were compiled in`                      | a build with no `WIFI_SSID`, which is what the gate and CI are            |
 
 The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
 clock, so before that the greeting prints how long it has been running since boot, wrapped into a
-day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and a reading
-with a date came from a server. Between two answers the clock keeps moving on its own crystal, so a
-reading nobody has confirmed for an hour says how long ago that was. The time lives in RAM, so every
-boot asks again. `src/ntp.rs` is the client; `src/clock.rs` is the one number it sets and the three
-facts about where it came from.
+day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and a count of
+seconds since the epoch came from a server. Between two answers the clock keeps moving on its own
+crystal, so a reading nobody has confirmed for an hour says how long ago that was in seconds. The
+time lives in RAM, so every boot asks again. `src/ntp.rs` is the client; `src/clock.rs` is the one
+number it sets and the three facts about where it came from.
 
 Wi-Fi is [`esp-radio`](https://docs.espressif.com/projects/rust/esp-radio/latest/), which on both
 chips is part of the chip itself: there are no pins to choose and no antenna to configure. It needs

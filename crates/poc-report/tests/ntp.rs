@@ -15,7 +15,7 @@
 // twenty tests agreed with a bug that a real server's first reply exposed. An encoder and a decoder
 // written from the same idea check each other's arithmetic and neither one's idea of the format.
 
-use poc_report::{Clock, Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
+use poc_report::{Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
 
 /// The nonce the tests send. Any value works; one that is easy to read in a failure is the point.
 const NONCE: u32 = 0x0BAD_F00D;
@@ -142,8 +142,8 @@ fn a_reply_captured_from_a_real_server_reads_as_the_day_it_was_asked_for() {
     let answer = sntp_reply(&packet, NONCE).expect("a well-formed reply");
 
     assert_eq!(
-        Clock::utc(answer.epoch_secs).to_string(),
-        "2026-10-04 12:24:25",
+        answer.epoch_secs,
+        epoch_secs(2026, 10, 4, 12, 24, 25),
         "a packet from a real server read as something else",
     );
 }
@@ -339,18 +339,16 @@ fn another_version_is_refused() {
     assert_eq!(sntp_reply(&packet, NONCE), Err(Refusal::Version));
 }
 
-/// The whole point of the time: the seconds a server sends are the seconds the greeting prints. The
-/// two are in different crates and one is what the other is for.
+/// The whole point of the time: the seconds a server sends are the seconds the clock counts from.
+/// The two are in different crates and one is what the other is for, and what travels between them
+/// is the count rather than a rendering of it.
 #[test]
-fn a_time_from_a_server_is_what_the_clock_prints() {
+fn a_time_from_a_server_is_what_the_clock_counts() {
     let moment = epoch_secs(2026, 10, 4, 18, 22, 31);
 
     let answer = sntp_reply(&reply(moment), NONCE).expect("a well-formed reply");
 
-    assert_eq!(
-        poc_report::Clock::utc(answer.epoch_secs).to_string(),
-        "2026-10-04 18:22:31"
-    );
+    assert_eq!(answer.epoch_secs, moment);
 }
 
 /// A request is 48 zero bytes with two things in it, and both are checked here rather than assumed:
@@ -451,21 +449,4 @@ fn the_refusals_are_distinguishable() {
     unique.dedup();
 
     assert_eq!(unique.len(), sentences.len(), "two refusals read the same");
-}
-
-/// The clock and the reply agree at the boundary the greeting prints most often: midnight, where a
-/// day of seconds turns into a date that is one further on.
-#[test]
-fn a_time_at_midnight_moves_the_date() {
-    let just_before = epoch_secs(2026, 10, 4, 23, 59, 59);
-    let just_after = just_before + 1;
-
-    for (moment, expected) in [
-        (just_before, "2026-10-04 23:59:59"),
-        (just_after, "2026-10-05 00:00:00"),
-    ] {
-        let answer = sntp_reply(&reply(moment), NONCE).expect("a well-formed reply");
-
-        assert_eq!(Clock::utc(answer.epoch_secs).to_string(), expected);
-    }
 }

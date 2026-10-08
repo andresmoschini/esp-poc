@@ -54,7 +54,7 @@ fn the_state_line_reads_the_time_then_the_address_then_the_radio() {
 
     assert_eq!(
         render(&status),
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined",
+        "1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined",
     );
 }
 
@@ -127,7 +127,7 @@ fn a_time_nobody_has_confirmed_recently_says_how_long_ago() {
 
     assert_eq!(
         render(&status),
-        "2026-10-04 18:22:31 UTC (from a stratum 3 server, last confirmed 3900s ago), \
+        "1791138151 UTC (from a stratum 3 server, last confirmed 3900s ago), \
          no address yet, wifi: joined",
     );
 }
@@ -143,12 +143,12 @@ fn the_second_an_answer_goes_stale_is_the_second_it_stops_being_current() {
     let stale = render(&Time::answered(AT, 2, STALE_AFTER_SECS));
 
     assert_eq!(
-        fresh, "2026-10-04 18:22:31 UTC (from a stratum 2 server)",
+        fresh, "1791138151 UTC (from a stratum 2 server)",
         "an answer one second short of the resync interval is still current",
     );
     assert_eq!(
         stale,
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server, last confirmed 3600s ago)",
+        "1791138151 UTC (from a stratum 2 server, last confirmed 3600s ago)",
     );
 }
 
@@ -165,7 +165,7 @@ fn a_time_from_boot_has_no_date_and_a_time_from_a_server_does() {
 
     assert_eq!(
         render(&Time::answered(AT, 2, 30)),
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server)",
+        "1791138151 UTC (from a stratum 2 server)",
     );
 }
 

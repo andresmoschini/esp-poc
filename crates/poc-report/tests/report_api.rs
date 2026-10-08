@@ -75,7 +75,7 @@ fn body() -> String {
 fn an_event_is_the_json_the_api_asks_for() {
     assert_eq!(
         body(),
-        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
+        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
     );
 }
 
@@ -126,12 +126,77 @@ fn the_timestamp_handles_the_ends_of_a_leap_year() {
         "2028-02-29T12:00:00Z",
     );
 
+    // 2000-02-29T00:00:00Z and the day after it: a century divisible by 400 is a leap year, so
+    // February has 29 days rather than 28.
+    assert_eq!(render(&Timestamp::at(951_782_400)), "2000-02-29T00:00:00Z",);
+    assert_eq!(render(&Timestamp::at(951_868_800)), "2000-03-01T00:00:00Z",);
+
     // 2100-02-28T23:59:59Z, the last second before a century that is divisible by 100 and not by
     // 400 takes its leap day away. A calendar that divides by four here is wrong once every hundred
     // years, which is exactly the sort of thing that is right in every test somebody writes.
     assert_eq!(
         render(&Timestamp::at(4_107_542_399)),
         "2100-02-28T23:59:59Z"
+    );
+}
+
+/// Every month of a year, which is the property that a month length is 30 or 31 and not 31 for all
+/// of them. One table rather than twelve tests, because the property is that the set is covered:
+/// the day either side of each boundary is the assertion, because a month length written into the
+/// arithmetic twice shows up as a date that is one day out.
+#[test]
+fn every_month_has_the_length_it_has() {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    // 2025-01-01T00:00:00Z, and 2025 is not a leap year, so February below is 28 days.
+    let mut first = 1_735_689_600;
+
+    for (index, length) in LENGTHS.iter().enumerate() {
+        let month = index as u64 + 1;
+
+        assert_eq!(
+            render(&Timestamp::at(first)),
+            format!("2025-{month:02}-01T00:00:00Z"),
+            "the first of month {month}",
+        );
+
+        // The last day of the month is the one the table names, and the first of the next month is
+        // the day after it — which is the whole claim being made here: the two are one day apart.
+        let last = first + (length - 1) * 86_400;
+
+        assert_eq!(
+            render(&Timestamp::at(last)),
+            format!("2025-{month:02}-{length:02}T00:00:00Z"),
+            "the last of month {month}",
+        );
+
+        first = last + 86_400;
+    }
+
+    assert_eq!(
+        render(&Timestamp::at(first)),
+        "2026-01-01T00:00:00Z",
+        "after December comes January"
+    );
+}
+
+/// A count of seconds no calendar has is not a time any server would send, but it is one the
+/// firmware can be handed — from a packet that passed every other check — and printing it has to
+/// produce a timestamp rather than an overflow panic. A panic here would be in the reporting task,
+/// and it would take the report down.
+#[test]
+fn an_impossible_epoch_renders_rather_than_overflowing() {
+    // The largest count there is, which in a debug build is where an unchecked addition would panic
+    // rather than wrap. The year is absurd; the point is that the arithmetic gets to the formatting.
+    let absurd = render(&Timestamp::at(u64::MAX));
+
+    assert!(
+        absurd.starts_with("584"),
+        "the year is finite even though the date is absurd: {absurd}"
+    );
+    assert!(
+        absurd.contains('T') && absurd.contains('Z') && absurd.contains(':'),
+        "a timestamp rather than a panic: {absurd}"
     );
 }
 
@@ -272,7 +337,7 @@ fn the_payload_is_the_state_line() {
     assert_eq!(payload(&earlier), payload(&later));
     assert_eq!(
         payload(&later),
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"
+        "1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"
     );
     assert_ne!(
         earlier, later,
