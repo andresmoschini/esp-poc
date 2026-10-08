@@ -106,6 +106,14 @@ const TX_LEN: usize = 512;
 /// of them in [`crate::report`] is three places to get subtly wrong.
 pub type Stream<'a> = TlsSocket<'a, edge_nal_embassy::TcpSocket<'a>>;
 
+/// What a failed read, write or handshake on that stream comes back as.
+///
+/// Named because [`crate::report`] has to name it too: `edge-http` is generic over the error type of
+/// whatever it reads and writes, and the one thing it is reading and writing here is a TLS socket. A
+/// type alias rather than the `SessionError` spelled out, so the two files cannot drift apart on which
+/// error this is.
+pub type Error = edge_nal_tls::mbedtls::SessionError;
+
 /// The one `MbedTLS` instance this firmware has, holding the entropy source it draws from.
 ///
 /// `Trng` is moved in rather than borrowed because `MbedTLS` wants a `&'static mut` to a `CryptoRng`:

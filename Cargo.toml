@@ -180,6 +180,24 @@ edge-nal         = "0.7.0"
 edge-nal-embassy = "0.9.0"
 edge-nal-tls     = { version = "0.3.0", features = ["defmt"] }
 
+# The HTTP framing: the request head and the reading of a reply, which is the part that is fiddly in
+# the detail nobody reads and that already cost this firmware one bug. `edge-http` is the same
+# author's crate as the three above and speaks the same `edge-nal` 0.7 socket, so it layers onto
+# `crate::tls`'s `TlsSocket` rather than beside it — which is why `src/report.rs` uses its
+# `RequestHeaders`/`ResponseHeaders`/`Body` directly instead of `edge_http::io::client::Connection`:
+# the state machine in `Connection` does the `connect` itself, and the handshake with its own
+# timeout and its own line in the log is what `src/tls.rs` is for.
+#
+# The `io` feature is default and is what brings `edge-nal`, `embedded-io-async`, `embassy-sync` and
+# `embassy-futures` — all four already in this tree at the versions it asks for, so nothing above
+# moves. `httparse`, `sha1_smol` and `base64` are new, and all three are small and `no_std`.
+edge-http = { version = "0.8.0", features = ["defmt"] }
+
+# `edge-http`'s own `String`, which `Headers::set_content_len` takes a borrow of because a
+# `Content-Length` has to be rendered as text before it can be a header. It is already in the tree
+# as a transitive dependency of three crates; this line makes it nameable.
+heapless = "0.9.3"
+
 # The C library's `memchr`, which MbedTLS calls from `x509.c` and which nothing else on the chip
 # provides. Measured, not assumed: without this the link fails with `undefined symbol: memchr`,
 # "referenced by x509.c", and the gate's `build` step is where that shows up.

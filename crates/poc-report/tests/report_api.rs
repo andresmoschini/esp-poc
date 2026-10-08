@@ -4,41 +4,39 @@
 // and an integration test is a separate crate with the standard prelude, so `assert_eq!` and `String`
 // are available without the library giving up `no_std` for its own build.
 //
-// What is worth testing is the wire format and the reading of an answer. The body is JSON written by
-// hand, and a body that is wrong is wrong in a way nothing on the board can see: a missing brace is
-// a 400 from a server, an unescaped quote is a 400, and a timestamp in the wrong format is stored as
-// a string nobody can sort. The status line is the other direction — an answer off the network is
-// untrusted input, and "the first fifteen bytes were HTML" is the case a chip on a hotel network
-// actually hits.
+// What is worth testing is the body and what an answer means. The body is JSON written by hand, and a
+// body that is wrong is wrong in a way nothing on the board can see: a missing brace is a 400 from a
+// server, an unescaped quote is a 400, and a timestamp in the wrong format is stored as a string
+// nobody can sort. An answer off the network is untrusted input, and what to say about it is what
+// ends up in a serial log.
+//
+// **The HTTP framing is not tested here because this crate no longer does any.** It used to: this
+// file held the request head, a `status_line_arrived` predicate, and a parser for the status line, and
+// the read-boundary bug that shipped — reading a reply once and judging whatever arrived — was caught
+// by a test right here. All of that is `edge-http`'s now, and `src/report.rs` builds a
+// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What arrives here is a
+// status number, a body, or the fact that neither came: three constructors rather than one parse. So
+// the tests below are about the wording, which is what a reader of the log actually sees, and about
+// the mapping from a number to a sentence — the parts a general-purpose client cannot decide.
 
 use std::fmt::Write as _;
 
 use poc_report::{
-    Address, EVENT_TELEMETRY, EVENTS_PATH, Event, LOGGED_LEN, Link, REPORT_EVERY_SECS, Reply,
-    Request, Status, Time, Timestamp, Verdict, logged, status_line_arrived,
+    Address, EVENT_TELEMETRY, Event, LOGGED_LEN, Link, REPORT_EVERY_SECS, Reply, Status, Time,
+    Timestamp, Verdict, logged,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
 /// test.
 const AT: u64 = 20_730 * 24 * 60 * 60 + 18 * 3_600 + 22 * 60 + 31;
 
-/// A real 401 from this API, captured on 2026-10-07 with the bytes the firmware sends.
+/// The body of a real 401 from this API, captured on 2026-10-07.
 ///
-/// The `Date`, `CF-RAY`, `Report-To` and `Nel` headers are trimmed, and everything else is byte for
-/// byte what came back — in particular the `Connection: close` and the 24-byte JSON body, both of
-/// which are what a real worker sends and neither of which a hand-written fixture would have thought
-/// of. It is 650 bytes against a 25-byte status line, which is the ratio that makes the read-boundary
-/// bug in [`Verdict::from_reply`] ordinary rather than exotic: one read of this reply is very likely
-/// not the whole of it.
-const REPLY_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
-Date: Wed, 07 Oct 2026 11:36:42 GMT\r\n\
-Content-Type: application/json\r\n\
-Content-Length: 24\r\n\
-Connection: close\r\n\
-WWW-Authenticate: Bearer realm=\"cfpoc\"\r\n\
-Server: cloudflare\r\n\
-\r\n\
-{\"error\":\"Unauthorized\"}";
+/// Taken out of the reply it arrived in: the head is [`edge-http`]'s to write and parse now, so this
+/// file has no opinion about CRLF, about a status line arriving in pieces, or about where the blank
+/// line is. What is left is what this crate is given — a number, these bytes, or the fact that
+/// neither arrived — and that is what the tests below are about.
+const BODY_401: &[u8] = br#"{"error":"Unauthorized"}"#;
 
 /// The status line of an event from a chip that has joined and has a time.
 fn status() -> Status {
@@ -239,138 +237,40 @@ fn the_payload_is_the_state_line() {
     );
 }
 
-/// The head is the part a server refuses a request over rather than stores wrongly, and CRLF is the
-/// detail: a request whose lines end in a bare `\n` is a request some servers will not answer at
-/// all, which on a board looks exactly like the API being down.
-#[test]
-fn the_head_is_an_http_1_1_post_with_crlf_lines() {
-    let head = render(&Request {
-        host: "cfpoc.example.workers.dev",
-        path: EVENTS_PATH,
-        content_length: 42,
-    });
-
-    assert_eq!(
-        head,
-        concat!(
-            "POST /events HTTP/1.1\r\n",
-            "Host: cfpoc.example.workers.dev\r\n",
-            "Content-Type: application/json\r\n",
-            "Content-Length: 42\r\n",
-            "Connection: close\r\n",
-            "\r\n",
-        ),
-    );
-}
-
-/// `Content-Length` is the number the caller measured, and the body is written into a buffer before
-/// the head is built because the head cannot be written without it. This is the pairing of the two
-/// that matters: a length that does not match the body is a request a server waits on until it gives
-/// up, which is a hang rather than an error.
-#[test]
-fn the_content_length_is_the_length_the_caller_measured() {
-    let event = Event {
-        device_id: "esp32c3-001122334455",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    };
-
-    let body = render(&event);
-
-    let head = render(&Request {
-        host: "cfpoc.example.workers.dev",
-        path: EVENTS_PATH,
-        content_length: body.len(),
-    });
-
-    assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
-    assert!(
-        head.ends_with("\r\n\r\n"),
-        "the head ends where the body begins"
-    );
-}
-
-/// A reply arrives in as many reads as the network decides, and the status line is not guaranteed to
-/// be whole in the first one. Measured against this API, the real 401 below is 650 bytes and the
-/// status line is the first 25 of them, so a read that lands inside the line is ordinary rather than
-/// exotic.
-///
-/// This is the bug this file exists to stop repeating. The firmware read the reply exactly once and
-/// judged whatever arrived, so a read landing inside the line reported "what answered was not the
-/// API" — for a reply the API had already sent, in full, correctly. Both halves are pinned here: the
-/// reader must be able to say when the line is whole, and once it says so every prefix must give the
-/// same answer.
-#[test]
-fn a_reply_read_one_byte_at_a_time_is_still_a_reply() {
-    let line_end = REPLY_401
-        .windows(2)
-        .position(|pair| pair == b"\r\n")
-        .expect("a status line");
-
-    for read in 1..=line_end {
-        let arrived = &REPLY_401[..read];
-
-        // Before the CRLF arrives the reader must know it has to read more, and must not have an
-        // opinion about what it has.
-        assert!(
-            !status_line_arrived(arrived),
-            "{read} bytes of a reply were taken for a whole first line: {}",
-            String::from_utf8_lossy(arrived),
-        );
-    }
-
-    // The CRLF itself, which is the byte that ends the line: one byte earlier than this the line is
-    // not whole and one byte later it is.
-    assert!(!status_line_arrived(&REPLY_401[..line_end + 1]));
-    assert!(status_line_arrived(&REPLY_401[..line_end + 2]));
-
-    // From the moment the line is whole, every byte that can be in the buffer after it gives the same
-    // answer, including the CRLF, the headers, and the body.
-    for read in (line_end + 2)..=REPLY_401.len() {
-        assert_eq!(
-            Reply::from_bytes(&REPLY_401[..read]).verdict(),
-            Verdict::Unauthorized,
-            "{read} bytes of a valid reply read as something else: {}",
-            String::from_utf8_lossy(&REPLY_401[..read]),
-        );
-    }
-}
-
-/// The point of the loop above, stated on its own: a first line that has half arrived and a first line
-/// that is wrong look identical in the bytes, and the firmware has to be able to tell them apart
-/// rather than guess. This is the exact prefix that made the guess, and what it is made of.
-#[test]
-fn a_half_arrived_status_line_is_not_the_same_as_a_wrong_one() {
-    let half = &REPLY_401[..11];
-
-    assert_eq!(half, b"HTTP/1.1 40");
-    assert!(
-        !status_line_arrived(half),
-        "a truncated line was taken for a whole one",
-    );
-    assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 2011 Created\r\n\r\n").verdict(),
-        Verdict::NotTheApi,
-        "a whole line that is not a status line is still a whole line",
-    );
-}
-
 /// Nothing at all is its own answer, and it is not the same thing as a portal's login page: one means
 /// nothing answered and the other means something that is not the API answered. They want different
 /// fixes, so they do not share a sentence.
+///
+/// Both are **constructed** rather than parsed, because `edge-http` decides which of the two happened
+/// and hands over the fact rather than the bytes. That is the trade this crate made: the decision of
+/// where a reply ends moves to a library, and what stays here is the wording — which is what the gate
+/// can check and what a log actually shows.
 #[test]
 fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
-    assert_eq!(Reply::from_bytes(b"").verdict(), Verdict::NothingCameBack);
+    assert_eq!(
+        Reply::nothing_came_back().verdict(),
+        Verdict::NothingCameBack
+    );
     assert_eq!(
         render(&Verdict::NothingCameBack),
         "nothing came back: the connection closed silently",
     );
 
+    assert_eq!(Reply::not_the_api().verdict(), Verdict::NotTheApi);
     assert_eq!(
-        Reply::from_bytes(b"<!DOCTYPE html><html>...").verdict(),
-        Verdict::NotTheApi,
+        render(&Verdict::NotTheApi),
+        "what answered was not the API: the first line was not a status line",
     );
+}
+
+/// Both ways of not having an answer report no status, rather than a zero. Inventing a number would be
+/// a guess: a zero in a log reads as a status the API sent, and there is no such status. `None` is
+/// the truth and the caller says so.
+#[test]
+fn a_reply_without_a_status_has_no_status_code() {
+    for reply in [Reply::nothing_came_back(), Reply::not_the_api()] {
+        assert_eq!(reply.status(), None, "{reply:?}");
+    }
 }
 
 /// The status code is the one thing in a reply that is not this firmware's opinion, so it has to be
@@ -379,61 +279,32 @@ fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
 #[test]
 fn the_status_code_is_readable_for_every_status() {
     for status in [200u16, 201, 204, 400, 401, 403, 404, 405, 429, 500, 503] {
-        let reply = format!("HTTP/1.1 {status} Something\r\nContent-Length: 0\r\n\r\n");
-
         assert_eq!(
-            Reply::from_bytes(reply.as_bytes()).status(),
+            Reply::answered(status, b"").status(),
             Some(status),
             "{status}",
         );
     }
 }
 
-/// A reply that is not HTTP has no status, and inventing one would be a guess: a zero in a log reads
-/// as a status the API sent, and there is no such status. `None` is the truth and the caller says so.
+/// The body is the API's own words, and on a 400 it is the only thing that says *which* field was
+/// wrong. This is the body of the real 401 captured on 2026-10-07, so it is the API's wording rather
+/// than a fixture's.
 #[test]
-fn a_reply_that_is_not_http_has_no_status_code() {
-    for reply in [
-        &b""[..],
-        b"<!DOCTYPE html>\r\n\r\n",
-        b"HTTP/1.1 20x Created\r\n\r\n",
-        b"{\"ok\":true}",
-    ] {
-        assert_eq!(Reply::from_bytes(reply).status(), None, "{reply:?}");
-    }
-}
+fn the_body_is_the_apis_own_words() {
+    let reply = Reply::answered(401, BODY_401);
 
-/// The body is what follows the first blank line, and it is the only thing a 400 says about which
-/// field was wrong. This is the API's own, from [`REPLY_401`].
-#[test]
-fn the_body_is_what_follows_the_headers() {
-    let reply = Reply::from_bytes(REPLY_401);
-
-    assert_eq!(reply.body(), br#"{"error":"Unauthorized"}"#);
+    assert_eq!(reply.body(), BODY_401);
     assert_eq!(render(&logged(reply.body())), r#"{"error":"Unauthorized"}"#);
 }
 
-/// A reply with no blank line has no body yet, which is not the same as a reply with an empty one.
-/// Both log as "(no body)" here, and the reason is in [`logged`]: the body is the only thing the
-/// status line does not already say, so a guess about framing would be a guess about the only part
-/// that is not already known.
+/// A reply with no body logs as saying so, rather than as an empty line. By the time this crate is
+/// handed one, `edge-http` has already said where the body ended, so there is nothing here to guess
+/// at: an empty slice is a body of no bytes. The reason is in [`logged`] — the body is the only thing
+/// the status line does not already say.
 #[test]
-fn a_reply_with_no_blank_line_has_no_body() {
-    // The status line and nothing else, which is what the reader has the moment the line arrives.
-    let line_end = REPLY_401
-        .windows(2)
-        .position(|pair| pair == b"\r\n")
-        .expect("a status line")
-        + 2;
-    let just_the_line = &REPLY_401[..line_end];
-
-    assert!(status_line_arrived(just_the_line));
-    assert_eq!(Reply::from_bytes(just_the_line).body(), b"");
-
-    // An explicitly empty body, which is what a 204 or a 304 carries.
-    let empty = b"HTTP/1.1 204 No Content\r\n\r\n";
-    assert_eq!(Reply::from_bytes(empty).body(), b"");
-
+fn a_reply_with_no_body_logs_as_saying_so() {
+    assert_eq!(Reply::answered(204, b"").body(), b"");
     assert_eq!(render(&logged(b"")), "(no body)");
 }
 
@@ -514,10 +385,7 @@ fn printable_ascii_survives_logging() {
 /// the only answer that does.
 #[test]
 fn a_stored_event_is_recognized() {
-    assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 201 Created\r\n\r\n").verdict(),
-        Verdict::Stored,
-    );
+    assert_eq!(Reply::answered(201, b"").verdict(), Verdict::Stored,);
     assert_eq!(render(&Verdict::Stored), "the API stored the event");
 }
 
@@ -527,7 +395,7 @@ fn a_stored_event_is_recognized() {
 #[test]
 fn a_refusal_for_want_of_credentials_is_recognized() {
     assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 401 Unauthorized\r\n\r\n").verdict(),
+        Reply::answered(401, BODY_401).verdict(),
         Verdict::Unauthorized,
     );
     assert_eq!(
@@ -536,61 +404,13 @@ fn a_refusal_for_want_of_credentials_is_recognized() {
     );
 }
 
-/// A reply does not have to be only a status line: headers and a body follow it in the same buffer,
-/// and only the first line is read.
-#[test]
-fn a_status_line_is_read_out_of_whatever_follows_it() {
-    let whole = b"HTTP/1.1 201 Created\r\n\
-                  Content-Type: application/json\r\n\
-                  Content-Length: 11\r\n\
-                  \r\n\
-                  {\"ok\":true}";
-    assert_eq!(Reply::from_bytes(whole).verdict(), Verdict::Stored);
-}
-
-/// Something that is not a status line is the captive-portal case: on a network with a login page,
-/// the first fifteen bytes of the answer are a `<!DOCTYPE`. These are all whole replies — every one of
-/// them has bytes and none of them has a status line in them — and they must not be confused with a
-/// reply that has not finished arriving, which is [`Verdict`]'s problem and not this one's.
-#[test]
-fn something_that_is_not_a_status_line_is_reported_as_such() {
-    let not_status_lines: [&[u8]; 6] = [
-        b"<!DOCTYPE html>\r\n\r\n<html>",
-        b"HTTP/1.1\r\n\r\n",
-        b"HTTP/1.1 20x Created\r\n\r\n",
-        // Four digits, which is a length or a version rather than a status code.
-        b"HTTP/1.1 2011 Created\r\n\r\n",
-        b"{\"ok\":true}",
-        b"  HTTP/1.1 401 Unauthorized\r\n\r\n",
-    ];
-
-    for line in not_status_lines {
-        assert_eq!(
-            Reply::from_bytes(line).verdict(),
-            Verdict::NotTheApi,
-            "{line:?}",
-        );
-    }
-
-    assert_eq!(
-        render(&Verdict::NotTheApi),
-        "what answered was not the API: the first line was not a status line",
-    );
-}
-
 /// Every other status is named as a number rather than guessed at, because a status this firmware
 /// does not know is a status somebody has to go and read about.
 #[test]
 fn an_unnamed_status_is_reported_as_the_number_it_is() {
     for status in [200u16, 204, 301, 404, 429, 500, 503] {
-        let reply = format!(
-            "HTTP/1.1 {status} Something
-
-"
-        );
-
         assert_eq!(
-            Reply::from_bytes(reply.as_bytes()).verdict(),
+            Reply::answered(status, b"").verdict(),
             Verdict::Unexpected(status),
             "{status}",
         );

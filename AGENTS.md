@@ -215,20 +215,37 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   version half-closed the connection itself before reading, which left the socket in a state the
   next `connect` tolerated, and **nothing shorter than two intervals can show this class of bug at
   all** — one exchange has to succeed before a second can fail.
+- **`edge-http` is reached through `RequestHeaders`/`ResponseHeaders`, not through its
+  `Connection`.** Its `io::client::Connection` state machine calls `connect` itself, which would
+  take the handshake away from `src/tls.rs` — and that handshake is what owns the 20-second budget
+  and the `the API's certificate verified: …` line, which are the only evidence in this repository
+  that the certificate was checked rather than merely received. So `src/report.rs` uses the
+  lower-level pieces over the `Stream` that `crate::tls::open` returns, and `src/tls.rs` is
+  unchanged by any of this. Two things about those pieces are not negotiable: `Headers::set`
+  **panics** with `No space left` rather than returning an error, so `HEADERS` in `src/report.rs` is
+  a promise the compiler does not check (it is 8 for 4 sent, leaving room for the `Authorization`
+  header that is next), and `Headers::set_content_len` needs a `heapless::String<20>` that must
+  outlive the header borrowing from it.
 - **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
   closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
   as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
-  so `once` reads first and closes afterwards. Close on **both** paths: `MbedTLS` warns on a session
-  dropped while still open, and a warning on every failed exchange would be a warning about the
-  reporting rather than about the failure.
-- **A reply is not a read.** `stream.read` returns whatever has arrived, which is not the same thing
-  as a whole HTTP reply: the 401 this API sends is 650 bytes against a 25-byte status line, and
-  nothing in TCP promises where the boundary falls. So `read_reply` loops and asks
-  `poc_report::status_line_arrived` before it judges anything. **Reading once and parsing that was
-  the bug that produced "what answered was not the API" against a working API** — the read had
-  landed inside the status line, and the first eleven bytes of a valid `401` (`HTTP/1.1 40`) parse
-  as no status at all. `tests/report_api.rs` pins it against a captured real reply, one byte at a
-  time. Anything that parses a reply needs the same question asked first.
+  so `exchange` reads first and closes afterwards. Close on **every** path: `MbedTLS` warns on a
+  session dropped while still open, and a warning on every failed exchange would be a warning about
+  the reporting rather than about the failure. The `Body` reader is scoped so it is gone before
+  `close` needs the stream it borrows.
+- **A reply is not a read, and that is now `edge-http`'s problem rather than ours.** `stream.read`
+  returns whatever has arrived, which is not the same thing as a whole HTTP reply: the 401 this API
+  sends is 650 bytes against a 25-byte status line, and nothing in TCP promises where the boundary
+  falls. **Reading once and parsing that was the bug that produced "what answered was not the API"
+  against a working API** — the read had landed inside the status line, and the first eleven bytes
+  of a valid `401` (`HTTP/1.1 40`) parse as no status at all. This firmware used to own the loop and
+  the predicate, and `tests/report_api.rs` pinned it against a captured real reply one byte at a
+  time; both are gone. `exchange` now calls `ResponseHeaders::receive` with **`exact = false`**,
+  which is the load-bearing argument: `true` takes the head one byte at a time looking for
+  `\r\n\r\n`, and `false` reads in bulk and re-parses, which is what makes a reply that arrives in
+  pieces a reply. **Reinstating a hand-written read loop over a raw `read` would reintroduce the
+  bug**, and the test that caught it went with the code it was testing, so nothing here would
+  notice.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled
@@ -303,8 +320,11 @@ part of the reasoning; read them before changing what reads what.
   hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
   SNTP header, the whole of the state line — its wording, its order, and the encoding each state is
   published in for another task to read — and the whole of what goes on the wire when that line is
-  reported: the JSON body and its escaping, the timestamp's format, the request head, and the
-  reading of a status line.
+  reported: the JSON body and its escaping, the timestamp's format, and the sentence each status
+  maps to. **The HTTP framing is the exception and went the other way:** the request head, the
+  read-until-whole loop, and the status-line parser were here once, are `edge-http`'s now, and took
+  about a dozen tests with them. So this bullet is no longer "everything on the wire is here" and
+  should not be read that way: what is here is what the _API_ means, not how HTTP is spelled.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

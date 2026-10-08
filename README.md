@@ -99,6 +99,19 @@ beside it is one of the named cases. The body is the API's own explanation, whic
 only thing that says _which_ field was wrong — and it is left out for a `201`, whose body is eleven
 bytes saying `ok`, every five minutes, forever.
 
+#### What is `edge-http` and what is not
+
+The HTTP itself is a library's job, and it is [`edge-http`](https://crates.io/crates/edge-http) —
+the same author's crate as the `edge-nal` pieces below it, speaking the same socket, so it layers on
+rather than beside. `src/report.rs` builds a request head, writes it, writes the body, and reads
+back a response head and a body. What it still owns is everything a general-purpose client cannot
+know: which host and path this build reports to, which four headers go out and why each is there,
+and what to say about what came back.
+
+That last part is the point of the three lines above, and it is what remains host-tested. What is no
+longer tested here is the framing — see
+[what the tests do and do not cover](#what-the-tests-do-and-do-not-cover) for what that cost.
+
 #### What the API's certificate is checked against
 
 TLS needs one certificate the firmware trusts before it believes any other, and here that is ISRG
@@ -515,7 +528,8 @@ Two test steps, and the difference between them is the whole story:
 - `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
   that decides rather than talks to hardware: how an address and a time are written, what a failed
   join says, what an SNTP packet means, what the radio is doing, what the line the firmware prints
-  twice a second reads, and what goes on the wire when that line is reported to an API.
+  twice a second reads, and what the body of a reported event says and what an answer from the API
+  means.
 
 The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
 `src/tls.rs`, `src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack,
@@ -533,10 +547,23 @@ a `Status` in `poc-report`, so its wording, its order and the decision of when a
 are all checked on the host. What publishes the state — the radio writing a word another task reads,
 and the clock remembering which server set it and when — is the same encoding, so the words and the
 values they stand for cannot drift apart. The reported event is the same story one step further out:
-the JSON body, the timestamp's format, the request head with its CRLF lines, and the reading of a
-status line are all checked on the host, including the case that matters most here — a reply that is
-not a status line at all, which is what a network with a login portal sends. None of it can check
-that the value published is the one the radio meant: that is still only knowable from the board.
+the JSON body, the timestamp's format, and the sentence each status maps to are all checked on the
+host, including the two cases where there is no status at all — nothing came back, and something
+that was not the API answered, which is what a network with a login portal sends. None of it can
+check that the value published is the one the radio meant: that is still only knowable from the
+board.
+
+**What is no longer tested here, and why.** This crate used to hold the HTTP framing: the request
+head with its CRLF lines, a predicate for whether a status line had arrived whole, and a parser for
+the status line itself. That was where the read-boundary bug lived — reading a reply once and
+judging whatever arrived, so a read landing inside the 25-byte status line of a 650-byte reply
+reported "what answered was not the API" for a reply the API had sent correctly — and where the test
+that caught it was. All of it is [`edge-http`](https://crates.io/crates/edge-http)'s now:
+`src/report.rs` builds a `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a
+`Body`, and what reaches this crate is a number, a body, or the fact that neither came. That is
+roughly a dozen fewer host tests, traded for not maintaining a parser of the most fiddly protocol in
+the tree. The mapping from a number to a sentence — which is what a reader of the log actually sees
+— is still here and still checked.
 
 ## The gate
 
@@ -553,29 +580,29 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
-| Path                                | Owns                                                                        |
-| ----------------------------------- | --------------------------------------------------------------------------- |
-| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it           |
-| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing               |
-| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer       |
-| `src/clock.rs`                      | the one number that says what time it is, and where it came from            |
-| `src/status.rs`                     | the three answers the state line is made of                                 |
-| `src/tls.rs`                        | what the API's certificate is checked against, and the handshake            |
-| `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and read the reply |
-| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs               |
-| `certs/`                            | the one root this firmware trusts, and where it came from                   |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests               |
-| `build.rs`                          | linker scripts, and what to do about each undefined symbol                  |
-| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy      |
-| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces         |
-| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build               |
-| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see           |
-| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags        |
-| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked             |
-| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design      |
-| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                            |
-| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                     |
-| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it     |
+| Path                                | Owns                                                                          |
+| ----------------------------------- | ----------------------------------------------------------------------------- |
+| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it             |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing                 |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer         |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from              |
+| `src/status.rs`                     | the three answers the state line is made of                                   |
+| `src/tls.rs`                        | what the API's certificate is checked against, and the handshake              |
+| `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and say what it said |
+| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs                 |
+| `certs/`                            | the one root this firmware trusts, and where it came from                     |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests                 |
+| `build.rs`                          | linker scripts, and what to do about each undefined symbol                    |
+| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy        |
+| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces           |
+| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build                 |
+| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see             |
+| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags          |
+| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked               |
+| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design        |
+| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                              |
+| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                       |
+| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it       |
 
 ## Regenerating
 

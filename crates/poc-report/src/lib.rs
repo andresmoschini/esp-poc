@@ -20,9 +20,11 @@
 //! - What the line the firmware prints twice a second reads, and whether the time on it is real.
 //!   That line is the whole of what this repository says about itself to whoever is reading it, and
 //!   it was assembled from three `format!`s in a generated file.
-//! - What the body of a reported event looks like, and what an answer from the API means. The bytes
-//!   of an HTTP request are the same kind of thing as the bytes of an SNTP header: right in the
-//!   common case, wrong in the detail nobody reads, and impossible to check on a board.
+//! - What the body of a reported event looks like, and what an answer from the API means. The body is
+//!   JSON written by hand and an answer is untrusted bytes off the network: right in the common case,
+//!   wrong in the detail nobody reads, and impossible to check on a board. **The HTTP framing around
+//!   both is not here** — `edge-http` writes the request and parses the reply in `src/report.rs`, and
+//!   what arrives here is a status code and a body rather than a buffer to parse.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
@@ -1293,7 +1295,7 @@ impl fmt::Display for Timestamp {
 
 /// What a reply from the API is: the number it said, what that means, and the body it said it in.
 ///
-/// One type rather than a bare [`Verdict`] because the three are three answers to one parse and the
+/// One type rather than a bare [`Verdict`] because the three are three answers to one read and the
 /// caller wants all three. The status code is the most concrete fact a reply carries and a verdict
 /// alone throws it away for every case it has a name for; the body is the API's own explanation, and
 /// on a 400 it is the only thing that says *which* field was wrong.
@@ -1301,79 +1303,101 @@ impl fmt::Display for Timestamp {
 /// The bytes are borrowed, not decoded: nothing here parses the body. Deciding is [`Verdict`]'s job
 /// and the status line is enough for it, but logging is a different question, and for logging the
 /// body is text a person reads. See [`logged`].
+///
+/// Constructed rather than parsed, which is the shape this had when it read bytes off a socket and
+/// found the status line in them. **It does not parse anything any more.** `edge-http` does that —
+/// see `src/report.rs` — and this type is what its answer looks like once it has one: a number, a
+/// body, or the fact that neither arrived. Three constructors rather than one parse, because each
+/// of the three is a different event and saying which one happened is the whole value here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply<'a> {
-    /// The three digits of the status code, or `None` when the first line was not a status line.
+    /// The three digits of the status code, or `None` when no status line was read.
     status: Option<u16>,
 
     /// What the status line means.
     verdict: Verdict,
 
-    /// Everything after the first blank line, which is where a body is.
+    /// Everything after the blank line, which is where a body is.
     body: &'a [u8],
 }
 
 impl<'a> Reply<'a> {
-    /// A reply, from the bytes that have arrived.
+    /// A reply that carried a status line, and whatever followed it.
     ///
-    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
-    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
-    /// pass it a line it has not finished collecting. See [`status_line_arrived`].
+    /// `body` is empty rather than guessed when nothing followed: a 401 with no body and a 401 whose
+    /// body has not arrived yet are the same thing to log, and both are better described by what the
+    /// status line says than by a guess about the framing.
     #[must_use]
-    pub fn from_bytes(bytes: &'a [u8]) -> Self {
-        let Some(line) = first_line(bytes) else {
-            return Self {
-                status: None,
-                verdict: Verdict::NothingCameBack,
-                body: &[],
-            };
-        };
-
-        let status = status_code(line);
-
-        // The body is what follows the first blank line, and an empty slice when there is not one —
-        // a 401 with no body and a 401 whose body has not arrived yet are the same thing to log, and
-        // both are better described by what the status line says than by a guess about the framing.
-        let body = bytes
-            .windows(4)
-            .position(|blank| blank == b"\r\n\r\n")
-            .map_or(&[][..], |blank| &bytes[blank + 4..]);
-
+    pub const fn answered(status: u16, body: &'a [u8]) -> Self {
         Self {
-            status,
-            verdict: match status {
-                Some(201) => Verdict::Stored,
-                Some(400) => Verdict::Malformed,
-                Some(401) => Verdict::Unauthorized,
-                Some(405) => Verdict::NotAllowed,
-                Some(other) => Verdict::Unexpected(other),
-                None => Verdict::NotTheApi,
-            },
+            status: Some(status),
+            verdict: verdict_of(status),
             body,
+        }
+    }
+
+    /// Something answered, and it was not the API: no status line was in what came back.
+    ///
+    /// A captive portal is the usual one, and a board on a hotel network is exactly where that
+    /// happens. Distinct from [`Self::nothing_came_back`] because the two have nothing in common
+    /// beyond "this did not work": one means something answered and it was the wrong thing, the other
+    /// means nothing answered.
+    #[must_use]
+    pub const fn not_the_api() -> Self {
+        Self {
+            status: None,
+            verdict: Verdict::NotTheApi,
+            body: &[],
+        }
+    }
+
+    /// The connection produced no bytes at all.
+    #[must_use]
+    pub const fn nothing_came_back() -> Self {
+        Self {
+            status: None,
+            verdict: Verdict::NothingCameBack,
+            body: &[],
         }
     }
 
     /// What the reply meant, in words.
     #[must_use]
-    pub fn verdict(&self) -> Verdict {
+    pub const fn verdict(&self) -> Verdict {
         self.verdict
     }
 
-    /// The status code, or `None` when the first line was not a status line.
+    /// The status code, or `None` when no status line was read.
     ///
     /// `Option` and not a number, because a reply that is not HTTP has no status and inventing one —
-    /// a zero, say — is exactly the guess this module exists to refuse. A reader of a log that sees
+    /// a zero, say — is exactly the guess this crate exists to refuse. A reader of a log that sees
     /// no number is being told the truth; one that sees `0` would go and read the API's
     /// documentation about status zero.
     #[must_use]
-    pub fn status(&self) -> Option<u16> {
+    pub const fn status(&self) -> Option<u16> {
         self.status
     }
 
     /// The bytes after the headers, for [`logged`].
     #[must_use]
-    pub fn body(&self) -> &'a [u8] {
+    pub const fn body(&self) -> &'a [u8] {
         self.body
+    }
+}
+
+/// What one status code means.
+///
+/// A function rather than something folded into [`Reply`] so that the mapping is one list rather than
+/// one list per constructor: there are three ways to build a [`Reply`] and one set of statuses, and a
+/// status that meant two different things depending on which constructor was used would be a bug
+/// nobody would look for.
+const fn verdict_of(status: u16) -> Verdict {
+    match status {
+        201 => Verdict::Stored,
+        400 => Verdict::Malformed,
+        401 => Verdict::Unauthorized,
+        405 => Verdict::NotAllowed,
+        other => Verdict::Unexpected(other),
     }
 }
 
@@ -1487,22 +1511,6 @@ pub enum Verdict {
     NothingCameBack,
 }
 
-/// Whether a reply has a whole first line in it yet.
-///
-/// The reader's question before it judges anything, and the reason [`Reply::from_bytes`] cannot be
-/// asked sooner: a first line that has half arrived cannot be told apart from one that is wrong.
-/// Measured on the real 401 this API sends, the first eleven bytes of it are `HTTP/1.1 40` — a
-/// truncated status line, a line with no status in it, and a line that looks like a nonsense reply.
-/// All three at once, and nothing in the bytes says which.
-///
-/// So a caller that judges a reply before this is true has to guess, and the guess is the expensive
-/// one: it blames something that was not the API for a reply the API had already sent, which is
-/// exactly what this firmware did until the read loop started asking.
-#[must_use]
-pub fn status_line_arrived(reply: &[u8]) -> bool {
-    reply.windows(2).any(|pair| pair == b"\r\n")
-}
-
 impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1527,119 +1535,5 @@ impl fmt::Display for Verdict {
                 f.write_str("nothing came back: the connection closed silently")
             }
         }
-    }
-}
-
-/// The first line of a reply, or `None` when there are no bytes at all.
-///
-/// `None` and not an empty slice, because "a line that arrived as nothing" and "a line that is not a
-/// status line" are different problems and this is where they are told apart. An empty read is a
-/// server that closed without answering; a portal's login page is a thousand bytes that do not start
-/// with a version number.
-///
-/// The line runs to the first `CRLF`, and a reply with no `CRLF` in it at all yields everything there
-/// is. That last case is the caller asking too early, which [`status_line_arrived`] exists to stop
-/// them doing; it yields the whole buffer rather than nothing, because a caller who got here anyway is
-/// better served by a sentence about a reply this firmware does not recognize than by one about
-/// silence.
-fn first_line(reply: &[u8]) -> Option<&[u8]> {
-    if reply.is_empty() {
-        return None;
-    }
-
-    let end = reply.windows(2).position(|pair| pair == b"\r\n");
-
-    Some(&reply[..end.unwrap_or(reply.len())])
-}
-
-/// The three digits of a status code, from the first line of a reply.
-///
-/// Reads the code rather than the reason phrase, because the phrase is prose that a server may
-/// change and the code is the part of the line that means something. Everything after the three
-/// digits is ignored, so a reason phrase that is missing or one this firmware has never seen does not
-/// change what the code was.
-///
-/// `None` for anything that is not `HTTP/x.y NNN`, which is what makes [`Verdict::NotTheApi`]
-/// reachable at all — a portal's login page is HTML, and the first fifteen bytes of it are a
-/// `<!DOCTYPE` that is not a version number.
-fn status_code(line: &[u8]) -> Option<u16> {
-    let after_version = line.strip_prefix(b"HTTP/")?;
-    // The version and its single digit, then the space. `strip_prefix` and a search for the space
-    // rather than `split_once`, which is still unstable for slices on the pinned toolchain — and a
-    // hand-rolled one would be the third spelling of the same two operations in this crate.
-    let space = after_version.iter().position(u8::is_ascii_whitespace)?;
-    let after_space = after_version.get(space + 1..)?;
-    let digits = after_space.get(..3)?;
-
-    if !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    // A space or the end of the buffer after the code, so that `HTTP/1.1 2011 Created` is not read
-    // as 201: a four-digit field is not a status code, and a parser that takes the first three
-    // digits of it is reading a length or a version that happens to be next door.
-    match after_space.get(3) {
-        None | Some(b' ') => {}
-        Some(_) => return None,
-    }
-
-    // The digits as text rather than accumulated as a number, so that a line saying `HTTP/1.1 20`
-    // or `HTTP/1.1 2011` is refused instead of read as 20 or 201: the code is three digits, and a
-    // parser that takes what it finds would make a length or a version out of the field next to it.
-    let digits = core::str::from_utf8(digits).ok()?;
-
-    digits.parse().ok()
-}
-
-/// The bytes of one HTTP request, head and body, as they go on the wire.
-///
-/// A `Display` rather than something that writes into a buffer this crate owns, because this crate
-/// does not know how big the request is: the body carries a [`Status`], whose length depends on the
-/// address DHCP handed out and on how long the sentence about the radio is. The firmware writes it
-/// into a buffer it sized, and if the buffer is too small that is a fact about the buffer rather than
-/// about the request.
-///
-/// `content_length` is a parameter rather than something derived, for the same reason: it is the
-/// number of bytes of body that were written, and the caller is the only thing that knows it. The
-/// head cannot be built without it, which is why the body goes first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Request<'a> {
-    /// The host to send to, which is what the `Host` header carries.
-    ///
-    /// The name and not the address: `embassy-net` resolves it, and an HTTP client that sent the
-    /// resolved address in this header would produce a request a server may refuse and a log that
-    /// cannot be read against the name somebody typed.
-    pub host: &'a str,
-
-    /// The path, which is [`EVENTS_PATH`] for this exchange.
-    pub path: &'a str,
-
-    /// How many bytes of body follow the head.
-    pub content_length: usize,
-}
-
-impl fmt::Display for Request<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // CRLF and not `\n`, because this is HTTP/1.1 and not a text file: a server is entitled to
-        // refuse a request whose lines end in a bare newline, and "entitled to" is the whole reason
-        // this is written down rather than left to whatever the format string felt like.
-        //
-        // `Content-Length` is here rather than a `Transfer-Encoding` because the body was written
-        // into a buffer before any of this was: its length is known without counting the bytes as
-        // they go past, which is what a chunked request would need.
-        //
-        // `Connection: close` because this client reads the answer and does nothing else with the
-        // connection. Without it the server may hold the socket open and the read above waits for
-        // bytes that are not coming, which is a timeout on every single report rather than once.
-        write!(
-            f,
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            self.path, self.host, self.content_length,
-        )
     }
 }

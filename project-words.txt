@@ -56,8 +56,10 @@ dhcp
 dhcpv4
 heapless
 hinnant
+httparse
 ntp
 rssi
+smol
 smoltcp
 sntp
 
