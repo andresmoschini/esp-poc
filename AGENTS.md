@@ -318,17 +318,17 @@ part of the reasoning; read them before changing what reads what.
   to hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run
   it on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when
   it is worth testing, and expect it not to be there** — logic that needs the radio stays in
-  `src/wifi.rs` untested, logic that needs a socket or a clock stays in `src/ntp.rs` untested, logic
-  that needs a TCP connection stays in `src/report.rs` untested, and logic that needs a certificate
-  to be trusted stays in `src/tls.rs` untested, because moving any of them would mean moving the
-  hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
-  SNTP header, the whole of the state line — its wording and its order — and the whole of what goes
-  on the wire when that line is reported: the JSON body and the alphabet its sentences stay inside,
-  and the timestamp's format. What an answer means is not here: a status code is reported as the
-  number it is. **The HTTP framing is the exception and went the other way:** the request head, the
-  read-until-whole loop, and the status-line parser were here once, are `edge-http`'s now, and took
-  about a dozen tests with them. So this bullet is no longer "everything on the wire is here" and
-  should not be read that way: what is here is what the _API_ means, not how HTTP is spelled.
+  `src/wifi.rs` untested, the state line stays in `src/status.rs` untested, logic that needs a
+  socket or a clock stays in `src/ntp.rs` untested, logic that needs a TCP connection stays in
+  `src/report.rs` untested, and logic that needs a certificate to be trusted stays in `src/tls.rs`
+  untested, because moving any of them would mean moving the hardware it is about. What has moved
+  out is what none of them needs: the calendar arithmetic, the SNTP header, and the whole of what
+  goes on the wire when that line is reported: the JSON body and the alphabet its sentences stay
+  inside, and the timestamp's format. What an answer means is not here: a status code is reported as
+  the number it is. **The HTTP framing is the exception and went the other way:** the request head,
+  the read-until-whole loop, and the status-line parser were here once, are `edge-http`'s now, and
+  took about a dozen tests with them. So this bullet is no longer "everything on the wire is here"
+  and should not be read that way: what is here is what the _API_ means, not how HTTP is spelled.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

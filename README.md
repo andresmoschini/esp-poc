@@ -23,16 +23,16 @@ gate can check rather than things assembled next to the printer.
 
 It also says when something is wrong, and what:
 
-| What the line says                                                            | What it means                                                             |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `00:00:42 (counting from boot: nothing has answered yet)`                     | no server has answered yet                                                |
-| `00:01:03 (counting from boot: the time server's answer did not arrive)`      | the last attempt, and the step of it that failed                          |
-| `1791138151 UTC (from a stratum 2 server, last confirmed 3900s ago)`          | a real time, from a server, and nobody has confirmed it since             |
-| `wifi: joined`                                                                | the station is on the network                                             |
-| `wifi: joining`                                                               | an attempt is in progress or due                                          |
-| `wifi: not joined: nothing with that name was heard (signal -81 dBm)`         | the last failure, in words and with the signal that separates two of them |
-| `wifi: not joined: the handshake started and did not finish (signal -55 dBm)` | the radio ran out of time mid-handshake and did not say why               |
-| `wifi: nothing to join: no credentials were compiled in`                      | a build with no `WIFI_SSID`, which is what the gate and CI are            |
+| What the line says                                                       | What it means                                                  |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| `00:00:42 (counting from boot: nothing has answered yet)`                | no server has answered yet                                     |
+| `00:01:03 (counting from boot: the time server's answer did not arrive)` | the last attempt, and the step of it that failed               |
+| `1791138151 UTC (from a stratum 2 server, last confirmed 3900s ago)`     | a real time, from a server, and nobody has confirmed it since  |
+| `wifi: joined`                                                           | the station is on the network                                  |
+| `wifi: joining`                                                          | an attempt is in progress or due                               |
+| `wifi: not joined: NoAccessPointFound (signal -81 dBm)`                  | the last failure, in the driver's own words, with the signal   |
+| `wifi: not joined: FourWayHandshakeTimeout (signal -55 dBm)`             | the radio ran out of time mid-handshake and did not say why    |
+| `wifi: nothing to join: no credentials were compiled in`                 | a build with no `WIFI_SSID`, which is what the gate and CI are |
 
 The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
 clock, so before that the greeting prints how long it has been running since boot, wrapped into a
@@ -420,15 +420,16 @@ eleven attempts over ninety seconds, every one at a strong signal, and four diff
 between:
 
 ```text
-[ERROR] could not join my-network: the handshake started and did not finish (signal -55 dBm) (FourWayHandshakeTimeout)
-[ERROR] could not join my-network: the network stopped answering partway through (signal -60 dBm) (AuthenticationExpired)
-[ERROR] could not join my-network: the link came up and then went down (signal -60 dBm) (DisassociatedDueToInactivity)
+[ERROR] could not join my-network: FourWayHandshakeTimeout (signal -55 dBm)
+[ERROR] could not join my-network: AuthenticationExpired (signal -60 dBm)
+[ERROR] could not join my-network: DisassociatedDueToInactivity (signal -60 dBm)
 ```
 
-The first of those was the firmware claiming more than the radio told it, and it is now fixed: it
-used to print `the network refused these credentials` for a handshake that ran out of time, and now
-prints what the driver reported. What can be said about that run is that the network was heard at a
-usable signal and the join did not complete — a much weaker claim, and the only one the radio
+The first of those used to be the firmware claiming more than the radio told it: it printed
+`the network refused these credentials` for a handshake that ran out of time, and then
+`the handshake started and did not finish` as its own grouping. Both wordings are gone, and what is
+printed is what the driver reported. What can be said about that run is that the network was heard
+at a usable signal and the join did not complete — a much weaker claim, and the only one the radio
 supported.
 
 The later failures came with a falling signal, from -57 down to -70 dBm, which is a different thing
@@ -443,9 +444,9 @@ from 520,768 is MbedTLS and the certificate.
 
 ```text
 [INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
-[INFO ] the clock is set to 2026-10-07 17:57:09 UTC by a stratum 3 server  (src/ntp.rs:146)
+[INFO ] the clock is set to 1791395829 UTC by a stratum 3 server             (src/ntp.rs:146)
 [INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
-[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[WARN ] the API did not store the event: 401
 [INFO ] the API said: {"error":"Unauthorized"}
 ```
 
@@ -453,7 +454,7 @@ and then, five minutes later, the same three lines again:
 
 ```text
 [INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
-[WARN ] the API did not store the event: 401 the API refused the event: no credentials were sent with it
+[WARN ] the API did not store the event: 401
 [INFO ] the API said: {"error":"Unauthorized"}
 ```
 
@@ -528,10 +529,8 @@ Two test steps, and the difference between them is the whole story:
 
 - `test` runs the tests of this repository's own automation, in Node.
 - `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
-  that decides rather than talks to hardware: how an address and a time are written, what a failed
-  join says, what an SNTP packet means, what the radio is doing, what the line the firmware prints
-  twice a second reads, and what the body of a reported event says and what an answer from the API
-  means.
+  that decides rather than talks to hardware: how an address and a time are written, what an SNTP
+  packet means, and what the body of a reported event says.
 
 The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
 `src/tls.rs`, `src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack,
@@ -545,18 +544,20 @@ whether the chain leads to ISRG are decisions `MbedTLS` makes, and the one thing
 says about them is the log line and the run above.
 
 What that buys, and what it does not, is worth being specific about. The line the firmware prints is
-a `Status` in `poc-report`, so its wording, its order and the decision of when a time has gone stale
-are all checked on the host. What publishes the state — the radio's `Link` and the clock's last
-failure, each behind a lock another task takes to read — is the value itself rather than an encoding
-of it, so there is no second representation for the words to drift apart from. The round trips
-through those words used to be checked here too and are gone with the encoding: a lock holding the
-value cannot hand back a word that means something else. The reported event is the same story one
-step further out: the JSON body, the timestamp's format, and the alphabet every sentence stays
-inside are all checked on the host, plus the one test that keeps every sentence quotable without
-escaping. What an answer means is deliberately not checked: a status code is reported as the number
-it is, because a mapping from numbers to sentences goes stale the day a status changes what it
-means. None of it can check that the value published is the one the radio meant: that is still only
-knowable from the board.
+assembled in `src/status.rs` from three answers — the time in `poc-report`, the radio's state in
+`src/wifi.rs`, the address from the stack — and only the first is checked on the host. What
+publishes the state — the radio's `Link` and the clock's last failure, each behind a lock another
+task takes to read — is the value itself rather than an encoding of it, so there is no second
+representation for the words to drift apart from. The round trips through those words used to be
+checked here too and are gone with the encoding: a lock holding the value cannot hand back a word
+that means something else. What the radio says about a failed join is the driver's own words now,
+carried as-is, and the order of the line lives next to the stack it is read from: a test on either
+needs a board. The reported event is the same story one step further out: the JSON body, the
+timestamp's format, and the alphabet every sentence stays inside are all checked on the host, plus
+the one test that keeps every sentence quotable without escaping. What an answer means is
+deliberately not checked: a status code is reported as the number it is, because a mapping from
+numbers to sentences goes stale the day a status changes what it means. None of it can check that
+the value published is the one the radio meant: that is still only knowable from the board.
 
 **What is no longer tested here, and why.** This crate used to hold the HTTP framing: the request
 head with its CRLF lines, a predicate for whether a status line had arrived whole, and a parser for
@@ -565,10 +566,9 @@ judging whatever arrived, so a read landing inside the 25-byte status line of a 
 reported "what answered was not the API" for a reply the API had sent correctly — and where the test
 that caught it was. All of it is [`edge-http`](https://crates.io/crates/edge-http)'s now:
 `src/report.rs` builds a `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a
-`Body`, and what reaches this crate is a number, a body, or the fact that neither came. That is
-roughly a dozen fewer host tests, traded for not maintaining a parser of the most fiddly protocol in
-the tree. The mapping from a number to a sentence — which is what a reader of the log actually sees
-— is still here and still checked.
+`Body`, and what is logged there is a status code and a body. That is roughly a dozen fewer host
+tests, traded for not maintaining a parser of the most fiddly protocol in the tree — and the mapping
+from a number to a sentence went the same way after it, traded for a log line that cannot go stale.
 
 ## The gate
 
@@ -585,29 +585,29 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
-| Path                                | Owns                                                                          |
-| ----------------------------------- | ----------------------------------------------------------------------------- |
-| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it             |
-| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing                 |
-| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer         |
-| `src/clock.rs`                      | the one number that says what time it is, and where it came from              |
-| `src/status.rs`                     | the three answers the state line is made of                                   |
-| `src/tls.rs`                        | what the API's certificate is checked against, and the handshake              |
-| `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and say what it said |
-| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs                 |
-| `certs/`                            | the one root this firmware trusts, and where it came from                     |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests                 |
-| `build.rs`                          | linker scripts, and what to do about each undefined symbol                    |
-| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy        |
-| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces           |
-| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build                 |
-| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see             |
-| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags          |
-| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked               |
-| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design        |
-| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                              |
-| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                       |
-| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it       |
+| Path                                | Owns                                                                            |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it               |
+| `src/wifi.rs`                       | join a network over DHCP, and publish what the radio is doing, in its own words |
+| `src/ntp.rs`                        | the SNTP client: ask a time server, and set the clock from the answer           |
+| `src/clock.rs`                      | the one number that says what time it is, and where it came from                |
+| `src/status.rs`                     | the state line: the three answers it is made of, and the order they print in    |
+| `src/tls.rs`                        | what the API's certificate is checked against, and the handshake                |
+| `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and say what it said   |
+| `src/lib.rs`                        | the crate root, and which nightly features the firmware needs                   |
+| `certs/`                            | the one root this firmware trusts, and where it came from                       |
+| `crates/poc-report/`                | what the firmware decides and says — the only part with tests                   |
+| `build.rs`                          | linker scripts, and what to do about each undefined symbol                      |
+| `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy          |
+| `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces             |
+| `tools/lib/chip.mjs`                | which chip is which feature and triple, for the gate to build                   |
+| `tools/lib/hooks.mjs`               | whether Git will run the hooks at all, which nothing else can see               |
+| `.cargo/config.toml`                | the default chip target, both `espflash` runners, the `-Z` rustflags            |
+| `.cargo/esp-config.toml`            | the build-time configuration: log filter and which API, tracked                 |
+| `.cargo/local.toml`                 | yours: the Wi-Fi credentials and any API override, untracked by design          |
+| `cspell.jsonc`, `project-words.txt` | the spell checker's dictionaries                                                |
+| `.claude/git-hooks/`                | the gate and commitlint, run before a commit is created                         |
+| `.opencode/plugins/`                | what installs those hooks from a session, and stamps the commit with it         |
 
 ## Regenerating
 

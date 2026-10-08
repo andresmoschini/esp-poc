@@ -217,6 +217,14 @@ const BODY_REPLY_LEN: usize = 256;
 /// matched on rather than read.
 const ID_LEN: usize = 32;
 
+/// How many bytes of state line to build.
+///
+/// 256, comfortably over the longest line this firmware can produce: a clock counting from boot
+/// with a failure to explain, an address, and a failed join with a signal in it. The line is
+/// rendered before the event because the payload is what the chip would have printed, and a line
+/// that does not fit is a report that is not sent.
+const STATUS_LEN: usize = 256;
+
 /// Starts reporting, and returns once the task is spawned.
 ///
 /// Nothing is returned and nothing is waited for: the whole reporter is one task, spawned from `main`
@@ -297,13 +305,20 @@ async fn once(
     // report carries has to be the state at the moment it is stamped.
     let state = status::report(Some(stack));
 
+    // Rendered before the event because the payload is what the chip would have printed at that
+    // moment rather than the three fields behind it: three fields in a payload would be a second
+    // way of writing the same line, and the two would drift.
+    let Some(payload) = fill::<STATUS_LEN>(&state) else {
+        return;
+    };
+
     let id = write_id(esp_hal::efuse::base_mac_address());
 
     let event = Event {
         device_id: id.as_str(),
         timestamp_secs: now_secs(),
         event_type: EVENT_TELEMETRY,
-        status: &state,
+        payload: payload.as_str(),
     };
 
     // The body is built before the head because `Content-Length` is its length and the head goes

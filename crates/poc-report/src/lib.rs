@@ -1,25 +1,16 @@
 //! What the firmware decides for itself, decided here so that something can check it.
 //!
-//! Seven decisions live in this crate, and every one of them is one the firmware would otherwise get
+//! Four decisions live in this crate, and every one of them is one the firmware would otherwise get
 //! subtly wrong and nobody would notice until it mattered:
 //!
 //! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/wifi.rs`
 //!   both print one, and they used to be two pieces of formatting that could drift apart.
-//! - What a failed join says. The radio names about fifty reasons, and printing its own words for
-//!   them answers the question "what did the hardware say" rather than the question an operator is
-//!   asking, which is what to do next.
-//! - What the radio is doing, and the state published for the greeting. A link that is down is
-//!   something a reader of a serial log has to be told about, and it is something the radio knows
-//!   and the greeting does not.
 //! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
 //!   that cannot be checked by looking at it, and this is the only part of the firmware that knows
 //!   what day it is.
 //! - What an SNTP packet means, and what an attempt to get one came to when it did not. A packet
 //!   off the network is untrusted input, and a 48-byte header of offsets is exactly the sort of
 //!   thing that is right in the common case and wrong in 2036.
-//! - What the line the firmware prints twice a second reads, and whether the time on it is real.
-//!   That line is the whole of what this repository says about itself to whoever is reading it, and
-//!   it was assembled from three `format!`s in a generated file.
 //! - What the body of a reported event looks like. The body is JSON written by hand: right in the
 //!   common case, wrong in the detail nobody reads, and impossible to check on a board. What an
 //!   answer from the API means is deliberately not here — a status code is reported as the number
@@ -27,6 +18,11 @@
 //!   it means. **The HTTP framing around both is not here** — `edge-http` writes the request and
 //!   parses the reply in `src/report.rs`, and what is logged there is a status code and a body
 //!   rather than a buffer to parse.
+//!
+//! What the radio is doing is deliberately not here either: the reason a join failed is the driver's
+//! own words, carried as-is in `src/wifi.rs`, and the state line as a whole is assembled in
+//! `src/status.rs`. Both need the radio or the network stack, so neither can be compiled for a host
+//! at all — and a test on them needs a board.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
@@ -36,9 +32,9 @@
 //! and for the host alike, and `tests/report.rs`, `tests/status.rs` and `tests/ntp.rs` run on
 //! whichever machine is running the gate.
 //!
-//! It knows nothing about Wi-Fi or about the network stack. `esp_radio::wifi::DisconnectReason` is
-//! translated into a [`Reason`] in `src/wifi.rs`, and an SNTP packet is read in the firmware and
-//! handed here as bytes, so that a change in either driver costs that one file rather than this
+//! It knows nothing about Wi-Fi or about the network stack. A failed join carries the driver's own
+//! `esp_radio::wifi::DisconnectReason` in `src/wifi.rs`, and an SNTP packet is read in the firmware
+//! and handed here as bytes, so that a change in either driver costs that one file rather than this
 //! crate's API.
 
 #![no_std]
@@ -63,159 +59,6 @@ pub struct Address {
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.ip, self.prefix_len)
-    }
-}
-
-/// Why joining a network did not work, in as few words as the radio allows.
-///
-/// The four cases below are the ones that want four different things done about them; everything else
-/// the radio can report is [`Reason::Other`], which is a deliberate admission rather than a guess.
-/// A wrong guess here is worse than a missing one, because it sends whoever is reading the serial
-/// output after the wrong problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// Nothing with that name was heard.
-    ///
-    /// One of three things: the name is wrong, the network is not there, or the station is too far
-    /// from it to be answered. The scan printed alongside this failure is what tells those apart.
-    NoSuchNetwork,
-
-    /// The network was heard and refused how this station asked to join it.
-    ///
-    /// In practice the password, or a security type that WPA2 does not cover.
-    SecurityRefused,
-
-    /// The exchange started and the other end stopped answering.
-    ///
-    /// This is what a station too far from its access point looks like from its own side: strong
-    /// enough to hear a beacon, too weak to finish a handshake.
-    NoAnswer,
-
-    /// The handshake began and did not finish, and the radio does not say why.
-    ///
-    /// Its own variant rather than one of the two above because both of them would be a claim the
-    /// radio did not make. A four-way handshake that times out is the commonest symptom of a wrong
-    /// password, and it is also what a station just out of range looks like; `SecurityRefused` says
-    /// the network refused, and `NoAnswer` says it went away, and a timeout establishes neither. What
-    /// the radio reported is that the exchange started and stopped, so that is what this says.
-    ///
-    /// Observed on a board rather than reasoned about: an ESP32-C6 that never joined logged
-    /// `FourWayHandshakeTimeout` at -55 dBm, which is a strong signal and not a refused password.
-    HandshakeStalled,
-
-    /// The link came up and then went down.
-    LinkLost,
-
-    /// The radio reported something this firmware does not name.
-    Other,
-}
-
-impl fmt::Display for Reason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(write_reason(*self))
-    }
-}
-
-/// A join that failed, with the signal the radio last measured.
-///
-/// Named for the join rather than just "a failure", because [`Obstruction`] is the other failure in
-/// this crate and `Failure` alone stopped saying which of the two a use was talking about.
-///
-/// The signal is there because the two failures that look identical in the radio's own words are not
-/// identical to fix: a wrong password and a station too far away both arrive as an exchange that
-/// stops, and the dBm reading is what separates them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JoinFailure {
-    /// What went wrong.
-    pub reason: Reason,
-
-    /// How strong the signal was, in dBm, when the radio measured one.
-    pub signal: Option<i8>,
-}
-
-impl fmt::Display for JoinFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.signal {
-            Some(dbm) => write!(f, "{} (signal {dbm} dBm)", self.reason),
-            None => fmt::Display::fmt(&self.reason, f),
-        }
-    }
-}
-
-/// The sentence for a reason, on its own.
-///
-/// It is a function rather than an arm of the `Display` above so that adding a case to the enum stays
-/// one edit: [`JoinFailure`] reaches it for the arm that has no signal to add, and a match written
-/// twice is a match that gets changed in one of the two places.
-fn write_reason(reason: Reason) -> &'static str {
-    match reason {
-        Reason::NoSuchNetwork => "nothing with that name was heard",
-        Reason::SecurityRefused => "the network refused these credentials",
-        Reason::NoAnswer => "the network stopped answering partway through",
-        Reason::HandshakeStalled => "the handshake started and did not finish",
-        Reason::LinkLost => "the link came up and then went down",
-        Reason::Other => "the radio reported a reason this firmware does not name",
-    }
-}
-
-/// What the radio is doing, and — when it is not doing what it should — why.
-///
-/// A state rather than a sequence of log lines because a log is read long after the event. A line
-/// saying it could not join helps only whoever is watching when it happens; a line that still says
-/// so twice a second is what someone reading the log from the top finds, and to them the two are the
-/// same thing.
-///
-/// The states are separate rather than one "not connected" because each wants a different thing done
-/// about it: fill in the credentials, fix a credential, replace the board, or go and look for the
-/// network and how loudly it can be heard from here.
-///
-/// `src/wifi.rs` publishes this and `src/status.rs` reads it. It is a published value rather than a
-/// return value because the radio runs in its own task and the greeting runs in the main one, and
-/// nothing either of them waits for the other. Published as the value itself, behind a lock, rather
-/// than as one word: six states fit in one word only as an encoding, and an encoding is a second
-/// thing for the two tasks to agree about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Link {
-    /// There was never a network to join, because no `SSID` was compiled in.
-    ///
-    /// The normal state of the gate and of CI, and the state a build made before `.cargo/local.toml`
-    /// was filled in is in. Nothing is wrong with the hardware, which is what makes this worth
-    /// distinguishing from every other state here.
-    NoNetwork,
-
-    /// There was a network to join and the radio would not take one of its credentials.
-    ///
-    /// Both values are compiled in, so this is a mistake in the file the firmware was built from
-    /// rather than anything that can happen on a board.
-    UnusableCredential,
-
-    /// The radio would not start at all, which is neither a network problem nor a credentials one.
-    NoRadio,
-
-    /// An attempt is in progress, or one is due.
-    Joining,
-
-    /// The station is on the network.
-    Joined,
-
-    /// The last attempt did not work, and this is what it said.
-    Failed(JoinFailure),
-}
-
-impl fmt::Display for Link {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // The same three words on the three states with no network in them, because what they
-            // have in common is what a reader has to act on first: there is nothing to wait for.
-            Self::NoNetwork => f.write_str("nothing to join: no credentials were compiled in"),
-            Self::UnusableCredential => f.write_str(
-                "nothing to join: a compiled-in credential is not one the radio can use",
-            ),
-            Self::NoRadio => f.write_str("nothing to join: the radio did not start"),
-            Self::Joining => f.write_str("joining"),
-            Self::Joined => f.write_str("joined"),
-            Self::Failed(failure) => write!(f, "not joined: {failure}"),
-        }
     }
 }
 
@@ -799,42 +642,6 @@ impl fmt::Display for Age {
     }
 }
 
-/// Everything the firmware knows about itself, right now, as the line it prints.
-///
-/// The order is the decision as much as the wording is: the time first, because a reader who came to
-/// see what time it is has their answer in the first field and can stop reading; then the address,
-/// which is the next thing they want; and the state of the two mechanisms last, because that is what
-/// they read when one of the first two is wrong, and by then they are looking for it.
-///
-/// A struct rather than three format arguments because these three come from three tasks, and three
-/// arguments assembled in the greeting is three places for the log and the state to disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Status {
-    /// Where the time came from, and whether it can still be believed.
-    pub time: Time,
-
-    /// What the radio is doing, and why.
-    pub link: Link,
-
-    /// The address, or `None` while DHCP has not produced one.
-    pub address: Option<Address>,
-}
-
-impl fmt::Display for Status {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, ", self.time)?;
-
-        match self.address {
-            Some(address) => write!(f, "{address}, ")?,
-            // Said rather than left out, because a missing clause reads as a formatting mistake and
-            // the state of the radio is the answer to it.
-            None => f.write_str("no address yet, ")?,
-        }
-
-        write!(f, "wifi: {}", self.link)
-    }
-}
-
 /// How often the firmware reports what it is doing.
 ///
 /// Five minutes, which is [`REPORT_EVERY_SECS`] rather than a number in the task that waits: this is
@@ -880,28 +687,28 @@ pub struct Event<'a> {
     /// What kind of event this is, which is [`EVENT_TELEMETRY`] for everything this firmware sends.
     pub event_type: &'a str,
 
-    /// The state line, as [`crate::Status`] renders it.
+    /// The state line, rendered by `src/status.rs`.
     ///
     /// The whole sentence rather than the three fields behind it, so that what is stored is what the
     /// chip would have printed at that moment. Three fields in a payload would be a second way of
     /// writing the same line, and the two would drift.
-    pub status: &'a Status,
+    pub payload: &'a str,
 }
 
 impl fmt::Display for Event<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Every field below stays inside plain printable text with no quotes in it, which is the
         // one rule a JSON string has — a quote ends it. The id is hex from `src/report.rs`, the
-        // timestamp is digits and fixed punctuation, the event type is a constant, and the status
-        // is a sentence this crate wrote whose alphabet a test pins. A field that grows a quote
-        // fails that test rather than corrupting a row in somebody's database.
+        // timestamp is digits and fixed punctuation, the event type is a constant, and the payload
+        // is a state line whose alphabet a test pins. A field that grows a quote fails that test
+        // rather than corrupting a row in somebody's database.
         write!(
             f,
             "{{\"device_id\":{},\"timestamp\":\"{}\",\"event_type\":{},\"payload\":{}}}",
             Quoted(&self.device_id),
             Timestamp::at(self.timestamp_secs),
             Quoted(&self.event_type),
-            Quoted(self.status),
+            Quoted(&self.payload),
         )
     }
 }

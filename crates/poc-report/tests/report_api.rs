@@ -20,8 +20,8 @@
 use std::fmt::Write as _;
 
 use poc_report::{
-    Address, Clock, EVENT_TELEMETRY, Event, JoinFailure, LOGGED_LEN, Link, Obstruction,
-    REPORT_EVERY_SECS, Reason, Refusal, STALE_AFTER_SECS, Status, Time, Timestamp, logged,
+    Address, Clock, EVENT_TELEMETRY, Event, LOGGED_LEN, Obstruction, REPORT_EVERY_SECS, Refusal,
+    STALE_AFTER_SECS, Time, Timestamp, logged,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
@@ -35,17 +35,10 @@ const AT: u64 = 20_730 * 24 * 60 * 60 + 18 * 3_600 + 22 * 60 + 31;
 /// line is. What is left is these bytes, the API's own wording rather than a fixture's.
 const BODY_401: &[u8] = br#"{"error":"Unauthorized"}"#;
 
-/// The status line of an event from a chip that has joined and has a time.
-fn status() -> Status {
-    Status {
-        time: Time::answered(AT, 2, 5),
-        link: Link::Joined,
-        address: Some(Address {
-            ip: "192.168.0.225".parse().unwrap(),
-            prefix_len: 24,
-        }),
-    }
-}
+/// The state line of an event from a chip that has joined and has a time, as `src/status.rs`
+/// renders it: the payload carries what the chip would have printed, and this crate stores it
+/// verbatim rather than rendering it.
+const PAYLOAD: &str = "1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined";
 
 /// Renders a value the way the firmware's `Display2Format` does on the chip, and as `String` here.
 fn render(value: &impl std::fmt::Display) -> String {
@@ -62,7 +55,7 @@ fn body() -> String {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT,
         event_type: EVENT_TELEMETRY,
-        status: &status(),
+        payload: PAYLOAD,
     })
 }
 
@@ -212,8 +205,10 @@ fn an_impossible_epoch_renders_rather_than_overflowing() {
 /// sentence added to the firmware without staying inside the alphabet fails to compile, which is
 /// the point. The id and the event type are not here — a hex string and a constant, quotable by
 /// construction at the call site — and neither is the timestamp, which is digits and fixed
-/// punctuation. If the payload ever grows a field from outside (an SSID, a driver's words), this
-/// test is where it lands, or the escaping comes back.
+/// punctuation. The state line itself is not here either: it is assembled in `src/status.rs` now,
+/// next to the radio it reports on, and a test on it needs a board. If the payload ever grows a
+/// field from outside (an SSID, a driver's words), this test is where it lands, or the escaping
+/// comes back.
 #[test]
 fn every_sentence_in_a_body_stays_quotable() {
     let mut sentences = vec![
@@ -225,29 +220,6 @@ fn every_sentence_in_a_body_stays_quotable() {
             ip: "10.0.0.7".parse().unwrap(),
             prefix_len: 0,
         }),
-        render(&Reason::NoSuchNetwork),
-        render(&Reason::SecurityRefused),
-        render(&Reason::NoAnswer),
-        render(&Reason::HandshakeStalled),
-        render(&Reason::LinkLost),
-        render(&Reason::Other),
-        render(&JoinFailure {
-            reason: Reason::NoAnswer,
-            signal: Some(-81),
-        }),
-        render(&JoinFailure {
-            reason: Reason::NoSuchNetwork,
-            signal: None,
-        }),
-        render(&Link::NoNetwork),
-        render(&Link::UnusableCredential),
-        render(&Link::NoRadio),
-        render(&Link::Joining),
-        render(&Link::Joined),
-        render(&Link::Failed(JoinFailure {
-            reason: Reason::HandshakeStalled,
-            signal: Some(-55),
-        })),
         render(&Clock::since_boot(0)),
         render(&Clock::since_boot(u64::MAX)),
         render(&Clock::utc(0)),
@@ -264,15 +236,6 @@ fn every_sentence_in_a_body_stays_quotable() {
         )),
         render(&Time::answered(AT, 2, 5)),
         render(&Time::answered(AT, 3, STALE_AFTER_SECS + 5 * 60)),
-        render(&status()),
-        render(&Status {
-            time: Time::since_boot_after(63, Obstruction::AnswerTimedOut),
-            link: Link::Failed(JoinFailure {
-                reason: Reason::NoSuchNetwork,
-                signal: Some(-81),
-            }),
-            address: None,
-        }),
     ];
 
     let refusals = [
@@ -313,36 +276,30 @@ fn every_sentence_in_a_body_stays_quotable() {
     }
 }
 
-/// Two events from the same chip differ in the timestamp and nothing else, and the payload is the
-/// state line rather than a second rendering of its three fields.
+/// Two events from the same chip differ in the timestamp and nothing else, and the payload is
+/// stored verbatim: the state line is rendered in the firmware and this crate keeps what it was
+/// given rather than rendering it a second time.
 #[test]
-fn the_payload_is_the_state_line() {
+fn the_payload_is_stored_verbatim() {
     let earlier = render(&Event {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT - 300,
         event_type: EVENT_TELEMETRY,
-        status: &status(),
+        payload: PAYLOAD,
     });
     let later = body();
 
-    fn payload(body: &str) -> &str {
-        body.split(r#""payload":""#)
-            .nth(1)
-            .expect("a body with a payload")
-            .split('"')
-            .next()
-            .expect("a payload with an end")
-    }
-
-    assert_eq!(payload(&earlier), payload(&later));
-    assert_eq!(
-        payload(&later),
-        "1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"
-    );
     assert_ne!(
         earlier, later,
         "two events five minutes apart are the same body"
     );
+
+    for body in [&earlier, &later] {
+        assert!(
+            body.contains(&format!("\"payload\":\"{PAYLOAD}\"")),
+            "the payload did not survive verbatim: {body}"
+        );
+    }
 }
 
 /// The body is the API's own words, and on a 400 it is the only thing that says *which* field was
@@ -448,29 +405,23 @@ fn the_reporting_interval_is_five_minutes() {
     assert_eq!(REPORT_EVERY_SECS, 300);
 }
 
-/// The body is a little over two hundred bytes for a chip that has joined, and a long address plus a
-/// sentence about a failed join is the largest it gets. A buffer the firmware sizes has to hold the
+/// The body is a little over two hundred bytes for a chip that has joined, and a long state line
+/// with a failed join in it is the largest it gets. A buffer the firmware sizes has to hold the
 /// worst case rather than this one, and this is the measurement of the ordinary case that says how
 /// much headroom there is.
 #[test]
 fn a_body_is_small_enough_to_fit_a_buffer() {
     let joined = body().len();
 
+    // A clock counting from boot with a failure to explain, a long address, and a failed join with
+    // a signal in it — the longest shape a state line takes.
     let failing = render(&Event {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT,
         event_type: EVENT_TELEMETRY,
-        status: &Status {
-            time: Time::since_boot_after(3_600, poc_report::Obstruction::AnswerTimedOut),
-            link: Link::Failed(poc_report::JoinFailure {
-                reason: poc_report::Reason::HandshakeStalled,
-                signal: Some(-55),
-            }),
-            address: Some(Address {
-                ip: "192.168.100.200".parse().unwrap(),
-                prefix_len: 24,
-            }),
-        },
+        payload: "01:00:00 (counting from boot: the server's time is before 1970, so there is no \
+            epoch to count it from), 192.168.100.200/24, wifi: not joined: FourWayHandshakeTimeout \
+            (signal -55 dBm)",
     });
 
     assert!(joined < 256, "{joined} bytes");
