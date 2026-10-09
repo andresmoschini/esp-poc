@@ -259,10 +259,11 @@ part of the reasoning; read them before changing what reads what.
   microcontroller, so a test on them needs a board. TLS is the sharpest case: whether the
   certificate chains to the root in `certs/` is a decision MbedTLS makes, and the only evidence
   either way is a log line on a board. What _is_ testable is the part that decides rather than talks
-  to hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run
-  it on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when
-  it is worth testing, and expect it not to be there** — logic that needs the radio stays in
-  `src/wifi.rs` untested, the state line stays in `src/status.rs` untested, logic that needs a
+  to hardware, and it lives in `crates/poc-domain` so that the gate's `test-firmware` step can run
+  it on the host: no dependencies, `#![no_std]`, buildable for both targets, and split into the four
+  things it decides — `address`, `clock`, `ntp` and `event` — with one test file each. **Put logic
+  there when it is worth testing, and expect it not to be there** — logic that needs the radio stays
+  in `src/wifi.rs` untested, the state line stays in `src/status.rs` untested, logic that needs a
   socket or a clock stays in `src/ntp.rs` untested, logic that needs a TCP connection stays in
   `src/report.rs` untested, and logic that needs a certificate to be trusted stays in `src/tls.rs`
   untested, because moving any of them would mean moving the hardware it is about. What has moved

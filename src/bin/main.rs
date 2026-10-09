@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         // One call, one line, and every fact on it comes from a different task: the radio's state
         // from `wifi`, the time and where it came from from `clock`, and the address from the
-        // network stack. `src/status.rs` is what puts them together, and `poc-report` decides how
+        // network stack. `src/status.rs` is what puts them together, and `poc-domain` decides how
         // they read — which is why the wording of this line is something a host can test and not
         // something assembled here.
         info!(

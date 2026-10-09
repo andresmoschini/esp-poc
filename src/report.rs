@@ -27,7 +27,7 @@ use embassy_executor::Spawner;
 use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::peripherals::{ADC1, RNG};
-use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
+use poc_domain::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
 use crate::{TIMEOUT, clock, status, tls};
 
@@ -149,7 +149,7 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 /// How many bytes of body to build.
 ///
 /// 512, comfortably over the longest body this firmware can produce: a failed join with a signal in it
-/// and a clock counting from boot, which `poc-report`'s tests measure at under 300. The buffer is
+/// and a clock counting from boot, which `poc-domain`'s tests measure at under 300. The buffer is
 /// sized over the worst case rather than the usual one, because a body that does not fit is a report
 /// that is silently not sent.
 const BODY_LEN: usize = 512;
@@ -527,7 +527,7 @@ fn say(code: Option<u16>, body: &[u8]) {
     match code {
         Some(201) => info!(
             "the API stored the event, 201 after {}",
-            defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
+            defmt::Display2Format(&poc_domain::age(Instant::now().as_secs()))
         ),
         Some(status) => warn!("the API did not store the event: {}", status),
         None => warn!("the API did not store the event: no status"),
@@ -540,7 +540,7 @@ fn say(code: Option<u16>, body: &[u8]) {
     if code != Some(201) {
         info!(
             "the API said: {}",
-            defmt::Display2Format(&poc_report::logged(body))
+            defmt::Display2Format(&poc_domain::logged(body))
         );
     }
 }

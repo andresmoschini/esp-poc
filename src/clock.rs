@@ -5,7 +5,7 @@
 //! it and `src/status.rs` prints it; neither knows how the number got there. A time on its own is
 //! not enough to read — `18:22:31` from a count since boot and from a server are the same six
 //! characters — so the clock keeps the last answer, how long ago it came, and the last thing that
-//! went wrong asking, and [`time`] puts those into a [`poc_report::Time`].
+//! went wrong asking, and [`time`] puts those into a [`poc_domain::Time`].
 //!
 //! It is all behind one lock rather than a word per field, for the reason `src/wifi.rs` holds its
 //! `Link` that way: on one core the lock is a brief critical section taken twice a second, and a
@@ -15,7 +15,7 @@ use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
-use poc_report::{Obstruction, Time};
+use poc_domain::{Obstruction, Time};
 
 /// What the clock knows: the last answer it was given, and the last thing that stopped one arriving.
 ///

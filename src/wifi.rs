@@ -29,7 +29,7 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ConnectionError, ControllerConfig, DisconnectReason,
     Interface, Password, Ssid, WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
 };
-use poc_report::Address;
+use poc_domain::Address;
 
 const SSID: Option<&str> = option_env!("WIFI_SSID");
 

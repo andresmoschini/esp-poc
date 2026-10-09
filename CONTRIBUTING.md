@@ -81,8 +81,8 @@ were gone:
 
 1. the `[lints]` blocks in `Cargo.toml` — removing these does not fail the gate, it makes the gate
    quieter while checking less (see below)
-2. the `[workspace]` block in `Cargo.toml` and the path dependency on `crates/poc-report` — removing
-   these fails loudly, at the build step, with `error[E0432]: unresolved import poc_report`
+2. the `[workspace]` block in `Cargo.toml` and the path dependency on `crates/poc-domain` — removing
+   these fails loudly, at the build step, with `error[E0432]: unresolved import poc_domain`
 3. the exact channel, and `rustfmt`, `clippy` and `rust-src`, in `rust-toolchain.toml`
 4. a crate-level `//!` doc comment in `build.rs`, `src/lib.rs` and `src/bin/main.rs`
 5. the formatter settings in `.vscode/settings.json` and the extension list in

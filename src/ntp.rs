@@ -4,7 +4,7 @@
 //! time the server thinks it is. There is no library for it on purpose: the whole protocol as a
 //! plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and the
 //! parts worth checking — the offsets, the 1900 epoch, a reply that is not an answer to this
-//! request — are decisions a host can make and a board cannot. Those are in `poc-report`; this file
+//! request — are decisions a host can make and a board cannot. Those are in `poc-domain`; this file
 //! is the part that needs a network.
 //!
 //! The clock does not survive a power cycle, so this task keeps asking for the life of the firmware.
@@ -18,7 +18,7 @@ use embassy_executor::Spawner;
 use embassy_net::udp::{PacketMetadata, RecvError, UdpSocket};
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use poc_report::{
+use poc_domain::{
     Answer, Clock, Obstruction, SNTP_LEN, STALE_AFTER_SECS, sntp_reply, sntp_request,
 };
 

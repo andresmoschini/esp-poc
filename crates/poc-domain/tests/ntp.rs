@@ -15,7 +15,7 @@
 // twenty tests agreed with a bug that a real server's first reply exposed. An encoder and a decoder
 // written from the same idea check each other's arithmetic and neither one's idea of the format.
 
-use poc_report::{Refusal, SNTP_LEN, sntp_reply, sntp_request};
+use poc_domain::{Obstruction, Refusal, SNTP_LEN, sntp_reply, sntp_request};
 
 /// The nonce the tests send. Any value works; one that is easy to read in a failure is the point.
 const NONCE: u32 = 0x0BAD_F00D;
@@ -26,7 +26,7 @@ const NTP_TO_UNIX: u64 = 2_208_988_800;
 
 /// Seconds since the Unix epoch for a date and a time, written the slow way.
 ///
-/// The arithmetic under test is `poc_report`'s; this is here so that the dates in these tests are
+/// The arithmetic under test is `poc_domain`'s; this is here so that the dates in these tests are
 /// not produced by it, which would make every one of them agree with a mistake.
 fn epoch_secs(year: u64, month: u64, day: u64, hour: u64, minute: u64, second: u64) -> u64 {
     const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -442,4 +442,75 @@ fn the_refusals_are_distinguishable() {
     unique.dedup();
 
     assert_eq!(unique.len(), sentences.len(), "two refusals read the same");
+}
+
+/// Every obstruction has a sentence, and the three timeouts are three of them rather than one
+/// carrying the name of the step: a name that does not resolve and a server that does not answer
+/// want opposite fixes, and "timed out" alone sends whoever is reading it after the network.
+#[test]
+fn every_obstruction_has_a_sentence() {
+    let expected = [
+        (
+            Obstruction::LookupTimedOut,
+            "the name of the time server did not resolve in time",
+        ),
+        (
+            Obstruction::RequestTimedOut,
+            "the request did not reach the time server",
+        ),
+        (
+            Obstruction::AnswerTimedOut,
+            "the time server's answer did not arrive",
+        ),
+        (
+            Obstruction::NoServer,
+            "the name of the time server did not resolve to an address",
+        ),
+        (
+            Obstruction::Stranger,
+            "the reply came from an address that was not asked",
+        ),
+        (
+            Obstruction::WouldNotSend,
+            "the socket would not send the request",
+        ),
+        (
+            Obstruction::TooLong,
+            "the reply was larger than the receive buffer",
+        ),
+        (
+            Obstruction::Refused(Refusal::KissOfDeath),
+            "the server will not answer this client",
+        ),
+    ];
+
+    for (obstruction, words) in expected {
+        assert_eq!(sentence(obstruction), words, "sentence for {obstruction:?}");
+    }
+}
+
+/// Two obstructions that read alike are two that will be confused, and this set has one case per
+/// thing that can go wrong between this chip and a server. The three timeouts are here as three.
+#[test]
+fn the_obstructions_are_distinguishable() {
+    let sentences = [
+        Obstruction::LookupTimedOut,
+        Obstruction::RequestTimedOut,
+        Obstruction::AnswerTimedOut,
+        Obstruction::NoServer,
+        Obstruction::Stranger,
+        Obstruction::WouldNotSend,
+        Obstruction::TooLong,
+    ]
+    .map(|obstruction| sentence(obstruction));
+
+    let mut unique = sentences.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    assert_eq!(
+        unique.len(),
+        sentences.len(),
+        "two obstructions read the same"
+    );
 }

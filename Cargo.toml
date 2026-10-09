@@ -47,7 +47,7 @@ bare_urls = "deny"
 # that the crate stops being a member, the firmware loses its dependency on it, and both parts of the
 # gate stop running any tests at all.
 [workspace]
-members = ["crates/poc-report"]
+members = ["crates/poc-domain"]
 
 [package]
 edition      = "2024"
@@ -217,8 +217,8 @@ tinyrlibc = { version = "0.5.1", default-features = false, features = ["memchr"]
 
 # The sentences the firmware prints about the network, and the address it prints them with. The only
 # dependency here that is not firmware: it has none of its own, which is what lets it be built for the
-# host and tested there. See `crates/poc-report`.
-poc-report = { path = "crates/poc-report" }
+# host and tested there. See `crates/poc-domain`.
+poc-domain = { path = "crates/poc-domain" }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

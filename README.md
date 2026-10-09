@@ -17,9 +17,10 @@ Hello world! 2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, w
 ```
 
 It reads as the time and where it came from, then the address, then the state of the radio — the
-last because it is what a reader looks for when one of the first two is wrong. The line is a single
-`Status` in [`crates/poc-report`](crates/poc-report), so its order and its wording are things the
-gate can check rather than things assembled next to the printer.
+last because it is what a reader looks for when one of the first two is wrong. The line is one
+`Status` in [`src/status.rs`](src/status.rs), assembled from three answers that three tasks each
+produce, and its order is a decision stated once in that file rather than worked out next to the
+printer.
 
 It also says when something is wrong, and what:
 
@@ -357,17 +358,20 @@ to say what you saw.
 Two test steps, and the difference between them is the whole story:
 
 - `test` runs the tests of this repository's own automation, in Node.
-- `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
+- `test-firmware` runs `crates/poc-domain`, on the host. That crate holds the part of the firmware
   that decides rather than talks to hardware: how an address and a time are written, what an SNTP
-  packet means, and what the body of a reported event says.
+  packet means, and what the body of a reported event says. It is four submodules — `address`,
+  `clock`, `ntp` and `event` — with one test file each.
 
 The split is not a preference. Every module in `src/` depends on `esp-hal`, on the network stack, or
 on a scheduler that exists only on a microcontroller, so none of them can be compiled for a host at
 all — a test on them needs a board. Anything testable therefore has to be in something that builds
-without them, which is what `crates/poc-report` is for, and what makes it the only crate in the tree
-with no dependencies of its own. Logic that belongs next to hardware is untested and stays that way
-until a board can run it. TLS is the clearest case: whether the chain leads to ISRG and whether the
-hostname matches are decisions `MbedTLS` makes, and the only evidence this repository has is the
+without them, which is what `crates/poc-domain` is for, and what makes it the only crate in the tree
+with no dependencies of its own. It is four submodules — `address`, `clock`, `ntp` and `event` — and
+everything is re-exported at its root, so the module is where to read and the root is what to
+import. Logic that belongs next to hardware is untested and stays that way until a board can run it.
+TLS is the clearest case: whether the chain leads to ISRG and whether the hostname matches are
+decisions `MbedTLS` makes, and the only evidence this repository has is the
 `the API's certificate verified: …` line on the serial log.
 
 What that buys is the wording and the arithmetic rather than the hardware: how an address and a time
@@ -416,7 +420,13 @@ graph TD
         lib["lib<br/>TIMEOUT"]
     end
 
-    poc["crates/poc-report<br/>no_std, no dependencies"]
+    subgraph domain["crates/poc-domain - no_std, no dependencies, the only part with tests"]
+        direction TB
+        domClock["clock<br/>the time and how it is written"]
+        domNtp["ntp<br/>a packet, and what standing still means"]
+        domAddress["address<br/>an address"]
+        domEvent["event<br/>the body of a report"]
+    end
 
     main -->|"join"| wifi
     main -->|"sync"| ntp
@@ -438,17 +448,26 @@ graph TD
 
     dns --> lib
 
-    clock -.->|a Time| poc
-    wifi -.->|an Address| poc
-    ntp -.->|a packet| poc
-    status -.->|a sentence| poc
-    report -.->|a body| poc
+    clock -.->|a Time| domClock
+    wifi -.->|an Address| domAddress
+    ntp -.->|a packet| domNtp
+    status -.->|a sentence| domClock
+    report -.->|a body| domEvent
+
+    domClock --> domNtp
+    domEvent --> domClock
 ```
 
 It is a DAG with no cycles, in two layers: `main`, then whatever talks to the network, then what
 holds it up. `report` is the busiest node — it reaches five of the other eight and nothing reaches
 it back — and `status` is the only module that depends on the network and on a peripheral at once,
 which is what makes it the one place the state line can be assembled.
+
+The lower box is [`crates/poc-domain`](crates/poc-domain), which is the firmware's decisions with
+the hardware taken out. The five firmware modules on top of it draw dotted lines because what they
+need from it is a type or a sentence rather than a call; the three solid ones inside it are the
+submodules' own dependencies — `Time` carries an `Obstruction`, and a reported event is stamped with
+a `Timestamp`.
 
 `dns` exists only because `ntp` and `report` were doing the same lookup twice. It is the one module
 whose reason to be is an arrow, so a third client resolving a name is the change this diagram is
@@ -467,7 +486,11 @@ for.
 | `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and say what it said   |
 | `src/lib.rs`                        | the crate root, and which nightly features the firmware needs                   |
 | `certs/`                            | the one root this firmware trusts, and where it came from                       |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests                   |
+| `crates/poc-domain/`                | what the firmware decides and says — the only part with tests                   |
+| `crates/poc-domain/src/clock.rs`    | the time, how it counts on, and the three ways either is written                |
+| `crates/poc-domain/src/ntp.rs`      | an SNTP packet off the network, and what standing still looks like              |
+| `crates/poc-domain/src/address.rs`  | an address, and how one is written                                              |
+| `crates/poc-domain/src/event.rs`    | the body of a reported event, and a reply rendered into a log                   |
 | `build.rs`                          | linker scripts, and what to do about each undefined symbol                      |
 | `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy          |
 | `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces             |

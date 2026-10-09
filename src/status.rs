@@ -13,7 +13,7 @@
 use core::fmt;
 
 use embassy_net::Stack;
-use poc_report::{Address, Time};
+use poc_domain::{Address, Time};
 
 use crate::{clock, wifi};
 
