@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { CHIPS } from "./lib/chip.mjs";
@@ -185,4 +186,38 @@ test("every npm script is a command the gate dispatches", () => {
     );
     assert.match(source, new RegExp(`case "${name}":`, "u"), `gate.mjs dispatches no \`${name}\``);
   }
+});
+
+// The one property of the gate that nothing above it can recover: the answer has to leave the
+// process. `npm run check`, the `pre-commit` hook and `ci.yml` each act on nothing but the exit
+// code, and a gate that prints "6 of 13 checks failed" and then exits 0 is a gate that reports
+// everything and enforces nothing — which is worse than one that fails, because it is believed.
+//
+// `help` is the command that reaches `main`'s return without running a step, so the answer is
+// observable here without building the firmware for two chips. It was 0 when the return value was
+// discarded: `process.exit` is called nowhere, an un-awaited promise's value goes nowhere, and a
+// Node process whose event loop has drained exits 0 whatever the answer was.
+test("the gate's answer is the process's exit code", async () => {
+  const source = fs.readFileSync(path.join(ROOT, "tools", "gate.mjs"), "utf8");
+
+  assert.match(source, /main\(\)\.then\(/u, "`main`'s answer is discarded rather than used");
+
+  const settled = spawnSync(process.execPath, [path.join(ROOT, "tools", "gate.mjs"), "help"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+
+  assert.equal(
+    settled.status,
+    0,
+    "`gate.mjs help` should succeed, and say so through its exit code",
+  );
+
+  const refused = spawnSync(
+    process.execPath,
+    [path.join(ROOT, "tools", "gate.mjs"), "no-such-command"],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+
+  assert.equal(refused.status, 1, "a command the gate does not know must exit non-zero");
 });

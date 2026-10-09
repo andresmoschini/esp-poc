@@ -401,8 +401,18 @@ export const FIX = [
 
 // Only when this file is the program. The tests import it to reach `GATE` and `FIX` and re-run these
 // steps by hand, and a module that dispatched on import would have a test run spawn the whole gate.
+//
+// `main`'s answer becomes the process's exit code, because that is the only thing `npm run check`,
+// the `pre-commit` hook and `.github/workflows/ci.yml` can act on. It used to be discarded: nothing
+// here calls `process.exit`, the value of an un-awaited promise goes nowhere, and a Node process
+// whose event loop has drained exits 0 whatever the answer was. The gate therefore printed
+// `6 of 13 checks failed` and then exited 0 — measured, on this repository, six steps red while the
+// commit they were meant to stop went through. `process.exitCode` rather than `process.exit`, so
+// Node still flushes what the gate printed on the way out.
 if (isEntryPoint(process.argv[1], fileURLToPath(import.meta.url))) {
-  main();
+  main().then((code) => {
+    process.exitCode = code;
+  });
 }
 
 /**
