@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use poc_domain::{Clock, Timestamp, age};
+use poc_domain::{Clock, STALE_AFTER_SECS, Setting, Source, Time, Timestamp, age, source};
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code
 /// under test.
@@ -188,4 +188,127 @@ fn an_impossible_epoch_renders_rather_than_overflowing() {
         absurd.contains('T') && absurd.contains('Z') && absurd.contains(':'),
         "a timestamp rather than a panic: {absurd}"
     );
+}
+
+// --- The arithmetic behind it ----------------------------------------------------
+
+/// A time a server would hand over: 2026-10-04T18:22:31Z.
+const A_DATE: u64 = 1_791_138_151;
+
+/// The clock as `src/clock.rs` stores it when a server answers.
+fn set_to(epoch_secs: u64, stratum: u8, answered_at_secs: u64) -> Setting {
+    Setting {
+        epoch_secs,
+        stratum,
+        answered_at_secs,
+    }
+}
+
+/// With no answer there is nothing a source is made of, and `src/clock.rs` reads that as the clock
+/// counting from boot rather than as an error.
+#[test]
+fn no_answer_has_no_source() {
+    assert_eq!(source(None, 42), None);
+}
+
+/// The instant the answer arrived is the instant the time is right: nothing has been counted on yet,
+/// so the age is zero and the epoch is the server's own number unchanged.
+#[test]
+fn an_answer_read_at_the_moment_it_arrives_is_unchanged() {
+    let answer = set_to(A_DATE, 2, 100);
+
+    assert_eq!(
+        source(Some(answer), 100),
+        Some(Source {
+            epoch_secs: A_DATE,
+            stratum: 2,
+            age_secs: 0,
+        })
+    );
+}
+
+/// The whole of the clock's job: the chip has no time of its own, so the time is the server's plus
+/// everything counted since. Both halves of the reading come from the same subtraction, which is
+/// why they cannot drift apart.
+#[test]
+fn the_time_moves_on_by_exactly_the_age() {
+    for elapsed in [0, 1, 60, 3_723, STALE_AFTER_SECS, 86_400] {
+        let answer = set_to(A_DATE, 3, 100);
+
+        let reading = source(Some(answer), 100 + elapsed).expect("there is an answer");
+
+        assert_eq!(reading.age_secs, elapsed);
+        assert_eq!(reading.epoch_secs, A_DATE + elapsed);
+    }
+}
+
+/// An answer set at boot and read a day later is a day of the chip's own counting, not an hour: the
+/// age is measured against when the answer arrived, not against when the firmware started.
+#[test]
+fn the_age_is_measured_from_the_answer_not_from_boot() {
+    let answer = set_to(A_DATE, 1, 3_600);
+
+    assert_eq!(
+        source(Some(answer), 4_600)
+            .expect("there is an answer")
+            .age_secs,
+        1_000,
+    );
+}
+
+/// The stratum travels unchanged, whatever else has happened to the time since.
+#[test]
+fn the_stratum_is_reported_as_the_server_gave_it() {
+    for stratum in [1, 2, 15] {
+        let answer = set_to(A_DATE, stratum, 0);
+
+        assert_eq!(
+            source(Some(answer), 500)
+                .expect("there is an answer")
+                .stratum,
+            stratum,
+        );
+    }
+}
+
+/// A counter that has gone backwards — a wrap, a suspend that was not a suspend — must not produce
+/// a negative age, and `u64` has no negative, so the only wrong answer available is a large one.
+/// Saturating gives zero, which is a reading of "the answer just arrived".
+#[test]
+fn a_counter_that_went_backwards_does_not_wrap() {
+    let answer = set_to(A_DATE, 2, 100);
+
+    let reading = source(Some(answer), 10).expect("there is an answer");
+
+    assert_eq!(reading.age_secs, 0);
+    assert_eq!(reading.epoch_secs, A_DATE);
+}
+
+/// The same for the date: an epoch near the end of what a `u64` holds saturates rather than wrapping
+/// to a time before 1970, which would be a reading of the past from a server reporting the future.
+#[test]
+fn an_epoch_that_would_overflow_saturates() {
+    let answer = set_to(u64::MAX - 10, 2, 0);
+
+    let reading = source(Some(answer), 1_000).expect("there is an answer");
+
+    assert_eq!(reading.epoch_secs, u64::MAX);
+    assert_eq!(reading.age_secs, 1_000);
+}
+
+/// The largest age there is is still an age, and the largest date there is still renders — in a debug
+/// build, which is where an unchecked addition panics rather than quietly wrapping.
+#[test]
+fn the_extremes_of_both_do_not_panic() {
+    let answer = set_to(u64::MAX, 2, 0);
+
+    let reading = source(Some(answer), u64::MAX).expect("there is an answer");
+
+    assert_eq!(reading.age_secs, u64::MAX);
+    assert_eq!(reading.epoch_secs, u64::MAX);
+
+    // And the sentence the greeting would print from it is a sentence rather than a panic.
+    let rendered = Time::answered(reading.epoch_secs, reading.stratum, reading.age_secs);
+
+    assert!(rendered.to_string().contains(&age(u64::MAX).to_string()));
 }

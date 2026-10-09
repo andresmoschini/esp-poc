@@ -375,13 +375,13 @@ decisions `MbedTLS` makes, and the only evidence this repository has is the
 `the API's certificate verified: …` line on the serial log.
 
 What that buys is the wording and the arithmetic rather than the hardware: how an address and a time
-are written, what an SNTP packet means, and the whole of the JSON body of a reported event, down to
-the alphabet every sentence stays inside so the body cannot be corrupted by a quote. What it
-deliberately does not hold is what an answer _means_ — a status code is reported as the number it
-is, because a mapping from numbers to sentences goes stale the day a status changes what it means.
-The HTTP framing went the same way: `edge-http` writes the request and reads the reply, so this
-crate holds no parser of the most fiddly protocol in the tree, and the test that used to pin it went
-with the code it was testing.
+are written, what an SNTP packet means, how far a server's answer has counted on since it arrived,
+and the whole of the JSON body of a reported event, down to the alphabet every sentence stays inside
+so the body cannot be corrupted by a quote. What it deliberately does not hold is what an answer
+_means_ — a status code is reported as the number it is, because a mapping from numbers to sentences
+goes stale the day a status changes what it means. The HTTP framing went the same way: `edge-http`
+writes the request and reads the reply, so this crate holds no parser of the most fiddly protocol in
+the tree, and the test that used to pin it went with the code it was testing.
 
 ## The gate
 
@@ -448,7 +448,7 @@ graph TD
 
     dns --> lib
 
-    clock -.->|a Time| domClock
+    clock -.->|a Time, a Setting| domClock
     wifi -.->|an Address| domAddress
     ntp -.->|a packet| domNtp
     status -.->|a sentence| domClock

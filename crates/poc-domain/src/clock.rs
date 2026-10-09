@@ -8,6 +8,11 @@
 //! [`Time`] is the shape the firmware publishes — a reading plus where it came from — and
 //! [`Clock`] is what the state line renders it as. [`STALE_AFTER_SECS`] is how old an answer has to
 //! be before the time it set stops being called current.
+//!
+//! [`source`] is the arithmetic behind it: given the last answer and how long the chip has been
+//! running, what it should believe and how sure of it to be. It is here rather than in
+//! `src/clock.rs` because it is a function of two values and nothing else — which makes it the one
+//! part of the firmware's own clock that a host can check.
 
 use core::fmt;
 
@@ -310,4 +315,71 @@ impl fmt::Display for Timestamp {
             civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
         )
     }
+}
+
+/// A setting of the clock: what it was set to, by how good a clock, and when.
+///
+/// [`crate::ntp::Answer`] is what came off the wire; this is what the firmware kept, and the
+/// difference is the third field. An answer has to carry the moment it arrived, because a time that
+/// is already stale by the time anything reads it is a time that reads wrong — [`source`] measures
+/// the age against `answered_at_secs`, and the answer itself never knew what the chip's counter
+/// said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setting {
+    /// Seconds since the Unix epoch, as the server gave them.
+    ///
+    /// Not adjusted, and the reason is on [`crate::ntp::Answer::epoch_secs`], where the wire format
+    /// is read: this firmware prints what the wire says rather than guessing at the correction.
+    pub epoch_secs: u64,
+
+    /// How many steps the server was from a reference clock, as the server gave it.
+    pub stratum: u8,
+
+    /// How long the chip had been running when the answer arrived.
+    pub answered_at_secs: u64,
+}
+
+/// Where the clock was last set, and how far it has counted on since.
+///
+/// Three facts that only mean anything together — a stratum from an hour ago is not a fact about the
+/// time being printed — so they are one value rather than three getters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    /// The time the server that answered gave, plus everything this chip has counted since.
+    pub epoch_secs: u64,
+
+    /// How many steps the server that answered was from a reference clock: one is a clock that is
+    /// itself a reference, such as an atomic clock or a GPS receiver.
+    pub stratum: u8,
+
+    /// How long ago it answered, in seconds.
+    pub age_secs: u64,
+}
+
+/// What the last answer is worth now, or `None` when there has not been one.
+///
+/// The arithmetic is addition rather than an offset reapplied: the time the server gave plus however
+/// long the chip has been running since it answered is the same number, and it is the one that can
+/// be held in a word this chip actually has. Neither chip has a RISC-V atomic wider than a word, so
+/// an offset stored the other way round would have to be read one chunk at a time.
+///
+/// # Parameters
+///
+/// - `setting` — the clock as it was last set, or `None` before the first time it was.
+/// - `uptime_secs` — how long the chip has been running, which is what the age is measured against.
+///
+/// Both saturate rather than wrap. A wrapped age is a small number that looks like a real one, and
+/// the only way to reach one is a counter that has gone backwards; a wrapped epoch is a date before
+/// the one that was just handed to it.
+#[must_use]
+pub fn source(setting: Option<Setting>, uptime_secs: u64) -> Option<Source> {
+    let setting = setting?;
+
+    let age_secs = uptime_secs.saturating_sub(setting.answered_at_secs);
+
+    Some(Source {
+        epoch_secs: setting.epoch_secs.saturating_add(age_secs),
+        stratum: setting.stratum,
+        age_secs,
+    })
 }

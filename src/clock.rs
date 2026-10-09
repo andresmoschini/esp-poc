@@ -15,7 +15,7 @@ use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
-use poc_domain::{Obstruction, Time};
+use poc_domain::{Obstruction, Setting, Time, source};
 
 /// What the clock knows: the last answer it was given, and the last thing that stopped one arriving.
 ///
@@ -29,58 +29,22 @@ use poc_domain::{Obstruction, Time};
 /// It starts with nothing because that is the state this chip is in from the moment it starts: no
 /// server has answered and no attempt has failed.
 static FACTS: Mutex<CriticalSectionRawMutex, RefCell<Facts>> = Mutex::new(RefCell::new(Facts {
-    answer: None,
+    setting: None,
     obstruction: None,
 }));
-
-/// One answer from a time server, as it was when it arrived.
-///
-/// The time the server gave rather than an offset from this chip's own zero, which is what used to be
-/// stored: the difference between the two is all the arithmetic ever needed, and an offset has to be
-/// squeezed into a type narrow enough to be atomic — where the count of seconds since 1970 is not,
-/// and where the day the firmware would have stopped serving a correct date is decided by the width
-/// of a word rather than by anything about the chip or the network.
-#[derive(Debug, Clone, Copy)]
-struct Answer {
-    /// Seconds since the Unix epoch, which is 1970-01-01T00:00:00Z.
-    epoch_secs: u64,
-
-    /// How many steps the server was from a reference clock.
-    stratum: u8,
-
-    /// How long the chip had been running when the answer arrived.
-    answered_at_secs: u64,
-}
 
 /// Everything the clock holds, and the whole of what it knows.
 #[derive(Debug, Clone, Copy)]
 struct Facts {
-    /// The last answer, or `None` before the first one.
+    /// The clock as it was last set, or `None` before the first time it was.
     ///
     /// `None` rather than a zero timestamp, because a zero is a time — 1970-01-01T00:00:00Z — and
     /// this firmware knows how to print one.
-    answer: Option<Answer>,
+    setting: Option<Setting>,
 
     /// What stood between this chip and a time, the last time something did, and `None` before the
     /// first attempt rather than an explanation of nothing having gone wrong.
     obstruction: Option<Obstruction>,
-}
-
-/// Where the clock was last set, and how far it has counted on since.
-///
-/// Three facts that only mean anything together — a stratum from an hour ago is not a fact about the
-/// time being printed — so they are returned as one rather than as three getters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Source {
-    /// The time the server that answered gave, plus everything this chip has counted since.
-    pub epoch_secs: u64,
-
-    /// How many steps the server that answered was from a reference clock: one is a clock that is
-    /// itself a reference, such as an atomic clock or a GPS receiver.
-    pub stratum: u8,
-
-    /// How long ago it answered, in seconds.
-    pub age_secs: u64,
 }
 
 /// Sets the clock from a count of seconds since the Unix epoch, and from the server that gave it.
@@ -99,7 +63,7 @@ pub fn set(epoch_secs: u64, stratum: u8) {
         // The running time is read once, here, rather than again on the way out: the age of this
         // answer is measured against the moment it arrived, and a reader that measured it against a
         // later one would be a reader reporting the clock as older than it is.
-        facts.answer = Some(Answer {
+        facts.setting = Some(Setting {
             epoch_secs,
             stratum,
             answered_at_secs: uptime_secs(),
@@ -133,7 +97,7 @@ pub fn time() -> Time {
     FACTS.lock(|slot| {
         let facts = slot.borrow();
 
-        match source(&facts, elapsed_secs) {
+        match source(facts.setting, elapsed_secs) {
             Some(source) => Time::answered(source.epoch_secs, source.stratum, source.age_secs),
 
             // Nothing to explain yet: a chip that has not asked a server anything has not had a
@@ -145,26 +109,6 @@ pub fn time() -> Time {
                 None => Time::since_boot(elapsed_secs),
             },
         }
-    })
-}
-
-/// What the last answer was, and what the clock has counted on to since, or `None` if there has not
-/// been one.
-///
-/// The arithmetic is addition rather than an offset reapplied: the time the server gave plus however
-/// long the chip has been running since it answered is the same number, and it is the one that can
-/// be held in a word this chip actually has.
-fn source(facts: &Facts, uptime_secs: u64) -> Option<Source> {
-    let answer = facts.answer?;
-
-    // Saturating rather than wrapping: a wrapped age would be a small number that looks like a real
-    // one, and the only way to reach it is a counter that has gone backwards.
-    let age_secs = uptime_secs.saturating_sub(answer.answered_at_secs);
-
-    Some(Source {
-        epoch_secs: answer.epoch_secs.saturating_add(age_secs),
-        stratum: answer.stratum,
-        age_secs,
     })
 }
 

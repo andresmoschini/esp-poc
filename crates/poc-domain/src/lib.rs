@@ -34,6 +34,6 @@ pub mod event;
 pub mod ntp;
 
 pub use address::Address;
-pub use clock::{Clock, STALE_AFTER_SECS, Time, Timestamp, age};
+pub use clock::{Clock, STALE_AFTER_SECS, Setting, Source, Time, Timestamp, age, source};
 pub use event::{EVENT_TELEMETRY, EVENTS_PATH, Event, LOGGED_LEN, REPORT_EVERY_SECS, logged};
 pub use ntp::{Answer, Obstruction, Refusal, SNTP_LEN, sntp_reply, sntp_request};
