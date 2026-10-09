@@ -1,13 +1,10 @@
 //! The one name lookup both network clients share.
 //!
-//! [`crate::ntp`] asks a time server and [`crate::report`] asks an API, and both start the same
-//! way: wait out a query for an A record and take the IPv4 address out of the answer. That is one
-//! exchange with one shape, so it is one function rather than two copies of one.
-//!
-//! What is not shared is what a refusal means, so the sentences stay with the callers: a name that
-//! does not resolve is DNS or the network for one and a name this cannot be reached at for the
-//! other, and the name is in both sentences because a log line about a name is not answerable
-//! without the name.
+//! [`crate::ntp`] asks a time server and [`crate::report`] asks an API, and both start by waiting
+//! out a query for an A record and taking the IPv4 address out of the answer. What a refusal means
+//! is not shared, so the sentences stay with the callers: a name that does not resolve is DNS or the
+//! network for one and a name this cannot be reached at for the other, and a log line about a name
+//! is not answerable without the name.
 
 use core::net::Ipv4Addr;
 

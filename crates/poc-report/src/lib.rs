@@ -1,41 +1,23 @@
 //! What the firmware decides for itself, decided here so that something can check it.
 //!
-//! Four decisions live in this crate, and every one of them is one the firmware would otherwise get
-//! subtly wrong and nobody would notice until it mattered:
+//! Four decisions live here, and each is one the firmware would otherwise get subtly wrong and
+//! nobody would notice until it mattered: how an address is written, how a time is written from a
+//! count of seconds, what an SNTP packet off the network means, and what the body of a reported
+//! event looks like. All four are arithmetic or format that cannot be checked by looking at it.
 //!
-//! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/report.rs`
-//!   both print one, and one rendering is one thing to keep correct rather than two.
-//! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
-//!   that cannot be checked by looking at it, and this is the only part of the firmware that knows
-//!   what day it is.
-//! - What an SNTP packet means, and what an attempt to get one came to when it did not. A packet
-//!   off the network is untrusted input, and a 48-byte header of offsets is exactly the sort of
-//!   thing that is right in the common case and wrong in 2036.
-//! - What the body of a reported event looks like. The body is JSON written by hand: right in the
-//!   common case, wrong in the detail nobody reads, and impossible to check on a board. What an
-//!   answer from the API means is deliberately not here — a status code is reported as the number
-//!   it is, because a mapping from numbers to sentences goes stale the day a status changes what
-//!   it means. **The HTTP framing around both is not here** — `edge-http` writes the request and
-//!   parses the reply in `src/report.rs`, and what is logged there is a status code and a body
-//!   rather than a buffer to parse.
+//! It is a crate of its own because of that. Nothing in `src/` can be compiled for a host — it
+//! depends on `esp-hal`, on the network stack, or on a scheduler that exists only on this chip — and
+//! a test on a microcontroller needs a board or a simulator, which the gate does not have. This
+//! crate is `#![no_std]` with no dependencies, so it builds for the chip and for the host alike.
 //!
-//! What the radio is doing is deliberately not here either: the reason a join failed is the driver's
-//! own words, carried as-is in `src/wifi.rs`, and the state line as a whole is assembled in
-//! `src/status.rs`. Both need the radio or the network stack, so neither can be compiled for a host
-//! at all — and a test on them needs a board.
+//! It knows nothing about Wi-Fi or about the network stack: a failed join carries the driver's own
+//! `DisconnectReason` in `src/wifi.rs`, an SNTP packet is read in the firmware and handed here as
+//! bytes, and the state line is assembled in `src/status.rs`.
 //!
-//! It is a crate of its own because this is the only part of the firmware that can be tested at all.
-//! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
-//! `esp-hal` or on the network stack above it, which exist only for this chip, so none of them can
-//! be compiled for a host — and a test on a microcontroller needs a board or a simulator, which the
-//! gate does not have. This crate is `#![no_std]` with no dependencies, so it builds for the chip
-//! and for the host alike, and `tests/report.rs`, `tests/status.rs` and `tests/ntp.rs` run on
-//! whichever machine is running the gate.
-//!
-//! It knows nothing about Wi-Fi or about the network stack. A failed join carries the driver's own
-//! `esp_radio::wifi::DisconnectReason` in `src/wifi.rs`, and an SNTP packet is read in the firmware
-//! and handed here as bytes, so that a change in either driver costs that one file rather than this
-//! crate's API.
+//! **Deliberately not here:** what the radio is doing, and what an answer from the API means — a
+//! status code is reported as the number it is, because a mapping from numbers to sentences goes
+//! stale the day a status changes what it means. **The HTTP framing is not here either**:
+//! `edge-http` writes the request and parses the reply in `src/report.rs`.
 
 #![no_std]
 

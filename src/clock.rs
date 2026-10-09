@@ -1,39 +1,15 @@
 //! The chip's clock: what time it is, and where that answer came from.
 //!
-//! There is no battery-backed clock on this chip, so a time that survives a power cycle is not
-//! something this firmware can have: what lives here is in RAM, and it is asked for again over the
-//! network every time the chip boots. Between two answers the scheduler's monotonic counter counts
-//! on, so the clock keeps moving without asking — which also means it drifts, by however much the
-//! crystal drifts, until the next answer puts it right.
+//! There is no battery-backed clock here, so what lives in this file is in RAM and is asked for
+//! again over the network every boot, drifting on its own crystal between answers. `src/ntp.rs` sets
+//! it and `src/status.rs` prints it; neither knows how the number got there. A time on its own is
+//! not enough to read — `18:22:31` from a count since boot and from a server are the same six
+//! characters — so the clock keeps the last answer, how long ago it came, and the last thing that
+//! went wrong asking, and [`time`] puts those into a [`poc_report::Time`].
 //!
-//! That is the whole of the device's timekeeping: one number, set from outside. `src/ntp.rs` is
-//! what sets it, and `src/status.rs` is what prints it, and neither of them knows how the number
-//! got there.
-//!
-//! ## What the clock can say about itself
-//!
-//! A time on its own is not enough to read: `18:22:31` from a count since boot and `18:22:31` from a
-//! server are the same six characters and mean different things. So the clock keeps the last answer
-//! and how long ago it came, plus the last thing that went wrong asking, which is the answer to "why
-//! is this still counting from boot". [`time`] puts the four of them together into a
-//! [`poc_report::Time`], and the wording and the arithmetic of that are in `poc-report` where a host
-//! can check them.
-//!
-//! ## Why one lock and not five atomics
-//!
-//! Everything here is four small facts that only mean anything together — an answer's time, its
-//! stratum and how long ago it came, or the failure that says there is no answer — and they are
-//! written by the task that talks to the network and read by the greeting, which runs twice a second
-//! on a chip with one core. A lock around the whole of it is a brief critical section taken twice a
-//! second, which is the same argument `src/wifi.rs` already makes for the radio's `Link`, and it is
-//! the right one here for a reason the atomics could not give: five one-word statics holding five
-//! parts of one fact need an ordering invariant to say they belong together, and an invariant nothing
-//! can check is an invariant that eventually is not upheld.
-//!
-//! Nor is there any word width to trade against. Neither chip has a RISC-V atomic wider than a word,
-//! so the 64-bit timestamp this needs would have been published through `portable-atomic` and read
-//! one chunk at a time — which is a second thing to get right, for no gain over a lock that is
-//! already there.
+//! It is all behind one lock rather than a word per field, for the reason `src/wifi.rs` holds its
+//! `Link` that way: on one core the lock is a brief critical section taken twice a second, and a
+//! value published as several words is a value whose parts can be read at different moments.
 
 use core::cell::RefCell;
 

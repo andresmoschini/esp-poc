@@ -1,20 +1,15 @@
 //! Ask a time server what time it is, and set the chip's clock from the answer.
 //!
-//! SNTP is a request and a reply over UDP port 123, and the reply is a 48-byte header that says
-//! what time the server thinks it is. There is no library for it here on purpose: the whole protocol
-//! as a plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and
-//! the parts of it that are worth checking — the offsets, the 1900 epoch, a reply that is not an
-//! answer to this request — are all decisions that a host can make and a board cannot test. Those
-//! are in `poc-report`; this file is the part that needs a network.
+//! SNTP is a request and a reply over UDP port 123, and the reply is a 48-byte header saying what
+//! time the server thinks it is. There is no library for it on purpose: the whole protocol as a
+//! plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and the
+//! parts worth checking — the offsets, the 1900 epoch, a reply that is not an answer to this
+//! request — are decisions a host can make and a board cannot. Those are in `poc-report`; this file
+//! is the part that needs a network.
 //!
-//! The clock this sets does not survive a power cycle, because there is nowhere on this chip to put
-//! it that would. That is why the task keeps going after the first answer rather than stopping:
-//! every boot starts at zero again and has to ask again.
-//!
-//! A failed attempt is not only logged: it is also handed to [`clock::report_failure`], which is what
-//! the greeting's state line reads to explain a time that is still counting from boot. The words for
-//! it live in `poc-report` with the rest of the sentences, and are tested on the host; what the
-//! driver said underneath stays in this file's log.
+//! The clock does not survive a power cycle, so this task keeps asking for the life of the firmware.
+//! A failed attempt is not only logged: it goes to [`clock::report_failure`], which is what the
+//! greeting reads to explain a time still counting from boot.
 
 use core::net::Ipv4Addr;
 
