@@ -3,23 +3,21 @@
 //!
 //! ## Why this goes through `edge-nal`
 //!
-//! The first version of this file talked to `embassy-net` directly: a `TcpSocket` owned by the
-//! reporting task, `connect` called on it, and a TLS session over it. That is not much code, but two
-//! of its properties were wrong and one of them was a bug this repository shipped and then found:
+//! The TLS path this file is the front of is `edge-nal-embassy`'s and `edge-http`'s, and two of its
+//! properties are why:
 //!
 //! - **A socket is not reusable.** `smoltcp` answers `connect` on an open socket with
-//!   `InvalidState`, so a socket has to be built per connection and dropped after. The task was
-//!   holding one, which meant every report after the first failed before a packet went out. The
-//!   buffers then had to be built separately and threaded through the reporter to make that work.
-//! - **TLS over it is a second API.** The session borrows the socket, borrows a NUL-terminated server
-//!   name, and borrows a `&'static mut` to the RNG, and every one of those lifetimes had to be
-//!   spelled out at every use.
+//!   `InvalidState`, so a socket has to be built per connection and dropped after. A socket held for
+//!   the life of a task means every exchange after the first is refused by the stack before a packet
+//!   goes out. `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a pool
+//!   when the connection is dropped, which makes that the library's property rather than this file's.
+//! - **TLS over it is a second API.** The session borrows the socket, borrows a NUL-terminated
+//!   server name, and borrows a `&'static mut` to the RNG, and every one of those lifetimes has to
+//!   be spelled out at every use. `edge-nal-tls` layers the session on top of a factory rather than
+//!   on a borrowed socket, and `edge-http`'s `Connection` drives the connect itself.
 //!
-//! `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a pool when the
-//! connection is dropped, which makes both of the first two facts the library's problem rather than
-//! this file's. `edge-nal-tls` layers the TLS session on top of a factory rather than on a borrowed
-//! socket, and `edge-http`'s `Connection` drives the connect itself. What is left here is the part
-//! none of them knows about: which root the API's certificate has to chain to.
+//! **Do not reintroduce a socket that outlives one exchange.** What is left here is the part none of
+//! them knows about: which root the API's certificate has to chain to.
 //!
 //! `mbedtls-rs` is still a direct dependency, and deliberately so. It is what puts the bytes on the
 //! wire, `edge-nal-tls` re-exports it, and the trust anchor is built from its types — but nothing
@@ -121,9 +119,7 @@ pub fn instance(trng: Trng) -> &'static Tls<'static> {
 ///
 /// The source is enabled here — once an address is up — rather than at boot because enabling it is
 /// what keeps a C6 from joining at all: the source is the SAR ADC, and [`TrngSource::new`]
-/// reprograms it while the station has not even authenticated. Measured by bisecting the join
-/// failure to that one call: everything at or before `3a3706b` joins in seconds, `4cbbdfe` never
-/// does, and adding only those two lines back reproduces it. DHCP up implies the station joined, so
+/// reprograms it while the station has not even authenticated. DHCP up implies the station joined, so
 /// from here on the radio is associated and the ADC is this exchange's to use.
 ///
 /// The source is parked in a static rather than held because nothing outlives this call to keep it:

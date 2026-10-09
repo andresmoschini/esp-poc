@@ -10,12 +10,10 @@
 // deliberately not tested: a status code is reported as the number it is, because a mapping from
 // numbers to sentences goes stale the day a status changes what it means.
 //
-// **The HTTP framing is not tested here because this crate no longer does any.** It used to: this
-// file held the request head, a `status_line_arrived` predicate, and a parser for the status line, and
-// the read-boundary bug that shipped — reading a reply once and judging whatever arrived — was caught
-// by a test right here. All of that is `edge-http`'s now, and `src/report.rs` builds a
-// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What is logged there
-// is a status code and a body: a number, these bytes, or the fact that neither came.
+// **The HTTP framing is not tested here because this crate does none of it.** The request head, the
+// loop that reads until a reply is whole, and the status-line parser are `edge-http`'s, and
+// `src/report.rs` builds a `Connection`, writes through it, and reads back the answer. What is
+// logged there is a status code and a body: a number, these bytes, or the fact that neither came.
 
 use std::fmt::Write as _;
 

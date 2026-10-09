@@ -153,9 +153,9 @@ impl core::fmt::Display for Link {
 ///
 /// The reason is the driver's own [`DisconnectReason`], carried as-is rather than grouped: any
 /// grouping is a claim about what to do next, and a wrong claim sends whoever is reading the serial
-/// output after the wrong problem. What the grouping used to be for — telling a wrong password from
-/// a station too far away — is what the signal is for: the two failures that look identical in the
-/// radio's own words are not identical to fix.
+/// output after the wrong problem. The signal is what tells the two failures that look identical in
+/// the radio's own words apart — a refused password and a station too far away both arrive as
+/// "could not join".
 ///
 /// The reason renders as the driver's own variant name, which is a Rust identifier: no quotes, no
 /// backslash, no controls, so it cannot end the JSON string the state line is reported in — by
@@ -180,11 +180,10 @@ impl core::fmt::Display for JoinFailure {
 
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///
-/// The stack is returned immediately rather than once DHCP has produced an address, because the
-/// address arrives in the `report_address` task and the caller has no reason to wait for it:
-/// everything this function starts runs in its own task. `None` means there was no network to join,
-/// either because no credentials were compiled in or because the radio refused to start; in both
-/// cases the rest of the firmware is unaffected, and what went wrong is on the state line.
+/// `None` means there was no network to join: the radio did not start, or there were no credentials
+/// compiled in. Either way the rest of the firmware is unaffected, and what went wrong is on the
+/// state line rather than only in the log — the greeting reads this long after the boot that caused
+/// it, and a reader working backwards from a missing address is being asked to guess.
 ///
 /// # Panics
 ///

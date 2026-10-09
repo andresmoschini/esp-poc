@@ -3,8 +3,8 @@
 //! Four decisions live in this crate, and every one of them is one the firmware would otherwise get
 //! subtly wrong and nobody would notice until it mattered:
 //!
-//! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/wifi.rs`
-//!   both print one, and they used to be two pieces of formatting that could drift apart.
+//! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/report.rs`
+//!   both print one, and one rendering is one thing to keep correct rather than two.
 //! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
 //!   that cannot be checked by looking at it, and this is the only part of the firmware that knows
 //!   what day it is.
@@ -252,10 +252,9 @@ pub struct Answer {
     ///
     /// Not adjusted, and the reason is worth writing down: NTP counts in a timescale that includes
     /// leap seconds and the Unix epoch does not, so the two disagree by however many leap seconds
-    /// have been inserted since 1972 — 27 when this was written, and the count only goes up. This
-    /// firmware prints what the wire says rather than guessing at the correction, because a firmware
-    /// that subtracts 27 on the strength of a number it read somewhere ages badly: the next leap
-    /// second makes it wrong, and nothing here would notice.
+    /// have been inserted since 1972. This firmware prints what the wire says rather than guessing at
+    /// the correction, because a firmware that subtracts a number it read somewhere ages badly: the
+    /// next leap second makes it wrong, and nothing here would notice.
     pub epoch_secs: u64,
 
     /// How many steps the server is from a reference clock: one is a clock that is itself a
