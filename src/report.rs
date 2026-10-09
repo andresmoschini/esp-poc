@@ -1,59 +1,16 @@
 //! Report what this chip is doing to an HTTPS API, every five minutes, over TCP.
 //!
-//! This is the first thing in the firmware that talks to something outside the local network. The
-//! other two — the radio and the time server — are a name to resolve and a socket on the LAN; this
-//! one is a host on the internet, a connection that can be refused or reset in the middle of an
-//! exchange, and a reply that is untrusted input. So everything the radio can do wrong has a state
-//! published for the greeting in [`crate::wifi`], and everything here has a sentence and a line in
-//! the log, decided in `poc-report` and printed here.
+//! This is the first thing in the firmware that talks to something outside the local network: an
+//! answer can be refused, reset mid-exchange, or not be the API at all.
 //!
-//! ## What it sends, and what it expects back
+//! **The HTTP framing is `edge-http`'s** — connect, request head, and the loop that reads until a
+//! reply is whole. That is where the fiddly part of an HTTP client lives, and this firmware shipped
+//! the bug it caused. What is left here is the one thing a general-purpose client cannot decide:
+//! **which API this build reports to**, and what to say about what it said back.
 //!
-//! One event every [`REPORT_EVERY_SECS`], carrying the state line as its payload. The body and the
-//! timestamp's format are in `poc-report` because those are decisions a host can check; this file is
-//! the part that needs a network.
-//!
-//! **The HTTP framing is `edge-http`'s.** The connect, the request head, the reading of a reply,
-//! and the loop that keeps reading until one is whole are all [`edge_http`]: this file builds a
-//! [`Connection`], sends the head and the body through it, and
-//! reads back the answer. That is not an arbitrary line to draw. The framing is the part of an HTTP
-//! client that is fiddly in the detail nobody reads — `Content-Length` versus a header the library
-//! guesses, CRLF, a reply that arrives in as many reads as the network decides — and this firmware
-//! shipped the resulting bug: it read the reply once and judged whatever arrived, so a read landing
-//! inside the 25-byte status line of a 650-byte reply reported "what answered was not the API" for
-//! a reply the API had sent correctly. What `edge-http` removes is that class of bug, and what is
-//! left here is the one thing a general-purpose HTTP client cannot decide: **which API this build
-//! reports to**, and what to say about what it said back.
-//!
-//! The `Connection` does the `connect` itself — TCP and the TLS handshake with it — which is why
-//! there is no `tls::open` any more: the handshake's twenty-second budget and the line saying what
-//! the handshake settled on live on this exchange rather than in [`crate::tls`]. What that costs is
-//! one lost distinction: a refused connection, a failed handshake and a head that did not go out
-//! are one call now, and one line when it fails.
-//!
-//! **It sends no credentials.** There is no `Authorization` header, so the API answers 401 and
-//! the log says so on every pass — that line is the feature working, not a bug. Adding the token is
-//! the next piece of work, and nothing here has to change for it.
-//!
-//! ## What is here now, and what is not
-//!
-//! - **TLS, and therefore a bearer token would be safe to add.** The exchange runs through
-//!   [`crate::tls`], so the port is 443 and the line [`start`] prints says `https`. What that buys
-//!   is the whole reason the token can come next: a credential in cleartext is a password on the
-//!   wire. What it does not buy is a check that the certificate has not expired — see the note in
-//!   [`crate::tls`], which is a property of how `MbedTLS` was built rather than of this code.
-//! - **A retry that is not "wait five minutes".** One attempt per interval, and a failure to reach
-//!   the API is a line in the log. It is not a state on the greeting, because the greeting is about
-//!   this chip and the API is somebody else's server.
-//!
-//! ## What `edge-http` does not decide, and this file still does
-//!
-//! A general-purpose HTTP client knows nothing about which API it is talking to, so everything about
-//! *that* is here and is what this file is for: which host and path from the build's configuration,
-//! which headers this exchange sends and why each is there, and what to say about what came back.
-//! The three lines it prints are the same three lines whatever the status, because a reader of a
-//! serial log should not have to know which failure they are looking at to find out what the log
-//! says.
+//! **It sends no credentials**, so the API answers 401 and the log says so on every pass — that line
+//! is the feature working, not a bug. The exchange is over TLS through [`crate::tls`], which is
+//! what makes the token the next piece of work safe to add.
 
 use core::ffi::CStr;
 use core::fmt::Write as _;
@@ -70,9 +27,9 @@ use embassy_executor::Spawner;
 use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::peripherals::{ADC1, RNG};
-use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
+use poc_domain::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
-use crate::{clock, status, tls};
+use crate::{TIMEOUT, clock, status, tls};
 
 /// Which API to report to, from the build's configuration.
 ///
@@ -170,27 +127,20 @@ fn server_name(buffer: &'static mut [u8; NAME_LEN]) -> &'static CStr {
     CStr::from_bytes_until_nul(buffer).expect("a NUL was just written")
 }
 
-/// How long any single step of an exchange may take, save the first one.
-///
-/// Each step is timed on its own, as in `src/ntp.rs`, so that a line saying an exchange failed also
-/// says which part of it failed: a body that does not go out and a server that does not answer are
-/// different problems with different fixes. The first step — connect, shake hands, send the head —
-/// is one call inside `edge-http`'s `Connection` and keeps its own budget in [`HANDSHAKE`].
-const TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How long the connect, the handshake and the request head may take together.
 ///
 /// One budget rather than three because `edge-http`'s `Connection` does all three inside one call:
 /// the TCP connect, the TLS handshake and the head going out are a single `initiate_request`, so a
 /// line saying "the handshake failed" and a line saying "the head did not go out" would be two names
-/// for one timeout.
+/// for one timeout. Every other step is [`crate::TIMEOUT`], which is the connect included: a
+/// connection that could not be established is a step that did not finish in time, like any other.
 ///
-/// The handshake is what makes this longer than [`TIMEOUT`]: every other step is a request going out
-/// or a reply coming back over an established connection, while this one is the API proving who it
-/// is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the chip's
-/// accelerators is seconds rather than milliseconds. The handshake is also renegotiated from scratch
-/// every five minutes, because the connection is built fresh each time and paid for in full every
-/// time.
+/// The handshake is what makes this longer than [`crate::TIMEOUT`]: every other step is a request
+/// going out or a reply coming back over an established connection, while this one is the API
+/// proving who it is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the
+/// chip's accelerators is seconds rather than milliseconds. The handshake is also renegotiated from
+/// scratch every five minutes, because the connection is built fresh each time and paid for in full
+/// every time.
 ///
 /// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
 /// inside five seconds, so this only bounds the failure where nothing comes back at all.
@@ -199,7 +149,7 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 /// How many bytes of body to build.
 ///
 /// 512, comfortably over the longest body this firmware can produce: a failed join with a signal in it
-/// and a clock counting from boot, which `poc-report`'s tests measure at under 300. The buffer is
+/// and a clock counting from boot, which `poc-domain`'s tests measure at under 300. The buffer is
 /// sized over the worst case rather than the usual one, because a body that does not fit is a report
 /// that is silently not sent.
 const BODY_LEN: usize = 512;
@@ -255,10 +205,9 @@ const STATUS_LEN: usize = 256;
 /// once the network stack exists, and every step inside it is bounded by a timeout of its own. A
 /// network that never comes up costs this task nothing but its own waiting.
 ///
-/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange: the
-/// generator is only handed out once the SAR ADC source behind it has been enabled, which takes
-/// both peripherals. They travel by value because the task enables the source itself, once DHCP is
-/// up — not here, where nothing has joined yet. See [`crate::tls::boot`] for why the wait matters.
+/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange, and they
+/// travel by value because the task enables the source itself rather than this function doing it
+/// before anything has joined. [`crate::tls::boot`] says why the wait matters.
 ///
 /// # Panics
 ///
@@ -578,7 +527,7 @@ fn say(code: Option<u16>, body: &[u8]) {
     match code {
         Some(201) => info!(
             "the API stored the event, 201 after {}",
-            defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
+            defmt::Display2Format(&poc_domain::age(Instant::now().as_secs()))
         ),
         Some(status) => warn!("the API did not store the event: {}", status),
         None => warn!("the API did not store the event: no status"),
@@ -591,7 +540,7 @@ fn say(code: Option<u16>, body: &[u8]) {
     if code != Some(201) {
         info!(
             "the API said: {}",
-            defmt::Display2Format(&poc_report::logged(body))
+            defmt::Display2Format(&poc_domain::logged(body))
         );
     }
 }

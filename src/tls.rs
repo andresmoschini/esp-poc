@@ -1,47 +1,19 @@
 //! One HTTPS connection to the API: the trust anchor it is verified against, and the factory every
 //! connection is made through.
 //!
-//! ## Why this goes through `edge-nal`
+//! **A socket is not reusable.** `smoltcp` answers `connect` on an open socket with `InvalidState`,
+//! so one held for the life of a task means every exchange after the first is refused before a
+//! packet goes out; `edge-nal-embassy` builds it per `connect`, `edge-nal-tls` layers TLS on the
+//! factory rather than on a borrowed socket, and `edge-http`'s `Connection` drives the connect
+//! itself. **Do not reintroduce a socket that outlives one exchange.**
 //!
-//! The first version of this file talked to `embassy-net` directly: a `TcpSocket` owned by the
-//! reporting task, `connect` called on it, and a TLS session over it. That is not much code, but two
-//! of its properties were wrong and one of them was a bug this repository shipped and then found:
-//!
-//! - **A socket is not reusable.** `smoltcp` answers `connect` on an open socket with
-//!   `InvalidState`, so a socket has to be built per connection and dropped after. The task was
-//!   holding one, which meant every report after the first failed before a packet went out. The
-//!   buffers then had to be built separately and threaded through the reporter to make that work.
-//! - **TLS over it is a second API.** The session borrows the socket, borrows a NUL-terminated server
-//!   name, and borrows a `&'static mut` to the RNG, and every one of those lifetimes had to be
-//!   spelled out at every use.
-//!
-//! `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a pool when the
-//! connection is dropped, which makes both of the first two facts the library's problem rather than
-//! this file's. `edge-nal-tls` layers the TLS session on top of a factory rather than on a borrowed
-//! socket, and `edge-http`'s `Connection` drives the connect itself. What is left here is the part
-//! none of them knows about: which root the API's certificate has to chain to.
-//!
-//! `mbedtls-rs` is still a direct dependency, and deliberately so. It is what puts the bytes on the
-//! wire, `edge-nal-tls` re-exports it, and the trust anchor is built from its types — but nothing
-//! here names `embassy_net::tcp` any more.
-//!
-//! ## What is verified, and what is not
-//!
-//! Chain, signatures and hostname are checked: the certificate the API presents has to lead to
-//! `certs/isrg-root-x1.der` and has to name the host this firmware asked for. **Expiry dates are not
-//! checked.** That is not a choice made here but a consequence of how the `MbedTLS` in this tree was
-//! built: `MBEDTLS_HAVE_TIME_DATE` is compiled out unless `mbedtls-rs`'s `hook-wall-clock` feature is
-//! on, and turning it on changes the C library's configuration, which makes `mbedtls-rs-sys`
-//! discard the static libraries it ships and compile `MbedTLS` from C source instead — needing
-//! `CMake`, Clang and a RISC-V C cross-compiler, none of which this project otherwise requires. So the
-//! promise this firmware can keep is "this chain leads to ISRG", not "this chain leads to ISRG and
-//! is current". `src/clock.rs` already holds a real time from SNTP, so enabling the hook and
-//! supplying it is the fix; it is a build-environment change rather than a code change, which is why
-//! it is its own piece of work.
-//!
-//! TODO: read the peer certificate's validity dates from the session and compare them against
-//! `clock::time()` once SNTP has answered. That closes the expiry hole while keeping the
-//! shipped static libraries, unlike `hook-wall-clock`.
+//! **Expiry dates are not checked**, which is a consequence of how the `MbedTLS` in this tree was
+//! built rather than a choice made here: the only way to enable `MBEDTLS_HAVE_TIME_DATE` is
+//! `mbedtls-rs`'s `hook-wall-clock` feature, and enabling it makes `mbedtls-rs-sys` compile
+//! `MbedTLS` from C source instead of using the libraries it ships. So the promise this firmware
+//! keeps is "this chain leads to ISRG", not "this chain leads to ISRG and is current"; `src/clock.rs`
+//! holds a real time, so comparing the certificate's own validity dates against it is the fix that
+//! keeps the shipped libraries.
 
 use core::ffi::CStr;
 
@@ -121,9 +93,7 @@ pub fn instance(trng: Trng) -> &'static Tls<'static> {
 ///
 /// The source is enabled here — once an address is up — rather than at boot because enabling it is
 /// what keeps a C6 from joining at all: the source is the SAR ADC, and [`TrngSource::new`]
-/// reprograms it while the station has not even authenticated. Measured by bisecting the join
-/// failure to that one call: everything at or before `3a3706b` joins in seconds, `4cbbdfe` never
-/// does, and adding only those two lines back reproduces it. DHCP up implies the station joined, so
+/// reprograms it while the station has not even authenticated. DHCP up implies the station joined, so
 /// from here on the radio is associated and the ADC is this exchange's to use.
 ///
 /// The source is parked in a static rather than held because nothing outlives this call to keep it:

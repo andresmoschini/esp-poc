@@ -12,6 +12,18 @@
 // `StaticCell` dance that esp-hal's own examples do.
 #![feature(type_alias_impl_trait)]
 
+use embassy_time::Duration;
+
+/// How long any single step of a network exchange may take.
+///
+/// One value for the three steps that share it — resolving a name, sending a request, reading a
+/// reply — because one timeout is what they all mean. They are timed separately rather than the
+/// exchange as a whole so that a log that says "timed out" also says which of them did: a name that
+/// does not resolve and a server that does not answer are different problems, and the fixes are
+/// opposite. A per-module constant spelled the same number three times is three places for that to
+/// be right in and one place too many to look in.
+pub const TIMEOUT: Duration = Duration::from_secs(5);
+
 pub mod clock;
 pub mod dns;
 pub mod ntp;

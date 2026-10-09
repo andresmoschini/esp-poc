@@ -2,25 +2,18 @@
 //!
 //! Three tasks produce the three facts on the state line — the radio in [`crate::wifi`]'s task, the
 //! time in [`crate::clock`], the address in the stack the same task hands back — and none of them
-//! can return to the loop in `src/bin/main.rs` that prints them. This module is the one place that
-//! asks all three and puts the answers together, so that the greeting is a call rather than an
-//! argument list assembled next to the printer.
+//! can return to the loop that prints them. This is the one place that asks all three and orders the
+//! answers, so the greeting is a call rather than an argument list assembled next to the printer.
+//! It is its own module rather than a line in `src/bin/main.rs` because that file is generated; what
+//! has to be put back by hand is listed in AGENTS.md, and this is not on it.
 //!
-//! It is here rather than in `src/bin/main.rs` for a second reason: that file is generated, and
-//! esp-generate overwrites it. Anything worth keeping in it has to be put back by hand after a
-//! regeneration, which is recorded in AGENTS.md; this is not in that list, because it is not
-//! regenerated.
-//!
-//! There is no logic here that a host can check, and that is the design: the wording of the states
-//! lives next to the hardware that decides them — the radio's in [`crate::wifi`], the time's in
-//! `poc-report` — and what this module does is order them. `embassy-net` has no host build, so there
-//! is no way to ask that stack for its address off a board, and the line as a whole can only be read
-//! on one.
+//! The wording of each state lives next to the hardware that decides it, and nothing here is
+//! testable on a host: `embassy-net` has no host build, so the line can only be read on a board.
 
 use core::fmt;
 
 use embassy_net::Stack;
-use poc_report::{Address, Time};
+use poc_domain::{Address, Time};
 
 use crate::{clock, wifi};
 

@@ -43,7 +43,7 @@ import { hostTriple } from "./host.mjs";
 import { runVisible } from "./process.mjs";
 
 /** The crate holding the firmware logic that does not need a chip. */
-const CRATE = "crates/poc-report";
+const CRATE = "crates/poc-domain";
 
 /**
  * Builds the firmware's host-side tests and runs them.

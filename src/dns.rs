@@ -1,26 +1,18 @@
 //! The one name lookup both network clients share.
 //!
-//! [`crate::ntp`] asks a time server and [`crate::report`] asks an API, and both start the same
-//! way: wait out a query for an A record and take the IPv4 address out of the answer. That is one
-//! exchange with one shape, so it is one function rather than two copies of one.
-//!
-//! What is not shared is what a refusal means, so the sentences stay with the callers: a name that
-//! does not resolve is DNS or the network for one and a name this cannot be reached at for the
-//! other, and the name is in both sentences because a log line about a name is not answerable
-//! without the name.
+//! [`crate::ntp`] asks a time server and [`crate::report`] asks an API, and both start by waiting
+//! out a query for an A record and taking the IPv4 address out of the answer. What a refusal means
+//! is not shared, so the sentences stay with the callers: a name that does not resolve is DNS or the
+//! network for one and a name this cannot be reached at for the other, and a log line about a name
+//! is not answerable without the name.
 
 use core::net::Ipv4Addr;
 
 use embassy_net::dns::DnsQueryType;
 use embassy_net::{IpAddress, Stack};
-use embassy_time::{Duration, with_timeout};
+use embassy_time::with_timeout;
 
-/// How long a lookup may take before it is given up on.
-///
-/// Five seconds, as in both callers before they shared this: a name that does not resolve and a
-/// server that does not answer are different problems, and the timeout on the lookup is what tells
-/// them apart in the log.
-const TIMEOUT: Duration = Duration::from_secs(5);
+use crate::TIMEOUT;
 
 /// What a lookup came to when it did not produce an address.
 ///

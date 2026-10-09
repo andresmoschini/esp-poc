@@ -1,9 +1,11 @@
 // The subprocess wrappers the repository's automation shares.
 //
-// `setup` drives `npm` and `eol` drives `git`, and both want the same two shapes: a command whose
-// progress the operator watches, and a command whose output is read back. Keeping them here is what
-// lets the logic that decides *what* to run stay in plain functions that take values and return
-// `Result`, in the module that owns the decision.
+// `setup` drives `npm` and `git-state` drives `git`, and both want the same two shapes: a command
+// whose progress the operator watches, and a command whose output is read back. Keeping them here is
+// what lets the logic that decides *what* to run stay in plain functions that take values and return
+// `Result`, in the module that owns the decision. `reportFailure` is the third shape, shared by the
+// steps that are a function of this repository's own code rather than a command: it is where their
+// `Promise` becomes the boolean the gate asks a step for.
 
 import { spawn } from "node:child_process";
 
@@ -80,4 +82,25 @@ export function captureUntrimmed(root, program, args) {
       }
     });
   });
+}
+
+/**
+ * Prints what went wrong, the way a subprocess step would, and answers whether the step passed.
+ *
+ * A step written as a function of this repository's own code has no exit code to hand back, so this
+ * is where its rejected promise becomes the boolean `run` asks for — and it lives here rather than in
+ * each of the two modules that need it, because two copies of it would be two places where the shape
+ * of a step's failure is decided.
+ *
+ * @param {Promise<void>} outcome What the step did.
+ * @returns {Promise<boolean>} Whether it passed.
+ */
+export async function reportFailure(outcome) {
+  try {
+    await outcome;
+    return true;
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return false;
+  }
 }

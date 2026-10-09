@@ -28,7 +28,7 @@ private_intra_doc_links = "deny"
 bare_urls = "deny"
 
 [package]
-name = "poc-report"
+name = "poc-domain"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"

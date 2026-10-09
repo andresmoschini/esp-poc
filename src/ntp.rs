@@ -1,32 +1,28 @@
 //! Ask a time server what time it is, and set the chip's clock from the answer.
 //!
-//! SNTP is a request and a reply over UDP port 123, and the reply is a 48-byte header that says
-//! what time the server thinks it is. There is no library for it here on purpose: the whole protocol
-//! as a plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and
-//! the parts of it that are worth checking — the offsets, the 1900 epoch, a reply that is not an
-//! answer to this request — are all decisions that a host can make and a board cannot test. Those
-//! are in `poc-report`; this file is the part that needs a network.
+//! SNTP is a request and a reply over UDP port 123, and the reply is a 48-byte header saying what
+//! time the server thinks it is. There is no library for it on purpose: the whole protocol as a
+//! plain client speaks it is a name to resolve, a socket, and 48 bytes in each direction, and the
+//! parts worth checking — the offsets, the 1900 epoch, a reply that is not an answer to this
+//! request — are decisions a host can make and a board cannot. Those are in `poc-domain`; this file
+//! is the part that needs a network.
 //!
-//! The clock this sets does not survive a power cycle, because there is nowhere on this chip to put
-//! it that would. That is why the task keeps going after the first answer rather than stopping:
-//! every boot starts at zero again and has to ask again.
-//!
-//! A failed attempt is not only logged: it is also handed to [`clock::report_failure`], which is what
-//! the greeting's state line reads to explain a time that is still counting from boot. The words for
-//! it live in `poc-report` with the rest of the sentences, and are tested on the host; what the
-//! driver said underneath stays in this file's log.
+//! The clock does not survive a power cycle, so this task keeps asking for the life of the firmware.
+//! A failed attempt is not only logged: it goes to [`clock::report_failure`], which is what the
+//! greeting reads to explain a time still counting from boot.
 
 use core::net::Ipv4Addr;
 
-use defmt::{error, info, warn};
+use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_net::udp::{PacketMetadata, RecvError, UdpSocket};
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use poc_report::{
-    Answer, Clock, Leap, Obstruction, SNTP_LEN, STALE_AFTER_SECS, sntp_reply, sntp_request,
+use poc_domain::{
+    Answer, Clock, Obstruction, SNTP_LEN, STALE_AFTER_SECS, sntp_reply, sntp_request,
 };
 
+use crate::TIMEOUT;
 use crate::clock;
 
 /// The server to ask. `pool.ntp.org` is the pool the RFC's own examples use: anycast, so the
@@ -41,13 +37,6 @@ const SERVER: &str = match option_env!("NTP_SERVER") {
 
 /// Port 123, which is the only port an NTP server answers on, and the only one this sends to.
 const PORT: u16 = 123;
-
-/// How long any single step of the exchange may take.
-///
-/// Each step is timed separately rather than the exchange as a whole, so that a log that says
-/// "timed out" also says which of them did: a name that does not resolve and a reply that does not
-/// arrive are different problems, and the retry below is the same either way.
-const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait before asking again after a server has answered.
 ///
@@ -147,15 +136,6 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
                     defmt::Display2Format(&Clock::utc(answer.epoch_secs)),
                     answer.stratum,
                 );
-
-                // Only when there is something to say: a leap second is a fact about tonight, and
-                // "none pending" is what every other line of this log already assumes.
-                if answer.leap != Leap::Normal {
-                    warn!(
-                        "the time server says {}",
-                        defmt::Display2Format(&answer.leap)
-                    );
-                }
 
                 RESYNC
             }

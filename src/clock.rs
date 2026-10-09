@@ -1,82 +1,50 @@
 //! The chip's clock: what time it is, and where that answer came from.
 //!
-//! There is no battery-backed clock on this chip, so a time that survives a power cycle is not
-//! something this firmware can have: what lives here is in RAM, and it is asked for again over the
-//! network every time the chip boots. Between two answers the scheduler's monotonic counter counts
-//! on, so the clock keeps moving without asking — which also means it drifts, by however much the
-//! crystal drifts, until the next answer puts it right.
+//! There is no battery-backed clock here, so what lives in this file is in RAM and is asked for
+//! again over the network every boot, drifting on its own crystal between answers. `src/ntp.rs` sets
+//! it and `src/status.rs` prints it; neither knows how the number got there. A time on its own is
+//! not enough to read — `18:22:31` from a count since boot and from a server are the same six
+//! characters — so the clock keeps the last answer, how long ago it came, and the last thing that
+//! went wrong asking, and [`time`] puts those into a [`poc_domain::Time`].
 //!
-//! That is the whole of the device's timekeeping: one number, set from outside. `src/ntp.rs` is
-//! what sets it, and `src/status.rs` is what prints it, and neither of them knows how the number
-//! got there.
-//!
-//! ## What the clock can say about itself
-//!
-//! A time on its own is not enough to read: `18:22:31` from a count since boot and `18:22:31` from a
-//! server are the same six characters and mean different things. So the clock keeps three facts
-//! about where it is — whether a server has answered, how many steps that server was from a
-//! reference clock, and how long ago it answered — plus the last thing that went wrong asking, which
-//! is the answer to "why is this still counting from boot". [`time`] puts the four of them together
-//! into a [`poc_report::Time`], and the wording and the arithmetic of that are in `poc-report` where
-//! a host can check them.
+//! It is all behind one lock rather than a word per field, for the reason `src/wifi.rs` holds its
+//! `Link` that way: on one core the lock is a brief critical section taken twice a second, and a
+//! value published as several words is a value whose parts can be read at different moments.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
-use poc_report::{Obstruction, Time};
+use poc_domain::{Obstruction, Setting, Time, source};
 
-/// Whether a time source has answered yet.
-static ANSWERED: AtomicBool = AtomicBool::new(false);
-
-/// The number of seconds between this chip's own count of seconds and real time, at the moment of
-/// the last answer.
+/// What the clock knows: the last answer it was given, and the last thing that stopped one arriving.
 ///
-/// The offset rather than the time itself, and the difference is small where a date is not: what
-/// [`time`] has to do with an answer is add the time that has passed since to it, so the difference
-/// between a real time and this chip's zero is all the arithmetic ever needs. A count of seconds
-/// since 1970 is not a small difference, and an `i32` of them is [`storable`]'s whole job.
-static OFFSET: AtomicI32 = AtomicI32::new(0);
-
-/// How many steps from a reference clock the server that answered last was.
+/// Published as the values themselves rather than as one word encoding of them, for the reason
+/// `src/wifi.rs` publishes its `Link` that way: a value split across several words is a value whose
+/// parts can be read at different moments. The `RefCell` is what makes the write safe without an
+/// `unsafe` — nothing locks again inside a lock closure and no interrupt handler touches this
+/// static, so the borrow cannot fail, and if that ever stops being true it panics rather than
+/// corrupting.
 ///
-/// A number rather than a sentence, because there is nothing useful to compare it against and a
-/// firmware that invented a threshold would be guessing. What it is good for is noticing that it
-/// changed, and for saying where the time on the greeting came from.
-static STRATUM: AtomicU8 = AtomicU8::new(0);
+/// It starts with nothing because that is the state this chip is in from the moment it starts: no
+/// server has answered and no attempt has failed.
+static FACTS: Mutex<CriticalSectionRawMutex, RefCell<Facts>> = Mutex::new(RefCell::new(Facts {
+    setting: None,
+    obstruction: None,
+}));
 
-/// How long the chip had been running when a server last answered, in seconds.
-///
-/// An `u32` rather than a `u64` because 136 years of running time is more than the clock will ever
-/// hold, and the saturation in [`seconds_in_a_word`] is what it reaches rather than something a
-/// reader of the greeting can.
-static ANSWERED_AT: AtomicU32 = AtomicU32::new(0);
+/// Everything the clock holds, and the whole of what it knows.
+#[derive(Debug, Clone, Copy)]
+struct Facts {
+    /// The clock as it was last set, or `None` before the first time it was.
+    ///
+    /// `None` rather than a zero timestamp, because a zero is a time — 1970-01-01T00:00:00Z — and
+    /// this firmware knows how to print one.
+    setting: Option<Setting>,
 
-/// What stood between this chip and a time, the last time something did.
-///
-/// Kept here rather than in `src/ntp.rs` because the question it answers — why is the time still
-/// counting from boot — is about the clock, and because [`time`] reads it in the same breath as the
-/// rest. `None` before the first attempt rather than an explanation of nothing having gone wrong.
-///
-/// A lock around the value rather than one atomic holding a word for it, for the same reason
-/// `src/wifi.rs` holds its state that way: on a chip with one core the lock is a brief critical
-/// section, and what it holds is the obstruction itself rather than an encoding of it.
-static OBSTRUCTED: Mutex<CriticalSectionRawMutex, RefCell<Option<Obstruction>>> =
-    Mutex::new(RefCell::new(None));
-
-/// Where the clock was last set, and how long ago.
-///
-/// Two facts that only mean anything together — a stratum from an hour ago is not a fact about the
-/// time being printed — so they are returned as one rather than as two getters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Source {
-    /// How many steps the server that answered was from a reference clock: one is a clock that is
-    /// itself a reference, such as an atomic clock or a GPS receiver.
-    pub stratum: u8,
-
-    /// How long ago it answered, in seconds.
-    pub age_secs: u64,
+    /// What stood between this chip and a time, the last time something did, and `None` before the
+    /// first attempt rather than an explanation of nothing having gone wrong.
+    obstruction: Option<Obstruction>,
 }
 
 /// Sets the clock from a count of seconds since the Unix epoch, and from the server that gave it.
@@ -89,22 +57,22 @@ pub struct Source {
 /// is an answer published half of: the greeting says where the time came from, and "from somewhere"
 /// is not an answer.
 pub fn set(epoch_secs: u64, stratum: u8) {
-    let running = uptime_secs();
+    FACTS.lock(|slot| {
+        let mut facts = slot.borrow_mut();
 
-    // Stored in this order, and read as if it arrived in this order. A reader that saw the flag
-    // without the words behind it would have no idea whether there was anything to read, and one
-    // that saw a stale one would be off by however much the clock had moved between two answers.
-    // The release store and the acquire loads are what make the set atomic from the reader's side;
-    // the chip has one core, so this is the only ordering that matters here.
-    OFFSET.store(storable(epoch_secs, running), Ordering::Release);
-    STRATUM.store(stratum, Ordering::Relaxed);
-    ANSWERED_AT.store(seconds_in_a_word(running), Ordering::Relaxed);
+        // The running time is read once, here, rather than again on the way out: the age of this
+        // answer is measured against the moment it arrived, and a reader that measured it against a
+        // later one would be a reader reporting the clock as older than it is.
+        facts.setting = Some(Setting {
+            epoch_secs,
+            stratum,
+            answered_at_secs: uptime_secs(),
+        });
 
-    // An answer clears the last failure: the reason there was no time was that the last attempt did
-    // not produce one, and there is one now.
-    OBSTRUCTED.lock(|slot| *slot.borrow_mut() = None);
-
-    ANSWERED.store(true, Ordering::Release);
+        // An answer clears the last failure: the reason there was no time was that the last attempt
+        // did not produce one, and there is one now.
+        facts.obstruction = None;
+    });
 }
 
 /// Reports that an attempt to ask a time server did not produce one.
@@ -112,93 +80,42 @@ pub fn set(epoch_secs: u64, stratum: u8) {
 /// The reason is kept rather than only printed, because "why is this still counting from boot" is
 /// the question the greeting raises twice a second and the log answered only once.
 pub fn report_failure(obstruction: Obstruction) {
-    OBSTRUCTED.lock(|slot| *slot.borrow_mut() = Some(obstruction));
+    FACTS.lock(|slot| slot.borrow_mut().obstruction = Some(obstruction));
 }
 
 /// What the firmware believes the time is, and why it believes it.
 ///
-/// This never waits and never fails: it is a handful of loads under brief critical sections and a
-/// subtraction, which is what lets the greeting call it twice a second without knowing anything
-/// about the network. What it
-/// cannot say is anything the four facts it reads do not add up to, which is the point — the shape of
+/// This never waits and never fails: it is one brief critical section and a subtraction, which is
+/// what lets the greeting call it twice a second without knowing anything about the network. What
+/// it cannot say is anything the facts it reads do not add up to, which is the point — the shape of
 /// the answer says whether it is a time of day or a count from boot, and now also whether a server
 /// confirmed it recently enough to be believed.
 #[must_use]
 pub fn time() -> Time {
-    if let Some(source) = source() {
-        return Time::answered(epoch_secs(), source.stratum, source.age_secs);
-    }
-
     let elapsed_secs = uptime_secs();
 
-    // Nothing to explain yet: a chip that has not asked a server anything has not had a failure, and
-    // the word for that is the same one the static starts as. Saying what the last attempt came to
-    // before there has been one is the kind of guess the rest of this file is careful not to make.
-    match last_obstruction() {
-        Some(obstruction) => Time::since_boot_after(elapsed_secs, obstruction),
-        None => Time::since_boot(elapsed_secs),
-    }
-}
+    FACTS.lock(|slot| {
+        let facts = slot.borrow();
 
-/// What the last answer was, and how long ago it came, or `None` if there has not been one.
-fn source() -> Option<Source> {
-    if !ANSWERED.load(Ordering::Acquire) {
-        return None;
-    }
+        match source(facts.setting, elapsed_secs) {
+            Some(source) => Time::answered(source.epoch_secs, source.stratum, source.age_secs),
 
-    let answered_at = u64::from(ANSWERED_AT.load(Ordering::Acquire));
-
-    Some(Source {
-        stratum: STRATUM.load(Ordering::Acquire),
-        age_secs: uptime_secs().saturating_sub(answered_at),
+            // Nothing to explain yet: a chip that has not asked a server anything has not had a
+            // failure, and the word for that is the same one the state starts as. Saying what the
+            // last attempt came to before there has been one is the kind of guess the rest of this
+            // file is careful not to make.
+            None => match facts.obstruction {
+                Some(obstruction) => Time::since_boot_after(elapsed_secs, obstruction),
+                None => Time::since_boot(elapsed_secs),
+            },
+        }
     })
-}
-
-/// What stood between this chip and a time, the last time something did.
-fn last_obstruction() -> Option<Obstruction> {
-    OBSTRUCTED.lock(|slot| *slot.borrow())
-}
-
-/// Seconds since the Unix epoch, as this chip's own count plus the offset of the last answer.
-fn epoch_secs() -> u64 {
-    let epoch_secs = i64::from(OFFSET.load(Ordering::Acquire))
-        .saturating_add(i64::try_from(uptime_secs()).unwrap_or(i64::MAX));
-
-    u64::try_from(epoch_secs).unwrap_or(u64::MAX)
 }
 
 /// How long the chip has been running.
 ///
-/// What the age of an answer is measured against, and what the offset is applied to on the way to a
+/// What the age of an answer is measured against, and what an answer is added to on the way to a
 /// date. The count is the scheduler's own, which starts at zero when the firmware does.
 fn uptime_secs() -> u64 {
     Instant::now().as_secs()
-}
-
-/// A count of seconds as one 32-bit atomic can hold it, saturating rather than wrapping.
-///
-/// 136 years of running time, which is not a thing that happens to a proof of concept: it is here so
-/// that the value a reader sees is a large one rather than a small one that looks real.
-fn seconds_in_a_word(secs: u64) -> u32 {
-    u32::try_from(secs).unwrap_or(u32::MAX)
-}
-
-/// The offset between a real time and this chip's zero, in the one word a reader can take whole.
-///
-/// A count of seconds fits in about 68 years either way of the chip's own zero, and a time further
-/// from that than 68 years is not one this firmware can put anywhere near a wall. Saturating rather
-/// than wrapping is the point: a wrapped offset would be a date in the past that looks like a real
-/// one, and a saturated one is 68 years out, which does not.
-///
-/// The date this stops serving correctly on is 2038-01-19, which is where an `i32` of seconds since
-/// 1970 runs out — a reading after it lags by however far past that it is, rather than jumping
-/// backwards. Fixing it means a 64-bit static, which on either chip would be published through
-/// `portable-atomic` and read one chunk at a time inside a critical section.
-fn storable(epoch_secs: u64, since_boot_secs: u64) -> i32 {
-    let since_boot = i64::try_from(since_boot_secs).unwrap_or(i64::MAX);
-    let offset = i64::try_from(epoch_secs)
-        .unwrap_or(i64::MAX)
-        .saturating_sub(since_boot);
-
-    i32::try_from(offset).unwrap_or(if offset < 0 { i32::MIN } else { i32::MAX })
 }

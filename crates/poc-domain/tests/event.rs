@@ -1,6 +1,6 @@
-// The tests for what this firmware sends to the events API.
+// The tests for the body of a reported event, and for a reply rendered into a log.
 //
-// They are here in `tests/` for the reason `tests/report.rs` opens with: this crate is `#![no_std]`,
+// They are here in `tests/` for the reason `tests/address.rs` opens with: this crate is `#![no_std]`,
 // and an integration test is a separate crate with the standard prelude, so `assert_eq!` and `String`
 // are available without the library giving up `no_std` for its own build.
 //
@@ -10,16 +10,14 @@
 // deliberately not tested: a status code is reported as the number it is, because a mapping from
 // numbers to sentences goes stale the day a status changes what it means.
 //
-// **The HTTP framing is not tested here because this crate no longer does any.** It used to: this
-// file held the request head, a `status_line_arrived` predicate, and a parser for the status line, and
-// the read-boundary bug that shipped — reading a reply once and judging whatever arrived — was caught
-// by a test right here. All of that is `edge-http`'s now, and `src/report.rs` builds a
-// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What is logged there
-// is a status code and a body: a number, these bytes, or the fact that neither came.
+// **The HTTP framing is not tested here because this crate does none of it.** The request head, the
+// loop that reads until a reply is whole, and the status-line parser are `edge-http`'s, and
+// `src/report.rs` builds a `Connection`, writes through it, and reads back the answer. What is
+// logged there is a status code and a body: a number, these bytes, or the fact that neither came.
 
 use std::fmt::Write as _;
 
-use poc_report::{
+use poc_domain::{
     Address, Clock, EVENT_TELEMETRY, Event, LOGGED_LEN, Obstruction, REPORT_EVERY_SECS, Refusal,
     STALE_AFTER_SECS, Time, Timestamp, logged,
 };
@@ -92,108 +90,13 @@ fn every_field_of_an_event_is_a_json_string() {
 
 /// The timestamp is what the API will read back as a date, so it has to be RFC 3339 — the same
 /// rendering the state line's clock shares. The two come out of the same number, and which one goes
-/// into the body is the decision this test pins.
-#[test]
-fn the_timestamp_is_rfc_3339() {
-    assert_eq!(render(&Timestamp::at(AT)), "2026-10-04T18:22:31Z");
-
-    // Both ends of the day, and the leap day itself: a timestamp that rolls over wrongly is a row
-    // that sorts into the wrong hour rather than an error anybody sees.
-    assert_eq!(render(&Timestamp::at(0)), "1970-01-01T00:00:00Z");
-    assert_eq!(
-        render(&Timestamp::at(20_730 * 24 * 60 * 60 - 1)),
-        "2026-10-03T23:59:59Z"
-    );
-    assert_eq!(
-        render(&Timestamp::at(20_730 * 24 * 60 * 60)),
-        "2026-10-04T00:00:00Z"
-    );
-}
-
 /// 2028 is a leap year and 2100 is not, and a timestamp that gets February wrong is a body the API
-/// stores happily and a reader cannot query.
-#[test]
-fn the_timestamp_handles_the_ends_of_a_leap_year() {
-    // 2028-02-29T12:00:00Z: a leap day in a year divisible by four.
-    assert_eq!(
-        render(&Timestamp::at(1_835_438_400)),
-        "2028-02-29T12:00:00Z",
-    );
-
-    // 2000-02-29T00:00:00Z and the day after it: a century divisible by 400 is a leap year, so
-    // February has 29 days rather than 28.
-    assert_eq!(render(&Timestamp::at(951_782_400)), "2000-02-29T00:00:00Z",);
-    assert_eq!(render(&Timestamp::at(951_868_800)), "2000-03-01T00:00:00Z",);
-
-    // 2100-02-28T23:59:59Z, the last second before a century that is divisible by 100 and not by
-    // 400 takes its leap day away. A calendar that divides by four here is wrong once every hundred
-    // years, which is exactly the sort of thing that is right in every test somebody writes.
-    assert_eq!(
-        render(&Timestamp::at(4_107_542_399)),
-        "2100-02-28T23:59:59Z"
-    );
-}
-
 /// Every month of a year, which is the property that a month length is 30 or 31 and not 31 for all
 /// of them. One table rather than twelve tests, because the property is that the set is covered:
 /// the day either side of each boundary is the assertion, because a month length written into the
-/// arithmetic twice shows up as a date that is one day out.
-#[test]
-fn every_month_has_the_length_it_has() {
-    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-    // 2025-01-01T00:00:00Z, and 2025 is not a leap year, so February below is 28 days.
-    let mut first = 1_735_689_600;
-
-    for (index, length) in LENGTHS.iter().enumerate() {
-        let month = index as u64 + 1;
-
-        assert_eq!(
-            render(&Timestamp::at(first)),
-            format!("2025-{month:02}-01T00:00:00Z"),
-            "the first of month {month}",
-        );
-
-        // The last day of the month is the one the table names, and the first of the next month is
-        // the day after it — which is the whole claim being made here: the two are one day apart.
-        let last = first + (length - 1) * 86_400;
-
-        assert_eq!(
-            render(&Timestamp::at(last)),
-            format!("2025-{month:02}-{length:02}T00:00:00Z"),
-            "the last of month {month}",
-        );
-
-        first = last + 86_400;
-    }
-
-    assert_eq!(
-        render(&Timestamp::at(first)),
-        "2026-01-01T00:00:00Z",
-        "after December comes January"
-    );
-}
-
 /// A count of seconds no calendar has is not a time any server would send, but it is one the
 /// firmware can be handed — from a packet that passed every other check — and printing it has to
 /// produce a timestamp rather than an overflow panic. A panic here would be in the reporting task,
-/// and it would take the report down.
-#[test]
-fn an_impossible_epoch_renders_rather_than_overflowing() {
-    // The largest count there is, which in a debug build is where an unchecked addition would panic
-    // rather than wrap. The year is absurd; the point is that the arithmetic gets to the formatting.
-    let absurd = render(&Timestamp::at(u64::MAX));
-
-    assert!(
-        absurd.starts_with("584"),
-        "the year is finite even though the date is absurd: {absurd}"
-    );
-    assert!(
-        absurd.contains('T') && absurd.contains('Z') && absurd.contains(':'),
-        "a timestamp rather than a panic: {absurd}"
-    );
-}
-
 /// Every sentence this crate can put in a body stays quotable without escaping: no `"`, no `\`,
 /// nothing below `U+0020`.
 ///

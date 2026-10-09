@@ -73,6 +73,9 @@ dev
 # Git's line-ending rules
 safecrlf
 
+# Git plumbing the hook fixer reaches for
+cacheinfo
+
 # Repository automation
 commitlint
 commitlintrc

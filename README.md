@@ -17,9 +17,10 @@ Hello world! 2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, w
 ```
 
 It reads as the time and where it came from, then the address, then the state of the radio — the
-last because it is what a reader looks for when one of the first two is wrong. The line is a single
-`Status` in [`crates/poc-report`](crates/poc-report), so its order and its wording are things the
-gate can check rather than things assembled next to the printer.
+last because it is what a reader looks for when one of the first two is wrong. The line is one
+`Status` in [`src/status.rs`](src/status.rs), assembled from three answers that three tasks each
+produce, and its order is a decision stated once in that file rather than worked out next to the
+printer.
 
 It also says when something is wrong, and what:
 
@@ -119,22 +120,13 @@ Root X1 in [`certs/`](certs/README.md) — the self-signed root of the Internet 
 Group, under which Let's Encrypt issues the certificate the deployed Worker is served with. The
 server sends the three intermediates above it; only the root has to be on the chip.
 
-Chain, signatures and hostname are checked. **Expiry dates are not**, and that is worth being blunt
-about rather than discovering later: `MBEDTLS_HAVE_TIME_DATE` is compiled out unless `mbedtls-rs`'s
-`hook-wall-clock` feature is on, and turning it on changes MbedTLS's configuration enough that
-`mbedtls-rs-sys` throws away the static libraries it ships for these two chips and compiles MbedTLS
-from C source instead — which needs CMake, Clang and a RISC-V C cross-compiler, none of which
-anything else in this repository requires. So the promise this firmware can currently keep is "this
-chain leads to ISRG", not "this chain leads to ISRG and is current". `src/clock.rs` already holds a
-real time from SNTP, so enabling the hook and handing it that clock is the fix; it is a
-build-environment change rather than a code change.
-
-The trade it makes is worth naming, because it is not the usual one: `mbedtls-rs` only uses its
-prebuilt static libraries when the enabled features match what they were built with byte for byte.
-The obvious next step — turning the certificate buffers down from MbedTLS's 16 KiB default to
-something a chip can afford — is exactly such a change, so it costs a C toolchain too. The buffer is
-therefore paid for in RAM: the handshake takes about 32 KiB of heap at its peak, which is measured
-below.
+Chain, signatures and hostname are checked. **Expiry dates are not**, and `src/tls.rs` says why: the
+only way to enable `MBEDTLS_HAVE_TIME_DATE` is a `mbedtls-rs` feature that also makes
+`mbedtls-rs-sys` discard the static libraries it ships and compile MbedTLS from C instead. The
+promise this firmware can currently keep is "this chain leads to ISRG", not "this chain leads to
+ISRG and is current" — and the rule that decides which features are safe to turn on is the comment
+on `mbedtls-rs` in [`Cargo.toml`](Cargo.toml), which is also why the record buffers are paid for in
+heap rather than configured down.
 
 #### Where it points
 
@@ -222,11 +214,10 @@ otherwise fails as `esp-metadata` saying the target is wrong.
 
 The triple is not `imac` for both, and the difference is worth knowing: the `a` is the RISC-V atomic
 extension and the C3 does not have it, so on the C3 `compare_exchange` is not offered at any width
-and anything needing read-modify-write goes through `portable-atomic` in a critical section. Both
-chips have no atomic wider than a word, which is why the clock's numbers in `src/clock.rs` are still
-one-word atomics. What the radio is doing and the last failure reach the greeting through a mutex
-instead: on a chip with one core the lock is a brief critical section, taken twice a second, and
-what it holds is the value itself rather than an encoding of it.
+and anything needing read-modify-write goes through `portable-atomic` in a critical section. Neither
+chip has an atomic wider than a word either, which is why the clock's facts and the radio's state
+both reach the greeting through a mutex: on a chip with one core the lock is a brief critical
+section, taken twice a second, and what it holds is the value itself rather than an encoding of it.
 
 What is _not_ per-chip, and is the reason this is one branch and two features rather than two
 directories, is almost everything: `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
@@ -253,13 +244,12 @@ toolchain, both targets and the components from it:
 rustup toolchain install
 ```
 
-That is still true of the TLS stack, and it is worth knowing why, because the obvious expectation is
-the opposite. `mbedtls-rs` ships prebuilt static libraries for exactly these two triples and builds
-against them as they are; anything that changes its configuration — including the wall-clock hook
-that would make it check certificate dates — makes it compile MbedTLS from C instead, which would
-add CMake, Clang and a RISC-V C cross-compiler to the list above. See
-[what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against) for
-what that costs and what it buys.
+That is still true of the TLS stack. `mbedtls-rs` ships prebuilt static libraries for exactly these
+two triples and uses them only when its enabled features match byte for byte, so anything that
+changes its configuration compiles MbedTLS from C instead — which would add CMake, Clang and a
+RISC-V C cross-compiler to the list above. That is also why
+[what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against) says
+what it says.
 
 ## Getting it running
 
@@ -357,218 +347,41 @@ of what a board has not answered here; that has not been tried.
 
 ### A green gate does not mean the firmware works
 
-This is the one thing worth being blunt about. The gate checks that the firmware compiles, is
-lint-clean, is formatted, is spelled correctly and has no line-ending damage. It cannot check that a
-peripheral does what the code says, because there is no test target: `cargo clippy --all-targets`
-was measured failing with `can't find crate for test`, since a bare-metal binary has no test harness
-to build. Testing on-device or in a simulator is a separate piece of tooling that does not exist
-here yet.
-
-So the way to find out whether the firmware behaves is to run it — on the board or in the simulator
-— and say what you saw.
-
-Wi-Fi makes that sharper rather than softer, and there are now two observations on record rather
-than none: one per chip, on the same network, minutes apart. The network name is a placeholder —
-this file is tracked, and a home network's name is not the repository's to publish.
-
-**ESP32-C3 Super Mini**, rev v0.4, 4 MB, over the chip's own USB Serial/JTAG, which needed no
-driver. Release image 520,768 bytes, 12.61% of the flash.
-
-```text
-[INFO ] joining my-network                 (src/wifi.rs:116)
-[INFO ] joined my-network                   (src/wifi.rs:240)
-[INFO ] address 192.168.0.250/24
-[INFO ] gateway 192.168.0.1
-[INFO ] the clock is set to 2026-10-05T20:41:59Z by a stratum 3 server  (src/ntp.rs:146)
-[INFO ] Hello world! 2026-10-05T20:42:48Z (from a stratum 3 server), 192.168.0.250/24, wifi: joined
-```
-
-**ESP32-C6**, rev v0.2, 16 MB, over its USB-to-UART bridge. Release image 584,480 bytes, 3.57% of
-the flash.
-
-```text
-[INFO ] joining my-network                 (src/wifi.rs:116)
-[INFO ] joined my-network                   (src/wifi.rs:240)
-[INFO ] address 192.168.0.225/24
-[INFO ] gateway 192.168.0.1
-[INFO ] the clock is set to 2026-10-05T21:08:56Z by a stratum 3 server  (src/ntp.rs:146)
-[INFO ] Hello world! 2026-10-05T21:09:19Z (from a stratum 3 server), 192.168.0.225/24, wifi: joined
-```
-
-So on both chips the radio associates, DHCP hands out an address, and the line reads what happened.
-That is **one boot of about fifty seconds each, on one network**, and it is the same firmware — the
-two images differ only in the chip's features and its triple.
-
-Two things are worth not rounding up, because both were observed to go the other way.
-
-The time server answered in the two runs above and did not answer in a third: five retries across
-eighty-three seconds, each logging
-
-```text
-[ERROR] the time server did not answer: the time server's answer did not arrive  (src/ntp.rs:164)
-[INFO ] Hello world! 00:01:23 (counting from boot: the time server's answer did not arrive), 192.168.0.225/24, wifi: joined
-```
-
-which is the point of counting from boot rather than showing a time nothing confirmed. It also means
-the sentence `the time server's answer did not arrive` is no longer only something `poc-report`
-asserts on the host: the firmware has printed it, and the state line degraded the way those tests
-say it should.
-
-And after that the C6 stopped joining at all. Across seven boots on one network the C3 joined every
-time and the C6 joined twice out of five, the last three failures in a row. One of those runs logged
-eleven attempts over ninety seconds, every one at a strong signal, and four different reasons in
-between:
-
-```text
-[ERROR] could not join my-network: FourWayHandshakeTimeout (signal -55 dBm)
-[ERROR] could not join my-network: AuthenticationExpired (signal -60 dBm)
-[ERROR] could not join my-network: DisassociatedDueToInactivity (signal -60 dBm)
-```
-
-The first of those used to be the firmware claiming more than the radio told it: it printed
-`the network refused these credentials` for a handshake that ran out of time, and then
-`the handshake started and did not finish` as its own grouping. Both wordings are gone, and what is
-printed is what the driver reported. What can be said about that run is that the network was heard
-at a usable signal and the join did not complete — a much weaker claim, and the only one the radio
-supported.
-
-The later failures came with a falling signal, from -57 down to -70 dBm, which is a different thing
-going on and not something this repository can explain: the board was on a desk next to a router
-that answered a beacon at -55 dBm in the run above. Nothing here has established why.
-
-### What the HTTPS work was measured doing
-
-The TLS path was run on the **ESP32-C3 Super Mini** against the deployed Worker, release profile,
-over the same network as the runs above. Release image 905,232 bytes, 21.92% of the flash — the jump
-from 520,768 is MbedTLS and the certificate.
-
-```text
-[INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
-[INFO ] the clock is set to 2026-10-07T17:57:09Z by a stratum 3 server             (src/ntp.rs:146)
-[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
-[WARN ] the API did not store the event: 401
-[INFO ] the API said: {"error":"Unauthorized"}
-```
-
-and then, five minutes later, the same three lines again:
-
-```text
-[INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
-[WARN ] the API did not store the event: 401
-[INFO ] the API said: {"error":"Unauthorized"}
-```
-
-Two consecutive exchanges, TLS 1.3 both times, verification flags `0x0` both times, and the same 401
-the cleartext path produced — now over port 443, encrypted, with the API's certificate verified
-against [`certs/`](certs/README.md). **The second exchange is the interesting half of that**: it
-took a run of seven minutes to produce, and it is the only evidence the reporter works more than
-once.
-
-Three things about it are worth recording because none of them was obvious beforehand, and one of
-them was a bug that only a second exchange could show.
-
-**The reporter only ever worked once.** The first exchange succeeded and the second, five minutes
-later, logged `the API would not accept the connection: InvalidState`. It is not a TLS failure and
-it is not the API: `smoltcp` answers `connect` on a socket that is still open with `InvalidState`,
-and this firmware held one socket for the life of the task, so after the first exchange left the
-connection half-closed every later one was refused by the stack before a packet went out. The socket
-is now built by `edge-nal-embassy` per connection and dropped at the end of it, which also took the
-buffers out of the reporter's signatures. Two things hid the bug until now: the cleartext version
-half-closed the connection itself before reading, which happened to leave the socket in a state the
-next `connect` tolerated, and the report interval is five minutes, so **a run has to outlive one
-exchange before anything can show.**
-
-**The heap had to grow, and the reason is the TLS record buffers.** With the two heaps this
-repository had — 64 KiB of reclaimed RAM and 36 KiB of internal — the handshake failed with
-`MbedTLS_ERR_SSL_ALLOC_FAILED` (-0x7F00) while 53,336 bytes were still free. MbedTLS `calloc`s a
-record buffer in each direction at its default 16 KiB, and that is 32 KiB it cannot be talked out of
-without changing its configuration, which costs a C toolchain (see above). The internal heap is now
-96 KiB, where the same boot reported 114,580 bytes free before the handshake and completed it. Two
-heaps rather than one because the reclaimed region is 66,320 bytes on the C3, so 64 KiB is close to
-all of it.
-
-**Closing the connection before reading the reply does not work.** `Connection: close` in the head
-means the _server_ closes when it has answered, and shutting the write half first — TLS
-`close_notify` and then the TCP FIN, as the cleartext version did — came back as
-`IO("ConnectionReset")` before a single byte arrived. The reply is now read first and `close_notify`
-sent afterwards, which is both what the server expects and what stops MbedTLS warning about a
-session dropped while still open.
-
-None of the following has been observed:
-
-- that a **second** exchange succeeds, which is the fix above and the next thing to check on a
-  board;
-- that the C6 completes a handshake: the TLS code names no chip, and the C6 builds and lints clean,
-  but the board above is the C3 and nothing here says the other one connects;
-- that certificate _dates_ are checked, because they are not — see the note under
-  [what the API's certificate is checked against](#what-the-apis-certificate-is-checked-against);
-- that a handshake survives much longer than five minutes, or that the reporter recovers from one
-  that does not: two exchanges have been seen, five minutes apart;
-- that SNTP succeeds reliably — two runs answered and one did not;
-- that a join succeeds reliably — the C3 joined every time and the C6 twice out of five, on one
-  network, and nothing here says why;
-- that the new handshake sentence appears at all: `FourWayHandshakeTimeout` came back once in seven
-  boots, so the fix is checked by its test and by the compiler rather than by a log;
-- that either stack keeps running for longer than a minute and a half, or reconnects when the link
-  drops, which is the failing runs' other half and has not been seen;
-- that Wokwi runs it, which nothing in the gate exercises either;
-- that the state line describes the radio rather than the last thing this firmware decided the radio
-  was doing — it reports what was published, and what was published is only ever one task's word
-  about what another task did. That is a property of the design, not something a longer run would
-  settle. The fourth run is a sharper version of the same point: the line named a cause the driver
-  never reported, and that one has since been fixed.
-
-What the gate verifies is the part it can see: both chips build in both profiles and are lint-clean
-on each. The credentials are compiled in from `.cargo/local.toml`, and nothing checks that they
-reached the image — `option_env!` makes it a question the compiler answers by building. The runs
-above are the only evidence they did.
+The gate checks that the firmware compiles, is lint-clean, is formatted and is spelled correctly. It
+cannot check that a peripheral does what the code says: there is no test target for bare-metal
+firmware, and testing on-device or in a simulator is tooling this repository does not have. **The
+way to find out whether the firmware behaves is to run it** — on the board or in the simulator — and
+to say what you saw.
 
 ### What the tests do and do not cover
 
 Two test steps, and the difference between them is the whole story:
 
 - `test` runs the tests of this repository's own automation, in Node.
-- `test-firmware` runs `crates/poc-report`, on the host. That crate holds the part of the firmware
+- `test-firmware` runs `crates/poc-domain`, on the host. That crate holds the part of the firmware
   that decides rather than talks to hardware: how an address and a time are written, what an SNTP
-  packet means, and what the body of a reported event says.
+  packet means, and what the body of a reported event says. It is four submodules — `address`,
+  `clock`, `ntp` and `event` — with one test file each.
 
-The split is not a preference. `src/wifi.rs`, `src/ntp.rs`, `src/clock.rs`, `src/status.rs`,
-`src/tls.rs`, `src/report.rs` and `src/bin/main.rs` all depend on `esp-hal`, on the network stack,
-or on a scheduler that exists only on a microcontroller, so none of them can be compiled for a host
-at all — a test on them needs a board. Anything testable therefore has to be in something that
-builds without them, which is what `crates/poc-report` is for, and what makes `poc-report` the only
-crate in the tree with no dependencies of its own. Logic that belongs next to hardware rather than
-in that crate is untested, and stays that way until a board or a simulator can run it. TLS is the
-clearest case of that: what the certificate is checked against, whether the hostname matches and
-whether the chain leads to ISRG are decisions `MbedTLS` makes, and the one thing this repository
-says about them is the log line and the run above.
+The split is not a preference. Every module in `src/` depends on `esp-hal`, on the network stack, or
+on a scheduler that exists only on a microcontroller, so none of them can be compiled for a host at
+all — a test on them needs a board. Anything testable therefore has to be in something that builds
+without them, which is what `crates/poc-domain` is for, and what makes it the only crate in the tree
+with no dependencies of its own. It is four submodules — `address`, `clock`, `ntp` and `event` — and
+everything is re-exported at its root, so the module is where to read and the root is what to
+import. Logic that belongs next to hardware is untested and stays that way until a board can run it.
+TLS is the clearest case: whether the chain leads to ISRG and whether the hostname matches are
+decisions `MbedTLS` makes, and the only evidence this repository has is the
+`the API's certificate verified: …` line on the serial log.
 
-What that buys, and what it does not, is worth being specific about. The line the firmware prints is
-assembled in `src/status.rs` from three answers — the time in `poc-report`, the radio's state in
-`src/wifi.rs`, the address from the stack — and only the first is checked on the host. What
-publishes the state — the radio's `Link` and the clock's last failure, each behind a lock another
-task takes to read — is the value itself rather than an encoding of it, so there is no second
-representation for the words to drift apart from. The round trips through those words used to be
-checked here too and are gone with the encoding: a lock holding the value cannot hand back a word
-that means something else. What the radio says about a failed join is the driver's own words now,
-carried as-is, and the order of the line lives next to the stack it is read from: a test on either
-needs a board. The reported event is the same story one step further out: the JSON body, the
-timestamp's format, and the alphabet every sentence stays inside are all checked on the host, plus
-the one test that keeps every sentence quotable without escaping. What an answer means is
-deliberately not checked: a status code is reported as the number it is, because a mapping from
-numbers to sentences goes stale the day a status changes what it means. None of it can check that
-the value published is the one the radio meant: that is still only knowable from the board.
-
-**What is no longer tested here, and why.** This crate used to hold the HTTP framing: the request
-head with its CRLF lines, a predicate for whether a status line had arrived whole, and a parser for
-the status line itself. That was where the read-boundary bug lived — reading a reply once and
-judging whatever arrived, so a read landing inside the 25-byte status line of a 650-byte reply
-reported "what answered was not the API" for a reply the API had sent correctly — and where the test
-that caught it was. All of it is [`edge-http`](https://crates.io/crates/edge-http)'s now:
-`src/report.rs` builds a `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a
-`Body`, and what is logged there is a status code and a body. That is roughly a dozen fewer host
-tests, traded for not maintaining a parser of the most fiddly protocol in the tree — and the mapping
-from a number to a sentence went the same way after it, traded for a log line that cannot go stale.
+What that buys is the wording and the arithmetic rather than the hardware: how an address and a time
+are written, what an SNTP packet means, how far a server's answer has counted on since it arrived,
+and the whole of the JSON body of a reported event, down to the alphabet every sentence stays inside
+so the body cannot be corrupted by a quote. What it deliberately does not hold is what an answer
+_means_ — a status code is reported as the number it is, because a mapping from numbers to sentences
+goes stale the day a status changes what it means. The HTTP framing went the same way: `edge-http`
+writes the request and reads the reply, so this crate holds no parser of the most fiddly protocol in
+the tree, and the test that used to pin it went with the code it was testing.
 
 ## The gate
 
@@ -585,6 +398,83 @@ step fails, how to add one, and which files esp-generate will overwrite.
 
 ## Layout
 
+### How the modules depend on each other
+
+Every arrow is a `use crate::` statement — a module named in another's doc comment is not an arrow,
+and `src/tls.rs` is the case worth knowing about: it mentions `crate::report` twice and the
+dependency runs the other way.
+
+```mermaid
+graph TD
+    main["src/bin/main.rs<br/>generated by esp-generate"]
+
+    subgraph firmware["src/ - the firmware"]
+        direction TB
+        report["report<br/>HTTPS to the API"]
+        status["status<br/>the state line"]
+        ntp["ntp<br/>the SNTP client"]
+        clock["clock<br/>the number and where it came from"]
+        wifi["wifi<br/>the radio and DHCP"]
+        tls["tls<br/>the trust anchor"]
+        dns["dns<br/>the shared lookup"]
+        lib["lib<br/>TIMEOUT"]
+    end
+
+    subgraph domain["crates/poc-domain - no_std, no dependencies, the only part with tests"]
+        direction TB
+        domClock["clock<br/>the time and how it is written"]
+        domNtp["ntp<br/>a packet, and what standing still means"]
+        domAddress["address<br/>an address"]
+        domEvent["event<br/>the body of a report"]
+    end
+
+    main -->|"join"| wifi
+    main -->|"sync"| ntp
+    main -->|"start"| report
+    main -->|"report"| status
+
+    report --> status
+    report --> tls
+    report --> clock
+    report --> dns
+    report --> lib
+
+    status --> clock
+    status --> wifi
+
+    ntp --> clock
+    ntp --> dns
+    ntp --> lib
+
+    dns --> lib
+
+    clock -.->|a Time, a Setting| domClock
+    wifi -.->|an Address| domAddress
+    ntp -.->|a packet| domNtp
+    status -.->|a sentence| domClock
+    report -.->|a body| domEvent
+
+    domClock --> domNtp
+    domEvent --> domClock
+```
+
+It is a DAG with no cycles, in two layers: `main`, then whatever talks to the network, then what
+holds it up. `report` is the busiest node — it reaches five of the other eight and nothing reaches
+it back — and `status` is the only module that depends on the network and on a peripheral at once,
+which is what makes it the one place the state line can be assembled.
+
+The lower box is [`crates/poc-domain`](crates/poc-domain), which is the firmware's decisions with
+the hardware taken out. The five firmware modules on top of it draw dotted lines because what they
+need from it is a type or a sentence rather than a call; the three solid ones inside it are the
+submodules' own dependencies — `Time` carries an `Obstruction`, and a reported event is stamped with
+a `Timestamp`.
+
+`dns` exists only because `ntp` and `report` were doing the same lookup twice. It is the one module
+whose reason to be is an arrow, so a third client resolving a name is the change this diagram is
+for.
+
+### What each file owns
+
 | Path                                | Owns                                                                            |
 | ----------------------------------- | ------------------------------------------------------------------------------- |
 | `src/bin/main.rs`                   | the entry point; generated, with the proof of concept added to it               |
@@ -596,7 +486,11 @@ step fails, how to add one, and which files esp-generate will overwrite.
 | `src/report.rs`                     | post that state line to an HTTPS API every five minutes, and say what it said   |
 | `src/lib.rs`                        | the crate root, and which nightly features the firmware needs                   |
 | `certs/`                            | the one root this firmware trusts, and where it came from                       |
-| `crates/poc-report/`                | what the firmware decides and says — the only part with tests                   |
+| `crates/poc-domain/`                | what the firmware decides and says — the only part with tests                   |
+| `crates/poc-domain/src/clock.rs`    | the time, how it counts on, and the three ways either is written                |
+| `crates/poc-domain/src/ntp.rs`      | an SNTP packet off the network, and what standing still looks like              |
+| `crates/poc-domain/src/address.rs`  | an address, and how one is written                                              |
+| `crates/poc-domain/src/event.rs`    | the body of a reported event, and a reply rendered into a log                   |
 | `build.rs`                          | linker scripts, and what to do about each undefined symbol                      |
 | `tools/`                            | the gate. No dependencies, on purpose: it guards the dependency policy          |
 | `Cargo.toml`                        | the chip features, dependencies and the `[lints]` the gate enforces             |

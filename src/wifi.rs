@@ -1,46 +1,20 @@
-//! The proof of concept: join a Wi-Fi network, take an address over DHCP, and print it.
+//! Join a Wi-Fi network, take an address over DHCP, and publish what the radio is doing.
 //!
-//! Wi-Fi on this chip is three pieces the project did not have before, and each one is a
-//! precondition of the next:
+//! Wi-Fi on this chip is three pieces, each a precondition of the next: `esp-radio` drives the radio
+//! and claims a peripheral, which is how `esp-hal` says only one task may drive it; `esp-rtos` is
+//! the preemptive scheduler that driver will not start without, which is why [`join`] is called
+//! after `esp_rtos::start`; and `embassy-net` turns a joined network into an address. Nothing here
+//! waits for the network — [`join`] starts three tasks and returns the stack, which is what
+//! `src/ntp.rs` and `src/report.rs` run on.
 //!
-//! - `esp-radio` drives the radio. On this chip it is part of the chip itself, so unlike the
-//!   original `ESP32` there are no pins to choose and no antenna to configure. It still claims a
-//!   peripheral, because claiming one is how `esp-hal` says that only one task may drive the radio.
-//! - `esp-rtos` is the preemptive scheduler that driver needs. It will not start without one, and
-//!   the scheduler has to be running *before* the radio is initialized, which is why [`join`] is
-//!   called after `esp_rtos::start` rather than before.
-//! - `embassy-net` is the TCP/IP stack that turns a joined network into an IP address. It runs on
-//!   the executor that an `async` `#[esp_hal::main]` sets up.
+//! The radio runs in a task and the greeting in another, so nothing here can return the state of the
+//! link to it. This file publishes that as a [`Link`] — what it is doing, and the driver's own reason
+//! when it stopped — behind a lock rather than as one word, because a value split across several
+//! words is a value whose parts can be read at different moments.
 //!
-//! Nothing here waits for the network: [`join`] starts three tasks and returns, so the firmware
-//! keeps doing whatever it was doing while the radio does its work in the background. What
-//! `join` returns is the handle to the network stack, which is what the rest of the firmware needs
-//! — an SNTP client runs on it in [`crate::ntp`], an HTTP reporter in [`crate::report`] — and which
-//! is `Copy`, so a task can take its own copy of it.
-//!
-//! ## Saying what the radio is doing
-//!
-//! The radio runs in a task and the greeting runs in another one, so nothing here can return the
-//! state of the link to it. Instead this file publishes it as a [`Link`] — what it is doing, and why
-//! it stopped if it did — and [`link`] hands it to [`crate::status`], which prints it twice a
-//! second. A build with no credentials says so on that line, rather than leaving a reader to work
-//! out from a missing address that nothing was ever attempted.
-//!
-//! The state is published as the value itself, behind a lock the greeting takes to read it, rather
-//! than as one word: a value published as several words is a value whose parts can be read at
-//! different moments, and a single word for six states is an encoding with a test for every byte of
-//! it. The lock is a brief critical section on a chip with one core, taken twice a second.
-//!
-//! ## Credentials
-//!
-//! The SSID and password are compiled in from the `WIFI_SSID` and `WIFI_PASSWORD` environment
-//! variables, which is the only way to get them into firmware that has no filesystem to read.
-//! Anything a user types would end up in a tracked file, so the values live in the `[env]` section
-//! of `esp-config.toml`, which `.gitignore` keeps out of the repository.
-//!
-//! They are read with `option_env!` rather than `env!` on purpose: a build with no credentials
-//! still has to build, because the gate and CI are such a build. There, [`join`] says so and
-//! returns `None`, and the rest of the firmware runs exactly as it did before Wi-Fi existed.
+//! The SSID and password are compiled in from `WIFI_SSID` and `WIFI_PASSWORD`, read with
+//! `option_env!` rather than `env!` so a build with neither still compiles — which is what the gate
+//! and CI are. There, [`join`] says so on the state line and returns `None`.
 
 use core::cell::RefCell;
 
@@ -55,9 +29,8 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ConnectionError, ControllerConfig, DisconnectReason,
     Interface, Password, Ssid, WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
 };
-use poc_report::Address;
+use poc_domain::Address;
 
-/// The SSID of the network to join, read from the environment when this was compiled.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
 
 /// The password of that network, likewise. Empty for an open network.
@@ -66,7 +39,6 @@ const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
 /// How long to wait between attempts to join, whether the last one failed or succeeded.
 const RETRY: Duration = Duration::from_secs(5);
 
-/// How many access points to name when a connection attempt fails.
 const NEIGHBORS: usize = 10;
 
 /// Sockets the network stack is sized for.
@@ -153,9 +125,9 @@ impl core::fmt::Display for Link {
 ///
 /// The reason is the driver's own [`DisconnectReason`], carried as-is rather than grouped: any
 /// grouping is a claim about what to do next, and a wrong claim sends whoever is reading the serial
-/// output after the wrong problem. What the grouping used to be for — telling a wrong password from
-/// a station too far away — is what the signal is for: the two failures that look identical in the
-/// radio's own words are not identical to fix.
+/// output after the wrong problem. The signal is what tells the two failures that look identical in
+/// the radio's own words apart — a refused password and a station too far away both arrive as
+/// "could not join".
 ///
 /// The reason renders as the driver's own variant name, which is a Rust identifier: no quotes, no
 /// backslash, no controls, so it cannot end the JSON string the state line is reported in — by
@@ -180,11 +152,10 @@ impl core::fmt::Display for JoinFailure {
 
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///
-/// The stack is returned immediately rather than once DHCP has produced an address, because the
-/// address arrives in the `report_address` task and the caller has no reason to wait for it:
-/// everything this function starts runs in its own task. `None` means there was no network to join,
-/// either because no credentials were compiled in or because the radio refused to start; in both
-/// cases the rest of the firmware is unaffected, and what went wrong is on the state line.
+/// `None` means there was no network to join: the radio did not start, or there were no credentials
+/// compiled in. Either way the rest of the firmware is unaffected, and what went wrong is on the
+/// state line rather than only in the log — the greeting reads this long after the boot that caused
+/// it, and a reader working backwards from a missing address is being asked to guess.
 ///
 /// # Panics
 ///
