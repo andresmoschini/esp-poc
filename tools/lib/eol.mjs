@@ -22,7 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { captureUntrimmed } from "./process.mjs";
+import { captureUntrimmed, reportFailure } from "./process.mjs";
 
 // The pair of bytes a CRLF line ending is made of.
 const CRLF = Buffer.from("\r\n");
@@ -107,25 +107,6 @@ export function offenders(records) {
  */
 export function fix(root) {
   return reportFailure(rewrite(root));
-}
-
-/**
- * Prints what went wrong, the way a subprocess step would, and answers whether it passed.
- *
- * A function of this repository's own code has no exit code to hand back, so this is where its
- * `Promise` becomes the boolean `run` asks for.
- *
- * @param {Promise<void>} outcome What the step did.
- * @returns {Promise<boolean>} Whether it passed.
- */
-async function reportFailure(outcome) {
-  try {
-    await outcome;
-    return true;
-  } catch (error) {
-    process.stderr.write(`${error.message}\n`);
-    return false;
-  }
 }
 
 /**

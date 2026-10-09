@@ -384,14 +384,16 @@ boundary that actually holds either way. `CONTRIBUTING.md`, under `The hooks`, h
 `pre-commit` hook is this repository's slowest command by a wide margin, because the gate compiles
 firmware for two chips from a vendored `core`.
 
-**A hook Git cannot run is invisible to every other step, and the `hooks` step is the one that sees
-it.** Git skips a hook that is not `100755` in the index or that names no interpreter, without
+**A hook Git cannot run is invisible to every other step, and the `git-state` step is the one that
+sees it.** Git skips a hook that is not `100755` in the index or that names no interpreter, without
 saying so. Windows produces that silently — `git add` records `100644` there, while the working-tree
 copy still looks executable, so `ls` and Git disagree and only Git decides. That step is the only
-one in the gate that reads the index rather than the files, and it has no fixer, because the fix
-(`git update-index --chmod=+x`) writes to the index: `tools/lib/hooks.mjs` says why, and `FIX` is
-for things that write to files. **After adding or re-adding a hook, run that command once** — the
-step will tell you, but a commit that goes through without the hook is the outcome worth avoiding.
+one in the gate that reads the index rather than the files, and `npm run fix` repairs the mode. The
+repair is `git update-index --cacheinfo 100755,<object>,<path>` and **not** `--chmod=+x <path>`,
+which looks equivalent and is not: measured, the second re-reads the working-tree copy and stages
+it, so a hook edited since it was staged would go into the commit unasked. `tools/lib/hooks.mjs`
+says so in its header. The fixer runs after `eol` because it writes the index, which is what
+`git add` and `git commit` read last.
 
 `.opencode/plugins/` holds the two plugins nothing in the gate can execute. They are the only thing
 that installs the git hooks here and the only thing that puts a session id in a commit, so a failure

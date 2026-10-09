@@ -42,7 +42,7 @@ import { check as eolCheck, fix as eolFix } from "./lib/eol.mjs";
 import { isEntryPoint } from "./lib/entry-point.mjs";
 import { CHIPS, chipArgs, defaultChip, defaultFeatureIsConfigured } from "./lib/chip.mjs";
 import { firmwareTests } from "./lib/firmware-tests.mjs";
-import { check as hookCheck } from "./lib/hooks.mjs";
+import { check as hookCheck, fix as hookFix } from "./lib/hooks.mjs";
 import { installedLockfile, nodeToolingState } from "./lib/tooling.mjs";
 
 // The npm executable.
@@ -120,6 +120,45 @@ function chipsAgree(root) {
   return false;
 }
 
+/**
+ * Reports whether Git would accept the tree as it stands.
+ *
+ * Two questions, asked here rather than as two steps of their own because they are one answer: both
+ * are about what Git thinks of this working tree, and a commit is refused or silently skips work
+ * because of the tree rather than because of a file. `eol` reads `.gitattributes` matched by
+ * attribute, where the party that has to agree is `git add`; `hooks` asks Git directly whether it
+ * will run the hooks, which is the only way to know on a filesystem that has no executable bit.
+ *
+ * Both run even when the first fails, so one pass names both problems — the property every step of
+ * `GATE` has, applied within this one.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<boolean>} Whether Git would accept the tree.
+ */
+async function gitStateIsClean(root) {
+  const endings = await eolCheck(root);
+  const hooks = await hookCheck(root);
+
+  return endings && hooks;
+}
+
+/**
+ * Repairs what Git would refuse at the commit, in that order.
+ *
+ * Line endings first because it writes files, and the executable bit second because it writes the
+ * index — which is what `git add` and `git commit` read last, so a mode recorded against bytes that
+ * are about to change is a mode recorded against the wrong content.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<boolean>} Whether there was nothing left to repair.
+ */
+async function gitStateIsRepairable(root) {
+  const endings = await eolFix(root);
+  const hooks = await hookFix(root);
+
+  return endings && hooks;
+}
+
 // Every step of the quality gate, in the order they run.
 //
 // Steps are added here as the gate grows. Order is presentation only: all of them run on every
@@ -149,18 +188,20 @@ export const GATE = [
     action: hereStep(chipsAgree),
   },
   {
-    name: "hooks",
-    // The one step that reads the index rather than the files. Git runs a hook only when the index
-    // says `100755` and the file names an interpreter, and it skips a hook that fails either test
-    // without saying so — so a repository can hold hooks no commit has ever run while every other
-    // step reports green. Windows is where that is produced: `git add` records `100644`, because
-    // there is no executable bit to read from the filesystem, and the working-tree copy looking
-    // executable answers a different question than the one Git asks.
+    name: "git-state",
+    // What Git thinks of this working tree, asked of Git rather than of the files, and the one step
+    // that reads the index.
     //
-    // It sits early because it is cheap, and because a red `hooks` explains why `pre-commit` is not
-    // running at all — which is the first thing to establish when a commit went through unchecked.
-    // It is second only to `chips`, which can report a repository set up for a chip nothing builds.
-    action: hereStep(hookCheck),
+    // Two things live here and they are one concern: `git add` refuses a file whose endings
+    // `.gitattributes` does not ask for, and it will not run a hook whose index mode is not `100755`.
+    // Both are refusals at the commit, so both are asked before anything is built — and Windows is
+    // where the second is produced routinely, since `git add` records `100644` there because there is
+    // no executable bit to read off the filesystem, while the working-tree copy still looks
+    // executable. Only Git's answer is one Git acts on.
+    //
+    // It sits second only to `chips`, which can report a repository set up for a chip nothing builds
+    // and make every step after it pointless.
+    action: hereStep(gitStateIsClean),
   },
   {
     name: "fmt",
@@ -196,17 +237,6 @@ export const GATE = [
     // this tool reads it as plain JSON and answers `invalid character '/'` on a comment — so it lives
     // here and in AGENTS.md instead.
     action: toolStep("editorconfig-checker", []),
-  },
-  {
-    name: "eol",
-    // `editorconfig` above answers from `.editorconfig`, matched by glob. This one answers from
-    // `.gitattributes`, matched by attribute, and the party that has to agree with it is `git add`:
-    // with `core.safecrlf` on, a file whose worktree copy is CRLF is one Git refuses rather than
-    // converts. An `.editorconfig` that says LF is not an answer about what Git will accept.
-    //
-    // `*.bat` and `*.cmd` are the live case for the disagreement — both configurations ask for CRLF
-    // on purpose, and only Git's answer is asked about them.
-    action: hereStep(eolCheck),
   },
   {
     name: "cspell",
@@ -322,12 +352,22 @@ export const GATE = [
 
 // The steps of the gate that can fix what they find, in the order they must run.
 //
-// Unlike `GATE`, order here is not presentation: these steps mutate the same files, so a later step
-// can undo or redo what an earlier one wrote. `editorconfig` runs after the content formatters
-// because it owns files none of the others touch (`Cargo.toml`, `rust-toolchain.toml`, the dotfiles)
-// and otherwise only confirms what the earlier steps already left clean, and `eol` last because it
-// asks Git rather than a formatter, and because every step above this one writes, so the ending of a
-// line is the last thing a byte should be decided on.
+// Unlike `GATE`, order here is not presentation: these steps mutate what the next one reads, so a
+// later step can undo or redo what an earlier one wrote. `editorconfig` runs after the content
+// formatters because it owns files none of the others touch (`Cargo.toml`, `rust-toolchain.toml`, the
+// dotfiles) and otherwise only confirms what the earlier steps already left clean. `git-state` runs
+// last because it is what Git itself will act on — the endings of a line, and then the executable bit
+// in the index — and because every step above it writes, so the bytes and the index are the last
+// thing a fixer should be deciding on.
+//
+// **A fixer repairs what Git would refuse at the commit; that includes the index, not only the files
+// in the working tree.** The rule used to be that fixers write files, and it was the reason the
+// hooks step had none: `git update-index --chmod=+x` writes to the index, so a fixer using it seemed
+// to be deciding what a commit would contain. It does not — it sets a mode and leaves the content
+// unstaged — and a gate that reports a problem it cannot repair leaves the operator with a command to
+// remember on the exact commit where it matters. `check` refuses to start if the installed tooling
+// does not match `package-lock.json` either, and that writes a file under `node_modules`, so the
+// old rule was already narrower than the practice.
 //
 // `clippy` and `cspell` have no entry: `cspell` cannot fix a spelling at all, and `clippy --fix` can
 // rewrite code in ways that need a human to read the diff, which does not fit a command meant to run
@@ -352,16 +392,10 @@ export const FIX = [
     action: toolStep("editorconfig-checker", ["-fix"]),
   },
   {
-    name: "eol",
-    // It sits beside `editorconfig` rather than inside it, and last rather than first.
-    // `editorconfig-checker` answers from `.editorconfig`, matched by glob; this step answers from
-    // `.gitattributes`, matched by attribute, and `git add` is what obeys the second one. The two
-    // configurations can disagree, and when they do it is `git add` that breaks rather than a
-    // formatter. `*.bat` and `*.cmd` are the live case: both configurations agree they are CRLF on
-    // purpose, and only Git's answer is asked.
-    // Every step above this one writes, so the ending of a line is the last thing a byte should be
-    // decided on.
-    action: hereStep(eolFix),
+    name: "git-state",
+    // Line endings first and the executable bit second, inside one step: the first writes files, the
+    // second writes the index, and the index is what `git add` and `git commit` read last.
+    action: hereStep(gitStateIsRepairable),
   },
 ];
 

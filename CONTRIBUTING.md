@@ -35,6 +35,10 @@ The properties the array has to keep:
   say so in its comment.
 - **The reason a step exists lives in its comment.** A step with no comment is a step nobody dares
   remove.
+- **The why of an item lives in its comment; its history, in the commit.** A comment describing how
+  the code was before a change belongs in the message of that change. Where there is no commit
+  behind it there is no history to keep, so delete it. `tools/lib/hooks.mjs` is the worked example:
+  what it measures is in its header, and what it used to do is in the commit that changed it.
 
 ## Adding a chip, or a step that depends on the chip
 
@@ -202,16 +206,9 @@ real cost. When the hook fails, fix the cause or stop and report.
 that is not executable in the index, or that names no interpreter, and says nothing when it does.
 Windows produces that routinely: `git add` records `100644`, because there is no executable bit to
 read off the filesystem, while the working-tree copy still looks executable — so `ls` and Git
-disagree and only Git is the one that matters. The gate's `hooks` step asks Git rather than the
-filesystem, so this is a red step rather than a mystery. A hook that is newly added or re-added
-needs
-
-```sh
-git update-index --chmod=+x .claude/git-hooks/*
-```
-
-once, and the reason it is not a step in `FIX` is in `tools/lib/hooks.mjs`: it writes to the index
-rather than to a file, and a fixer that staged would change what a commit is about to contain.
+disagree and only Git is the one that matters. The gate's `git-state` step asks Git rather than the
+filesystem, so this is a red step rather than a mystery, and `npm run fix` repairs the mode by
+writing the index rather than the file.
 
 ### The session trailer
 

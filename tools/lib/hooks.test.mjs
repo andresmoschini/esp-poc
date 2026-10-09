@@ -1,25 +1,31 @@
-// The tests for the hook check, which is the only step in the gate that reads the index.
+// The tests for the hook check and fixer, which are the only step in the gate that reads the index.
 //
-// The failure it exists to catch is silent by construction: Git skips a hook it cannot run and the
+// The failure they exist to catch is silent by construction: Git skips a hook it cannot run and the
 // commit succeeds, so a repository can hold hooks that no commit has ever executed and every other
 // step will keep reporting green. Measured here, on Windows, `git add` recorded both hooks as `100644`
 // while the working-tree copies were already executable, so nothing short of asking Git would have
 // noticed.
 //
-// Everything below is therefore a function of a string Git printed or of bytes on disk, and the tests
-// drive it with both rather than by damaging a repository.
+// Everything below is a function of a string Git printed, of bytes on disk, or of an index a real
+// repository was asked to hold — and the last of those drives a real `git`, because the whole claim
+// under test is what Git does, and a fabricated index would only be a claim about this file.
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
-import { parse, parseAll, problemWith } from "./hooks.mjs";
+import { fix, parse, parseAll, problemWith } from "./hooks.mjs";
 
-// A record as `git ls-files --stage` prints one. The object name is not read by anything here, so it
-// is short, but it is there because the tab has to be after three fields for the record to be one.
-const record = (mode, relative) => `${mode} 6b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 0\t${relative}`;
+// The object name a fabricated record carries. `fix` hands it back to `git update-index
+// --cacheinfo`, so it has to be a name rather than an omission.
+const OBJECT = "6b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+
+// A record as `git ls-files --stage` prints one: mode, object name, stage, a tab, and the path. The
+// tab has to be after three fields for the record to be one at all.
+const record = (mode, relative) => `${mode} ${OBJECT} 0\t${relative}`;
 
 /**
  * A temporary workspace holding one hook file.
@@ -39,6 +45,49 @@ function workspaceWith(relative, contents) {
 // A hook Git will run: executable in the index, and naming its interpreter.
 const RUNNABLE = "#!/bin/sh\nexec npm run check\n";
 
+/**
+ * A temporary Git repository holding one hook, as `git add` on Windows would leave it.
+ *
+ * A real repository rather than a fabricated index, because the claim under test is what
+ * `git update-index --chmod=+x` does — the mode it holds afterwards, and what it leaves staged — and
+ * the only way to know either is to ask Git.
+ *
+ * @param {string} relative Path of the hook, relative to the root.
+ * @param {string} contents What the file says.
+ * @returns {string} The root, which the caller removes.
+ */
+function repositoryWith(relative, contents) {
+  const root = workspaceWith(relative, contents);
+
+  const git = (...args) => spawnSync("git", args, { cwd: root, encoding: "utf8" }).status === 0;
+
+  assert.ok(git("init", "--quiet"), "could not create a repository to test against");
+
+  return root;
+}
+
+/**
+ * The mode Git's index holds a path at, or `null` for a path the index does not have.
+ *
+ * @param {string} root Repository root.
+ * @param {string} relative Path, relative to the root.
+ * @returns {string | null} The mode, or `null` when the path is not in the index.
+ */
+function modeInIndex(root, relative) {
+  const listed = spawnSync("git", ["ls-files", "--stage", "--", relative], {
+    cwd: root,
+    encoding: "utf8",
+  });
+
+  if (listed.status !== 0) {
+    return null;
+  }
+
+  const [record] = listed.stdout.split("\n").filter(Boolean);
+
+  return record === undefined ? null : record.split(/\s+/u)[0];
+}
+
 // --- Parsing what Git printed --------------------------------------------------
 
 // Two hooks and two records, which is the shape the step sees on a healthy checkout. `-z` is what
@@ -52,9 +101,19 @@ test("every tracked hook is read out of the records", () => {
   );
 
   assert.deepEqual(found, [
-    { relative: ".claude/git-hooks/commit-msg", mode: "100755" },
-    { relative: ".claude/git-hooks/pre-commit", mode: "100755" },
+    {
+      relative: ".claude/git-hooks/commit-msg",
+      mode: "100755",
+      object: OBJECT,
+    },
+    { relative: ".claude/git-hooks/pre-commit", mode: "100755", object: OBJECT },
   ]);
+});
+
+// The object name is what `fix` hands back to `git update-index --cacheinfo`, so a record that lost
+// it would leave the fixer with no way to write an entry that changes only the mode.
+test("the object name is read out of the record", () => {
+  assert.equal(parse(record("100644", ".claude/git-hooks/pre-commit")).object, OBJECT);
 });
 
 // The records come back sorted, so the failure a run prints is in the same order every time rather
@@ -169,6 +228,104 @@ test("a CRLF line ending does not make a good hook look broken", () => {
       problemWith({ relative: ".claude/git-hooks/pre-commit", mode: "100755" }, root),
       null,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- The fixer, against a repository Git agrees with -----------------------------
+
+// The mode Windows leaves behind, and the case the fixer was written for: `git add` records `100644`
+// however executable the working-tree copy looks, so the step has something to repair on exactly the
+// platform where the hook is most likely to be added.
+test("the fixer sets the bit Git's index is missing", async () => {
+  const root = repositoryWith(".claude/git-hooks/pre-commit", RUNNABLE);
+
+  try {
+    spawnSync("git", ["add", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    const before = modeInIndex(root, ".claude/git-hooks/pre-commit");
+    assert.ok(before === "100644" || before === "100755", "`git add` recorded a mode to repair");
+
+    await fix(root);
+
+    assert.equal(modeInIndex(root, ".claude/git-hooks/pre-commit"), "100755");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// What makes the repair worth automating, and what makes it safe: the mode changes and the content
+// does not. A hook staged at one revision and then edited in the worktree must still hold the staged
+// revision after `fix` — `git update-index --chmod=+x <path>` does not, which is measured in
+// `tools/lib/hooks.mjs` and is why the fixer uses `--cacheinfo` instead.
+test("the fixer changes the mode without staging the file's contents", async () => {
+  const root = repositoryWith(".claude/git-hooks/pre-commit", RUNNABLE);
+
+  try {
+    spawnSync("git", ["add", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    const edited = `${RUNNABLE}# edited\n`;
+    fs.writeFileSync(path.join(root, ".claude/git-hooks/pre-commit"), edited);
+
+    await fix(root);
+
+    assert.equal(modeInIndex(root, ".claude/git-hooks/pre-commit"), "100755");
+    assert.equal(
+      spawnSync("git", ["cat-file", "-p", ":.claude/git-hooks/pre-commit"], {
+        cwd: root,
+        encoding: "utf8",
+      }).stdout,
+      RUNNABLE,
+      "the index should still hold what was staged, not the edit",
+    );
+    assert.equal(fs.readFileSync(path.join(root, ".claude/git-hooks/pre-commit"), "utf8"), edited);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The repair is sticky, so it is a fix rather than something to remember on the next commit: a later
+// `git add` of the same path keeps the bit the fixer set.
+test("the bit the fixer sets survives a later add", async () => {
+  const root = repositoryWith(".claude/git-hooks/pre-commit", RUNNABLE);
+
+  try {
+    spawnSync("git", ["add", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    await fix(root);
+    spawnSync("git", ["add", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    assert.equal(modeInIndex(root, ".claude/git-hooks/pre-commit"), "100755");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A repository with nothing wrong is a pass rather than an error, and the fixer says so instead of
+// running a command per hook to discover there was no work.
+test("the fixer passes on a repository with nothing to repair", async () => {
+  const root = repositoryWith(".claude/git-hooks/pre-commit", RUNNABLE);
+
+  try {
+    spawnSync("git", ["add", "--chmod=+x", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    assert.equal(await fix(root), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A hook with no interpreter cannot be repaired by setting a bit, and a fixer that reported success
+// on it would be the silent failure this step exists to catch. It fails rather than passing.
+test("the fixer fails on a hook it cannot repair", async () => {
+  const root = repositoryWith(".claude/git-hooks/pre-commit", "exec npm run check\n");
+
+  try {
+    spawnSync("git", ["add", ".claude/git-hooks/pre-commit"], { cwd: root });
+
+    assert.equal(await fix(root), false);
+    assert.equal(modeInIndex(root, ".claude/git-hooks/pre-commit"), "100755");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -30,16 +30,25 @@
 // `git show :path` would answer about the staged snapshot instead. That is the same distinction the
 // `pre-commit` hook itself lives with, and it is documented under `The hooks` in CONTRIBUTING.md.
 //
-// **This step fixes nothing.** `git update-index --chmod=+x` could set the bit, and it is the right
-// command, but it writes to the index rather than to a file — and every other fixer in `FIX` writes
-// to files and leaves staging to the operator. A fixer that stages would make `npm run fix` change
-// what a commit is about to contain, which is a decision rather than a repair. The failure message
-// names the command instead.
+// **The repair writes the index rather than a file, and that is the point of `fix` being a fixer.**
+// `FIX` used to hold only steps that wrote files, and the array's comment says the rule it follows;
+// the rule is now the real one, which is that a fixer repairs what Git would refuse at the commit —
+// and refusing a hook Git will not run is refusing the commit, not the file.
+//
+// **The repair is `--cacheinfo`, not `--chmod=+x`, and the difference is the whole reason.** Both set
+// the bit and both are sticky across a later `git add`, but `--chmod=+x <path>` re-reads the
+// working-tree copy and stages it: measured, on a hook staged at one revision and then edited in the
+// worktree, `git update-index --chmod=+x h/p` left `git status` reading `A  h/p` with the *edited*
+// bytes in the index. That is a fixer deciding what a commit contains, which is the one thing a
+// fixer must not do. `--cacheinfo <mode>,<object>,<path>` writes the entry the index already holds
+// with one field changed: the same object name, the same path, the mode from `100644` to `100755`, so
+// the edit stays unstaged — `AM h/p` before and after, measured. The object name comes from
+// `git ls-files --stage`, which is the entry being repaired, so nothing has to be guessed.
 
 import fs from "node:fs";
 import path from "node:path";
 
-import { captureUntrimmed } from "./process.mjs";
+import { captureUntrimmed, reportFailure, runVisible } from "./process.mjs";
 
 // The directory the hooks live in, relative to the workspace root. It is named here rather than
 // passed in because it is a fact about this repository rather than about anything a caller decides,
@@ -60,43 +69,150 @@ const SHEBANG = "#!/bin/sh";
  * @param {string} root Workspace root.
  * @returns {Promise<boolean>} Whether the step passed.
  */
-export async function check(root) {
-  try {
-    const records = await askGit(root);
-    const found = parseAll(records);
+export function check(root) {
+  return reportFailure(verify(root));
+}
 
-    if (found.length === 0) {
-      throw new Error(
-        `gate: no hook is tracked under ${HOOKS_DIRECTORY}/.\n\n` +
-          `    A commit that finds no hook runs no gate, and says nothing. Restore them with\n` +
-          `    \`git checkout ${HOOKS_DIRECTORY}\`, or see CONTRIBUTING.md, under The hooks.`,
-      );
-    }
+/**
+ * `fix`'s step: sets the executable bit on every tracked hook Git would otherwise skip.
+ *
+ * It runs after `eol` because it writes the index, and the index is what `git add` and `git commit`
+ * read last: a mode set before a file's endings are settled would be a mode recorded against bytes
+ * that are about to change. It verifies by re-reading the index rather than by trusting the command's
+ * exit code — a fixer that does not check its own work is a command that reports success on a
+ * repository it did not repair.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<boolean>} Whether the step passed.
+ */
+export function fix(root) {
+  return reportFailure(repair(root));
+}
 
-    const broken = found
-      .map((hook) => problemWith(hook, root))
-      .filter((problem) => problem !== null);
+/**
+ * Reads what Git reports and throws when any of it needs repairing.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<void>}
+ */
+async function verify(root) {
+  const found = await askGit(root);
 
-    if (broken.length === 0) {
-      console.log(
-        `every hook Git tracks under ${HOOKS_DIRECTORY}/ is one Git will run ` +
-          `(${found.length} of them)`,
-      );
-      return true;
-    }
+  assertThereAreHooks(found);
 
-    throw new Error(
-      `gate: ${broken.length} hook(s) Git would not run:\n` +
-        `${broken.map((problem) => `  - ${problem}\n`).join("")}\n` +
-        `    Git runs a hook only if the index says ${EXECUTABLE_MODE} and the file starts with\n` +
-        `    \`${SHEBANG}\`. Windows has no executable bit, so \`git add\` records ${"100644"} there\n` +
-        `    and the working-tree copy looking executable is not an answer to Git.\n\n` +
-        `    Run: git update-index --chmod=+x ${HOOKS_DIRECTORY}/*\n`,
-    );
-  } catch (error) {
-    process.stderr.write(`${error.message}\n`);
-    return false;
+  const broken = found.map((hook) => problemWith(hook, root)).filter((problem) => problem !== null);
+
+  if (broken.length === 0) {
+    report(found.length);
+    return;
   }
+
+  throw new Error(
+    `gate: ${broken.length} hook(s) Git would not run:\n` +
+      `${broken.map((problem) => `  - ${problem}\n`).join("")}\n` +
+      `    Git runs a hook only if the index says ${EXECUTABLE_MODE} and the file starts with\n` +
+      `    \`${SHEBANG}\`. Windows has no executable bit, so \`git add\` records 100644 there\n` +
+      `    and the working-tree copy looking executable is not an answer to Git.\n\n` +
+      `    \`npm run fix\` sets a missing bit. A missing \`${SHEBANG}\` is the file's own doing:\n` +
+      `    restore the line and run it again. See CONTRIBUTING.md, under The hooks.\n`,
+  );
+}
+
+/**
+ * Sets the executable bit on every tracked hook whose index mode is not `100755`.
+ *
+ * `git update-index --cacheinfo <mode>,<object>,<path>` rather than `--chmod=+x <path>`, because the
+ * first rewrites the index entry the mode and object name came from and the second re-reads the
+ * working-tree copy and stages it. The header says why that difference is the whole point; the short
+ * of it is that a fixer which decides what a commit contains is not a fixer.
+ *
+ * A hook Git does not track is not repaired here, and could not be: `--cacheinfo` needs an object
+ * name, and there is no index entry to read one from. `git add --chmod=+x <path>` tracks a file and
+ * sets the bit in one command, and the failure message names it — staging a new file is a decision
+ * about what a commit holds, and that belongs to whoever is committing.
+ *
+ * @param {string} root Workspace root.
+ * @returns {Promise<void>}
+ */
+async function repair(root) {
+  const found = await askGit(root);
+
+  assertThereAreHooks(found);
+
+  const missingBit = found.filter((hook) => hook.mode !== EXECUTABLE_MODE);
+
+  if (missingBit.length === 0) {
+    report(found.length);
+    return;
+  }
+
+  for (const hook of missingBit) {
+    const entry = `${EXECUTABLE_MODE},${hook.object},${hook.relative}`;
+    const ok = await runVisible(root, "git", ["update-index", "--cacheinfo", entry]);
+
+    if (!ok) {
+      throw new Error(
+        `gate: could not set the executable bit on ${hook.relative}.\n` +
+          `    If the hook is not tracked, \`git add --chmod=+x ${hook.relative}\` tracks it and\n` +
+          `    sets the bit together.`,
+      );
+    }
+  }
+
+  const after = await askGit(root);
+
+  // The index, read back. Everything about the mode this step can fix, it can fix, so a hook still
+  // wrong here is one whose contents are wrong — and the operator is the one who has to see that
+  // rather than a fixer that reported success on a hook Git will skip.
+  const stillBroken = after
+    .map((hook) => problemWith(hook, root))
+    .filter((problem) => problem !== null);
+
+  if (stillBroken.length > 0) {
+    throw new Error(
+      `gate: ${stillBroken.length} hook(s) Git would still not run after setting the bit:\n` +
+        `${stillBroken.map((problem) => `  - ${problem}\n`).join("")}\n` +
+        `    The bit is set; what is left is the file itself. Run \`npm run check\` and read what\n` +
+        `    it says about them.`,
+    );
+  }
+
+  for (const hook of missingBit) {
+    console.log(`  ${hook.relative}: ${hook.mode} → ${EXECUTABLE_MODE}`);
+  }
+  console.log(`${missingBit.length} hook(s) marked executable in the index`);
+}
+
+/**
+ * Refuses a repository holding no tracked hook at all, which is a failure rather than nothing to do.
+ *
+ * A fixer cannot repair that one: there is no file to set a bit on, and inventing one would be a
+ * decision about what this repository's commits run. The check is where the answer belongs, and this
+ * says so rather than passing on an empty answer.
+ *
+ * @param {Array<{relative: string, mode: string}>} found What Git reported.
+ */
+function assertThereAreHooks(found) {
+  if (found.length > 0) {
+    return;
+  }
+
+  throw new Error(
+    `gate: no hook is tracked under ${HOOKS_DIRECTORY}/.\n\n` +
+      `    A commit that finds no hook runs no gate, and says nothing. Restore them with\n` +
+      `    \`git checkout ${HOOKS_DIRECTORY}\`, or see CONTRIBUTING.md, under The hooks.`,
+  );
+}
+
+/**
+ * Says that nothing here needed doing, naming how many hooks that was.
+ *
+ * @param {number} count How many hooks Git tracks.
+ */
+function report(count) {
+  console.log(
+    `every hook Git tracks under ${HOOKS_DIRECTORY}/ is one Git will run (${count} of them)`,
+  );
 }
 
 /**
@@ -106,14 +222,20 @@ export async function check(root) {
  * a conflicted path has an entry per stage and the modes can disagree.
  *
  * @param {string} root Workspace root.
- * @returns {Promise<string>} NUL-separated records, as `git ls-files` printed them.
+ * @returns {Promise<Array<{relative: string, mode: string}>>} One entry per tracked hook.
  */
-function askGit(root) {
-  return captureUntrimmed(root, "git", ["ls-files", "-z", "--stage", "--", HOOKS_DIRECTORY]).catch(
-    (error) => {
-      throw new Error(`gate: ${error.message}`);
-    },
-  );
+async function askGit(root) {
+  const records = await captureUntrimmed(root, "git", [
+    "ls-files",
+    "-z",
+    "--stage",
+    "--",
+    HOOKS_DIRECTORY,
+  ]).catch((error) => {
+    throw new Error(`gate: ${error.message}`);
+  });
+
+  return parseAll(records);
 }
 
 /**
@@ -139,11 +261,15 @@ export function parseAll(records) {
  * A record is a mode, an object name and a stage, then a tab, then the path:
  *
  * ```text
- * 100755 6b2c... 0<TAB>.claude/git-hooks/commit-msg
+ * 100755 6b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 0<TAB>.claude/git-hooks/commit-msg
  * ```
  *
+ * The object name is read and carried although only `fix` uses it, because it is the same record:
+ * reading the mode out of it and looking the name up again later would be two questions asked of Git
+ * where one record answers both.
+ *
  * @param {string} record One record.
- * @returns {{relative: string, mode: string}} What it says.
+ * @returns {{relative: string, mode: string, object: string}} What it says.
  */
 export function parse(record) {
   const tab = record.indexOf("\t");
@@ -154,9 +280,9 @@ export function parse(record) {
     );
   }
 
-  const [mode] = record.slice(0, tab).split(/\s+/);
+  const [mode, object] = record.slice(0, tab).split(/\s+/);
 
-  return { relative: record.slice(tab + 1), mode };
+  return { relative: record.slice(tab + 1), mode, object };
 }
 
 /**
