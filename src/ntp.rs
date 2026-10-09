@@ -143,7 +143,7 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
                 clock::set(answer.epoch_secs, answer.stratum);
 
                 info!(
-                    "the clock is set to {} UTC by a stratum {} server",
+                    "the clock is set to {} by a stratum {} server",
                     defmt::Display2Format(&Clock::utc(answer.epoch_secs)),
                     answer.stratum,
                 );

@@ -13,7 +13,7 @@ accident, then join a Wi-Fi network, print the address DHCP hands out, and set t
 SNTP server over that network — and every 500 ms print one line that says all of it:
 
 ```text
-Hello world! 1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined
+Hello world! 2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, wifi: joined
 ```
 
 It reads as the time and where it came from, then the address, then the state of the radio — the
@@ -23,24 +23,24 @@ gate can check rather than things assembled next to the printer.
 
 It also says when something is wrong, and what:
 
-| What the line says                                                       | What it means                                                  |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------- |
-| `00:00:42 (counting from boot: nothing has answered yet)`                | no server has answered yet                                     |
-| `00:01:03 (counting from boot: the time server's answer did not arrive)` | the last attempt, and the step of it that failed               |
-| `1791138151 UTC (from a stratum 2 server, last confirmed 3900s ago)`     | a real time, from a server, and nobody has confirmed it since  |
-| `wifi: joined`                                                           | the station is on the network                                  |
-| `wifi: joining`                                                          | an attempt is in progress or due                               |
-| `wifi: not joined: NoAccessPointFound (signal -81 dBm)`                  | the last failure, in the driver's own words, with the signal   |
-| `wifi: not joined: FourWayHandshakeTimeout (signal -55 dBm)`             | the radio ran out of time mid-handshake and did not say why    |
-| `wifi: nothing to join: no credentials were compiled in`                 | a build with no `WIFI_SSID`, which is what the gate and CI are |
+| What the line says                                                         | What it means                                                  |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `00:00:42 (counting from boot: nothing has answered yet)`                  | no server has answered yet                                     |
+| `00:01:03 (counting from boot: the time server's answer did not arrive)`   | the last attempt, and the step of it that failed               |
+| `2026-10-04T18:22:31Z (from a stratum 2 server, last confirmed 3900s ago)` | a real time, from a server, and nobody has confirmed it since  |
+| `wifi: joined`                                                             | the station is on the network                                  |
+| `wifi: joining`                                                            | an attempt is in progress or due                               |
+| `wifi: not joined: NoAccessPointFound (signal -81 dBm)`                    | the last failure, in the driver's own words, with the signal   |
+| `wifi: not joined: FourWayHandshakeTimeout (signal -55 dBm)`               | the radio ran out of time mid-handshake and did not say why    |
+| `wifi: nothing to join: no credentials were compiled in`                   | a build with no `WIFI_SSID`, which is what the gate and CI are |
 
 The time is UTC, and it is only real once a server has answered. This chip has no battery-backed
 clock, so before that the greeting prints how long it has been running since boot, wrapped into a
-day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and a count of
-seconds since the epoch came from a server. Between two answers the clock keeps moving on its own
-crystal, so a reading nobody has confirmed for an hour says how long ago that was in seconds. The
-time lives in RAM, so every boot asks again. `src/ntp.rs` is the client; `src/clock.rs` is the one
-number it sets and the three facts about where it came from.
+day, and the difference is visible in the shape: a bare `HH:MM:SS` counts from boot, and an RFC 3339
+timestamp came from a server. Between two answers the clock keeps moving on its own crystal, so a
+reading nobody has confirmed for an hour says how long ago that was in seconds. The time lives in
+RAM, so every boot asks again. `src/ntp.rs` is the client; `src/clock.rs` is the one number it sets
+and the three facts about where it came from.
 
 Wi-Fi is [`esp-radio`](https://docs.espressif.com/projects/rust/esp-radio/latest/), which on both
 chips is part of the chip itself: there are no pins to choose and no antenna to configure. It needs
@@ -379,8 +379,8 @@ driver. Release image 520,768 bytes, 12.61% of the flash.
 [INFO ] joined my-network                   (src/wifi.rs:240)
 [INFO ] address 192.168.0.250/24
 [INFO ] gateway 192.168.0.1
-[INFO ] the clock is set to 2026-10-05 20:41:59 UTC by a stratum 3 server  (src/ntp.rs:146)
-[INFO ] Hello world! 2026-10-05 20:42:48 UTC (from a stratum 3 server), 192.168.0.250/24, wifi: joined
+[INFO ] the clock is set to 2026-10-05T20:41:59Z by a stratum 3 server  (src/ntp.rs:146)
+[INFO ] Hello world! 2026-10-05T20:42:48Z (from a stratum 3 server), 192.168.0.250/24, wifi: joined
 ```
 
 **ESP32-C6**, rev v0.2, 16 MB, over its USB-to-UART bridge. Release image 584,480 bytes, 3.57% of
@@ -391,8 +391,8 @@ the flash.
 [INFO ] joined my-network                   (src/wifi.rs:240)
 [INFO ] address 192.168.0.225/24
 [INFO ] gateway 192.168.0.1
-[INFO ] the clock is set to 2026-10-05 21:08:56 UTC by a stratum 3 server  (src/ntp.rs:146)
-[INFO ] Hello world! 2026-10-05 21:09:19 UTC (from a stratum 3 server), 192.168.0.225/24, wifi: joined
+[INFO ] the clock is set to 2026-10-05T21:08:56Z by a stratum 3 server  (src/ntp.rs:146)
+[INFO ] Hello world! 2026-10-05T21:09:19Z (from a stratum 3 server), 192.168.0.225/24, wifi: joined
 ```
 
 So on both chips the radio associates, DHCP hands out an address, and the line reads what happened.
@@ -444,7 +444,7 @@ from 520,768 is MbedTLS and the certificate.
 
 ```text
 [INFO ] reporting to https://cfpoc.andresmoschini.workers.dev:443/events every 300 seconds
-[INFO ] the clock is set to 1791395829 UTC by a stratum 3 server             (src/ntp.rs:146)
+[INFO ] the clock is set to 2026-10-07T17:57:09Z by a stratum 3 server             (src/ntp.rs:146)
 [INFO ] the API's certificate verified: Some(Tls1_3), flags 0x0            (src/tls.rs:223)
 [WARN ] the API did not store the event: 401
 [INFO ] the API said: {"error":"Unauthorized"}

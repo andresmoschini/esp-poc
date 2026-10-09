@@ -98,12 +98,12 @@ fn a_clock_counting_from_boot_wraps_at_midnight() {
     assert_eq!(render(&Clock::since_boot(u64::MAX)), "07:00:15");
 }
 
-/// A real time is the count of seconds since the epoch, printed as the number: the date is what
-/// the reported event's timestamp is for, and the greeting that carries this one is read twice a
-/// second. The calendar behind the timestamp is pinned where the timestamp is tested.
+/// A real time is RFC 3339 in UTC, the same rendering as the reported event's timestamp: one
+/// calendar shape for the serial log and the stored row, so a greeting reads the same as what the
+/// API kept. The calendar itself is pinned where the timestamp is tested.
 #[test]
-fn a_synchronized_clock_is_the_count_of_seconds() {
-    assert_eq!(render(&Clock::utc(0)), "0");
+fn a_synchronized_clock_is_rfc_3339() {
+    assert_eq!(render(&Clock::utc(0)), "1970-01-01T00:00:00Z");
     // 2026-10-04T18:22:31Z, the moment the other test files write lines at.
-    assert_eq!(render(&Clock::utc(1_791_138_151)), "1791138151");
+    assert_eq!(render(&Clock::utc(1_791_138_151)), "2026-10-04T18:22:31Z");
 }

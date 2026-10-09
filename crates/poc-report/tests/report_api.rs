@@ -38,7 +38,8 @@ const BODY_401: &[u8] = br#"{"error":"Unauthorized"}"#;
 /// The state line of an event from a chip that has joined and has a time, as `src/status.rs`
 /// renders it: the payload carries what the chip would have printed, and this crate stores it
 /// verbatim rather than rendering it.
-const PAYLOAD: &str = "1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined";
+const PAYLOAD: &str =
+    "2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, wifi: joined";
 
 /// Renders a value the way the firmware's `Display2Format` does on the chip, and as `String` here.
 fn render(value: &impl std::fmt::Display) -> String {
@@ -68,7 +69,7 @@ fn body() -> String {
 fn an_event_is_the_json_the_api_asks_for() {
     assert_eq!(
         body(),
-        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"1791138151 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
+        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
     );
 }
 
@@ -89,11 +90,11 @@ fn every_field_of_an_event_is_a_json_string() {
     assert!(body.starts_with('{') && body.ends_with('}'), "{body}");
 }
 
-/// The timestamp is what the API will read back as a date, so it has to be RFC 3339 and not the
-/// space-separated form the state line prints. The two renderings come out of the same number, and
-/// which one goes into the body is the decision this test pins.
+/// The timestamp is what the API will read back as a date, so it has to be RFC 3339 — the same
+/// rendering the state line's clock shares. The two come out of the same number, and which one goes
+/// into the body is the decision this test pins.
 #[test]
-fn the_timestamp_is_rfc_3339_and_not_the_state_line_s_form() {
+fn the_timestamp_is_rfc_3339() {
     assert_eq!(render(&Timestamp::at(AT)), "2026-10-04T18:22:31Z");
 
     // Both ends of the day, and the leap day itself: a timestamp that rolls over wrongly is a row
