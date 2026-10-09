@@ -77,56 +77,12 @@ runs Cargo from outside the repository, and the reason why is longer than the co
 
 ## What esp-generate owns, and what that costs you
 
-The generator wrote these files, and it will overwrite them:
-
-| File                                                   | What has been added since                                                                                 |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| `Cargo.toml`                                           | the `[lints]`, `[workspace]` and `[features]` blocks, and the path dependency on `crates/poc-report`      |
-| `rust-toolchain.toml`                                  | the exact pin and `rustfmt`, `clippy`, `rust-src`, and the second chip's target                           |
-| `build.rs`, `src/lib.rs`, `src/bin/main.rs`            | a crate-level `//!` doc comment                                                                           |
-| `.vscode/settings.json`, `.vscode/extensions.json`     | formatter ownership and the gate's extension set                                                          |
-| `.github/workflows/rust_ci.yml`                        | **deleted** — replaced by `ci.yml` and `commitlint.yml`                                                   |
-| `.cargo/config.toml`                                   | `alloc` in `build-std`, a second `include` for the untracked `local.toml`, and the second chip's `runner` |
-| `.cargo/esp-config.toml`, `wokwi.toml`, `diagram.json` | a note in the first about where credentials belong instead                                                |
-
-After re-running the generator, run `npm run check` before committing and put back what it reports
-missing. The generator is told about the gate, CI and the agent file but not about a lints block, a
-pinned channel, a documentation comment or a `[features]` block, so nothing it does will tell you
-they were dropped.
-
-**The `[features]` block is the trap this repository set for itself.** The generator writes one
-chip's features inline on each dependency, which is exactly what this repository stopped doing:
-regenerating replaces the block with `esp32c3` or `esp32c6` on the seven Espressif dependencies and
-leaves the other chip unable to build, and `src/bin/main.rs`'s other `#[cfg]` block goes with it.
-That one does go red, at the build step, and the message is about a chip's features and not about a
-manifest — so `git diff Cargo.toml` is still the faster way to see it. `CONTRIBUTING.md` carries the
-procedure.
-
-**Three rows in that table are not what they look like**, and they hide five traps between them.
-Take the `[lints]` blocks out and the gate does not go red — it goes quietly weaker, because with
-them removed `cargo clippy -- -D warnings` is silent: there are no lints left to warn. That is the
-sharpest instance of the rule above, and the reason to read `git diff Cargo.toml` after generating
-rather than trusting the summary line. Take `rust-toolchain.toml` out instead and it does go red,
-because a machine that has never built this project then has no `cargo fmt` or `cargo clippy` to
-run. And `build-std = ["core"]` does go red, but with a message that says nothing about Wi-Fi: the
-radio driver allocates, so the firmware needs `alloc`, and without it every crate that does fails
-with `duplicate lang item in crate core`. The generator only writes that `alloc` when it is given
-`-o alloc`, so that is the option to pass.
-
-The `include` line is the fourth trap, and the quietest: regenerating rewrites
-`include = ["esp-config.toml"]`, which silently drops `local.toml`, and nothing goes red — the build
-still succeeds and the firmware simply stops joining networks, saying it has no credentials. Put the
-second entry back. Credentials belong in `local.toml` and nowhere else: they are compiled into the
-image, so a tracked file would put the password in the repository as well.
-
-The `[workspace]` block is the fifth, and the only loud one: regenerating drops it along with the
-path dependency on `crates/poc-report`, so the firmware stops compiling with
-`error[E0432]: unresolved import poc_report`. Loud is good — it is the failure mode you would rather
-have — but it fails at the build step with a message about an import rather than about a manifest,
-so `git diff Cargo.toml` is still the faster way to see it.
-
-CONTRIBUTING.md carries the procedure for all of them, and the third trap: `-o ci` recreates
-`.github/workflows/rust_ci.yml`, which builds on a toolchain this project cannot use.
+The generator overwrites `Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`, `build.rs`,
+`src/`, `wokwi.toml`, `diagram.json`, `.vscode/` and `.github/workflows/`, and everything added to
+those files by hand has to be put back by hand. The list of what, the procedure, and the five traps
+between the rows of it are in
+[CONTRIBUTING.md, under Re-running esp-generate](CONTRIBUTING.md#re-running-esp-generate) — that
+section is the one place they are written down, and it is the section to read before regenerating.
 
 What the generator will _not_ overwrite, and which you should keep an eye on: everything else —
 `tools/`, `package.json` and the rest of the Node tooling, `.gitattributes`, `.editorconfig`,
@@ -185,29 +141,23 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   are in `Cargo.toml`; do not remove them thinking they are noise.
 - Credentials are compiled in from `.cargo/local.toml`, which is untracked. Keep it that way, and
   remember that whatever is in it also lands in the flash image.
-- **The TLS stack is prebuilt or it is not built at all.** `mbedtls-rs` ships static libraries for
-  exactly the two triples this project builds, and uses them only when the enabled features match
-  what they were built with byte for byte; anything else compiles MbedTLS from C and needs `CMake`,
-  Clang and a RISC-V C cross-compiler that nothing else here requires. **Two consequences, both
-  traps.** Turning on `hook-wall-clock` — the only way to make it check certificate _dates_, which
-  it otherwise does not — falls on the wrong side of that line, so `src/clock.rs`'s SNTP time is not
-  currently reaching the certificate check. And so does any `ssl-*-content-len-*` feature, which is
-  why the 16 KiB record buffers are paid for in heap instead. Read `Cargo.toml`'s `mbedtls-rs` entry
-  and `src/tls.rs` before changing any feature of that crate; the failure mode of getting it wrong
-  is a build that wants a C toolchain, not a build that says so.
+- **The TLS stack is prebuilt or it is not built at all.** The rule is the comment on the
+  `mbedtls-rs` entry in `Cargo.toml` — read it before changing any feature of that crate, because
+  the failure mode of getting it wrong is a build that wants `CMake`, Clang and a RISC-V C
+  cross-compiler, not a build that says so. Two things in this tree sit on the wrong side of that
+  line, and both are deliberate: `hook-wall-clock`, the only way to make MbedTLS check certificate
+  _dates_, which is why `src/tls.rs` says the dates are not checked; and any `ssl-*-content-len-*`
+  feature, which is why the 16 KiB record buffers are paid for in heap instead.
 - **`certs/` holds the one root this firmware trusts**, and it is a promise with a shelf life: if
   the API moves behind another authority, every handshake fails with a verification error rather
   than trusting whatever is offered, and `certs/README.md` is what has to change. `.gitattributes`
   marks the `.der` binary and `.editorconfig-checker.json` excludes it, so the gate reads it as
   neither text nor prose.
-- **The TRNG entropy source stays off until the network is up.** `TrngSource::new` reprograms the
-  SAR ADC for entropy, and on the C6 that keeps the station from joining at all: narrowed to that
-  one call by flashing each side (`3a3706b` joins in seconds, `4cbbdfe` never does, and adding only
-  those two lines back reproduces it), always as `AuthenticationExpired` at a signal too strong for
-  range to explain. So `src/bin/main.rs` passes `RNG`/`ADC1` into the reporting task, and
-  `src/tls.rs`'s `boot` enables the source once DHCP is up — which implies the station joined. Plain
-  `Rng` is not a substitute: it is only `RngCore`, never `CryptoRng`, and without RF or ADC running
-  it is pseudo-random, so it cannot be what TLS draws its key material from.
+- **The TRNG entropy source stays off until the network is up**, and `src/tls.rs` is where that is
+  written down and why: `TrngSource::new` reprograms the SAR ADC, which on the C6 keeps the station
+  from joining at all. Plain `Rng` is not a substitute — it is only `RngCore`, never `CryptoRng`,
+  and without RF or ADC running it is pseudo-random, so it cannot be what TLS draws its key material
+  from.
 - `src/report.rs` sends **no `Authorization` header**, so the API answers `401` and the log says so
   on every pass — that line is the feature working, not a bug. It is now safe to add the token,
   which is the next piece of work: the exchange is HTTPS through `src/tls.rs` on port 443, so a
@@ -215,18 +165,11 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   variables rather than from source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the
   deployed Worker and port 443. `HOST` is printed only in the lines about a name that does not
   resolve.
-- **One connection per exchange, and it is `edge-nal`'s job rather than ours.** `smoltcp` answers
-  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of a
-  task means every exchange after the first is refused by the stack before a packet goes out —
-  measured on the board, the first exchange succeeded and the second logged `InvalidState` five
-  minutes later. `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a
-  pool on drop, so this is now the library's property; **do not reintroduce a socket that outlives
-  one exchange.** The factory in `src/tls.rs` is built once and parked in a static because a
-  `TlsSocket` borrows the factory that made it — that is the one constraint the abstraction adds,
-  and it costs two statics. It hid for a long time for two reasons worth remembering: the cleartext
-  version half-closed the connection itself before reading, which left the socket in a state the
-  next `connect` tolerated, and **nothing shorter than two intervals can show this class of bug at
-  all** — one exchange has to succeed before a second can fail.
+- **One connection per exchange, and it is `edge-nal`'s job rather than ours.** `src/tls.rs` says
+  why, and it is the place to read before changing anything about how the connection is made. The
+  one thing worth repeating here is how the bug hid: **nothing shorter than two intervals can show
+  this class of failure at all** — one exchange has to succeed before a second can fail, and the
+  report interval is five minutes.
 - **The exchange runs through `edge-http`'s `Connection`, connect included.** Its
   `io::client::Connection` state machine calls `connect` itself — TCP and the TLS handshake with it
   — so there is no `tls::open` any more: the handshake's twenty-second budget lives on the
@@ -240,25 +183,17 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   Worker answers with), and the `Content-Length` tuple borrows from a `heapless::String<20>` that
   must outlive the headers borrowing from it.
 - **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
-  closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
-  as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
-  so `once` reads first and closes afterwards. Close on **every** path: `MbedTLS` warns on a session
-  dropped while still open, and a warning on every failed exchange would be a warning about the
-  reporting rather than about the failure. The split borrow of the answer is over before `close`
-  takes the connection back.
-- **A reply is not a read, and that is now `edge-http`'s problem rather than ours.** `stream.read`
-  returns whatever has arrived, which is not the same thing as a whole HTTP reply: the 401 this API
-  sends is 650 bytes against a 25-byte status line, and nothing in TCP promises where the boundary
-  falls. **Reading once and parsing that was the bug that produced "what answered was not the API"
-  against a working API** — the read had landed inside the status line, and the first eleven bytes
-  of a valid `401` (`HTTP/1.1 40`) parse as no status at all. This firmware used to own the loop and
-  the predicate, and `tests/report_api.rs` pinned it against a captured real reply one byte at a
-  time; both are gone. `Connection` reads the head with `exact = true`, one byte at a time looking
-  for `\r\n\r\n` — over TLS each of those is a session read rather than a packet, and a few hundred
-  of them is what a head costs. What matters is that it keeps reading until the head is whole, which
-  is what makes a reply that arrives in pieces a reply. **Reinstating a hand-written read loop over
-  a raw `read` would reintroduce the bug**, and the test that caught it went with the code it was
-  testing, so nothing here would notice.
+  closes when it has answered; `once` reads first and closes afterwards, because shutting the write
+  half first is the server's cue that the conversation is over before it has replied. Close on
+  **every** path: `MbedTLS` warns on a session dropped while still open, and a warning on every
+  failed exchange would be a warning about the reporting rather than about the failure.
+- **A reply is not a read, and that is `edge-http`'s problem rather than ours.** A read returns
+  whatever has arrived, which is not the same thing as a whole HTTP reply: nothing in TCP promises
+  where the boundary falls, so a reply of 650 bytes with a 25-byte status line can arrive in pieces.
+  `Connection` reads the head with `exact = true` until it is whole, which is what makes a reply
+  that arrives in pieces a reply. **Reinstating a hand-written read loop over a raw `read` would
+  reintroduce the bug it removed**, and the test that caught it went with the code it was testing,
+  so nothing here would notice.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled

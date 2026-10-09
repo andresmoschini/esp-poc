@@ -205,10 +205,9 @@ const STATUS_LEN: usize = 256;
 /// once the network stack exists, and every step inside it is bounded by a timeout of its own. A
 /// network that never comes up costs this task nothing but its own waiting.
 ///
-/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange: the
-/// generator is only handed out once the SAR ADC source behind it has been enabled, which takes
-/// both peripherals. They travel by value because the task enables the source itself, once DHCP is
-/// up — not here, where nothing has joined yet. See [`crate::tls::boot`] for why the wait matters.
+/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange, and they
+/// travel by value because the task enables the source itself rather than this function doing it
+/// before anything has joined. [`crate::tls::boot`] says why the wait matters.
 ///
 /// # Panics
 ///

@@ -103,11 +103,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 96 * 1024);
 
-    // The entropy MbedTLS draws its key material from is enabled later, not here: the
-    // source is the SAR ADC, and enabling it before the station has joined keeps the C6 from
-    // joining at all — measured, `TrngSource::new` at boot is the whole of that failure. So the
-    // peripherals below travel into the reporting task, which enables the source once DHCP is up.
-    // See `src/report.rs`.
+    // The entropy MbedTLS draws its key material from is enabled later, not here, so the two
+    // peripherals travel into the reporting task. `src/tls.rs` says why the wait matters.
 
     // The radio needs a preemptive scheduler and will not start without one, so this has to come
     // before anything touches the radio. `FROM_CPU_INTR0` is how the scheduler is woken.
