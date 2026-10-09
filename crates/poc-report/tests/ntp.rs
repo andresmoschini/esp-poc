@@ -15,7 +15,7 @@
 // twenty tests agreed with a bug that a real server's first reply exposed. An encoder and a decoder
 // written from the same idea check each other's arithmetic and neither one's idea of the format.
 
-use poc_report::{Leap, Refusal, SNTP_LEN, sntp_reply, sntp_request};
+use poc_report::{Refusal, SNTP_LEN, sntp_reply, sntp_request};
 
 /// The nonce the tests send. Any value works; one that is easy to read in a failure is the point.
 const NONCE: u32 = 0x0BAD_F00D;
@@ -105,7 +105,6 @@ fn a_reply_carries_the_time_the_server_gave() {
 
     assert_eq!(answer.epoch_secs, moment);
     assert_eq!(answer.stratum, 2);
-    assert_eq!(answer.leap, Leap::Normal);
 }
 
 /// The second half of a timestamp is a fraction, and adding it to the seconds is a bug that looks
@@ -217,27 +216,21 @@ fn a_server_that_says_it_is_unsynchronized_is_refused() {
     assert_eq!(sntp_reply(&packet, NONCE), Err(Refusal::Unsynchronized));
 }
 
-/// The other two leap indicators are read rather than refused: a leap second is a fact about tonight
-/// and not a reason to distrust the packet.
+/// The other two leap indicators are read rather than refused, and then nothing is done with them: a
+/// leap second is a fact about tonight, and a clock whose use for its time is printing it will not
+/// notice either a repeated second or a skipped one. The bits are still parsed, because the third
+/// value in those same two bits is a refusal and there is no way to tell them apart without looking.
 #[test]
-fn a_pending_leap_second_is_reported_rather_than_refused() {
-    for (bits, leap) in [(0b0100_0000, Leap::Inserted), (0b1000_0000, Leap::Deleted)] {
+fn a_pending_leap_second_is_not_a_refusal() {
+    for bits in [0b0100_0000, 0b1000_0000] {
         let mut packet = reply(epoch_secs(2026, 10, 4, 18, 22, 31));
         packet[0] |= bits;
 
-        let answer = sntp_reply(&packet, NONCE).expect("a leap second is not a refusal");
-
-        assert_eq!(answer.leap, leap);
+        assert!(
+            sntp_reply(&packet, NONCE).is_ok(),
+            "a leap second is not a reason to distrust the packet",
+        );
     }
-
-    assert_eq!(
-        sentence(Leap::Inserted),
-        "a leap second is being added at the end of the day"
-    );
-    assert_eq!(
-        sentence(Leap::Deleted),
-        "a leap second is being removed at the end of the day"
-    );
 }
 
 /// A packet too short to be a header has nothing in it to read, and reading past the end of it would

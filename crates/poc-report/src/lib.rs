@@ -265,37 +265,6 @@ pub struct Answer {
     /// There is no useful threshold to compare this against, and a firmware that invented one would
     /// be guessing. What it is good for is noticing that it changed.
     pub stratum: u8,
-
-    /// What the server says about leap seconds.
-    pub leap: Leap,
-}
-
-/// What a server says about leap seconds, in the two bits at the top of the packet's first byte.
-///
-/// Nothing is done with it: a leap second is a repeated or skipped second at the end of a UTC day,
-/// and a device whose use for its time is printing it will not notice either. It is read because it
-/// shares a byte with the version and the mode, and because "a leap second is pending tonight" is
-/// worth having in the log on the day the log looks wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Leap {
-    /// No leap second is pending.
-    Normal,
-
-    /// The last minute of the day has 61 seconds: one is being added.
-    Inserted,
-
-    /// The last minute of the day has 59 seconds: one is being removed.
-    Deleted,
-}
-
-impl fmt::Display for Leap {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Normal => "no leap second pending",
-            Self::Inserted => "a leap second is being added at the end of the day",
-            Self::Deleted => "a leap second is being removed at the end of the day",
-        })
-    }
 }
 
 /// Why an SNTP packet could not be turned into a time.
@@ -390,13 +359,12 @@ pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
     }
 
     // The two bits above the version say whether the server considers its own clock sound, and a
-    // server that says it does not is not a source of time however plausible its packet looks.
-    let leap = match first >> 6 {
-        0 => Leap::Normal,
-        1 => Leap::Inserted,
-        2 => Leap::Deleted,
-        _ => return Err(Refusal::Unsynchronized),
-    };
+    // server that says it does not is not a source of time however plausible its packet looks. The
+    // other two values are read and not acted on: a leap second is a repeated or skipped second at
+    // the end of a UTC day, and a device whose use for its time is printing it notices neither.
+    if first >> 6 == 0b11 {
+        return Err(Refusal::Unsynchronized);
+    }
 
     let request = sntp_request(nonce);
     if header[ORIGINATE..ORIGINATE + 8] != request[TRANSMIT..TRANSMIT + 8] {
@@ -439,7 +407,6 @@ pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
     Ok(Answer {
         epoch_secs,
         stratum,
-        leap,
     })
 }
 
