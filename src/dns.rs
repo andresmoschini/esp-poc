@@ -13,14 +13,9 @@ use core::net::Ipv4Addr;
 
 use embassy_net::dns::DnsQueryType;
 use embassy_net::{IpAddress, Stack};
-use embassy_time::{Duration, with_timeout};
+use embassy_time::with_timeout;
 
-/// How long a lookup may take before it is given up on.
-///
-/// Five seconds, as in both callers before they shared this: a name that does not resolve and a
-/// server that does not answer are different problems, and the timeout on the lookup is what tells
-/// them apart in the log.
-const TIMEOUT: Duration = Duration::from_secs(5);
+use crate::TIMEOUT;
 
 /// What a lookup came to when it did not produce an address.
 ///

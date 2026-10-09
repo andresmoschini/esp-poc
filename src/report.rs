@@ -72,7 +72,7 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::peripherals::{ADC1, RNG};
 use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
-use crate::{clock, status, tls};
+use crate::{TIMEOUT, clock, status, tls};
 
 /// Which API to report to, from the build's configuration.
 ///
@@ -170,27 +170,20 @@ fn server_name(buffer: &'static mut [u8; NAME_LEN]) -> &'static CStr {
     CStr::from_bytes_until_nul(buffer).expect("a NUL was just written")
 }
 
-/// How long any single step of an exchange may take, save the first one.
-///
-/// Each step is timed on its own, as in `src/ntp.rs`, so that a line saying an exchange failed also
-/// says which part of it failed: a body that does not go out and a server that does not answer are
-/// different problems with different fixes. The first step — connect, shake hands, send the head —
-/// is one call inside `edge-http`'s `Connection` and keeps its own budget in [`HANDSHAKE`].
-const TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How long the connect, the handshake and the request head may take together.
 ///
 /// One budget rather than three because `edge-http`'s `Connection` does all three inside one call:
 /// the TCP connect, the TLS handshake and the head going out are a single `initiate_request`, so a
 /// line saying "the handshake failed" and a line saying "the head did not go out" would be two names
-/// for one timeout.
+/// for one timeout. Every other step is [`crate::TIMEOUT`], which is the connect included: a
+/// connection that could not be established is a step that did not finish in time, like any other.
 ///
-/// The handshake is what makes this longer than [`TIMEOUT`]: every other step is a request going out
-/// or a reply coming back over an established connection, while this one is the API proving who it
-/// is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the chip's
-/// accelerators is seconds rather than milliseconds. The handshake is also renegotiated from scratch
-/// every five minutes, because the connection is built fresh each time and paid for in full every
-/// time.
+/// The handshake is what makes this longer than [`crate::TIMEOUT`]: every other step is a request
+/// going out or a reply coming back over an established connection, while this one is the API
+/// proving who it is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the
+/// chip's accelerators is seconds rather than milliseconds. The handshake is also renegotiated from
+/// scratch every five minutes, because the connection is built fresh each time and paid for in full
+/// every time.
 ///
 /// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
 /// inside five seconds, so this only bounds the failure where nothing comes back at all.
