@@ -48,7 +48,8 @@ use core::ffi::CStr;
 use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
 use edge_nal_tls::{TlsConnector, TlsSocket};
 use embassy_net::Stack;
-use esp_hal::rng::Trng;
+use esp_hal::peripherals::{ADC1, RNG};
+use esp_hal::rng::{Trng, TrngSource};
 use mbedtls_rs::{Certificate, ClientSessionConfig, Tls};
 
 /// The trust anchor: ISRG Root X1, in DER, in flash. See `certs/README.md` for where it came from,
@@ -104,12 +105,47 @@ pub type Stream<'a> = TlsSocket<'a, edge_nal_embassy::TcpSocket<'a>>;
 ///
 /// # Panics
 ///
-/// If a `MbedTLS` instance already exists. [`crate::report::start`] calls this once, at boot, so this
-/// is a statement about the program rather than something that can happen later.
+/// If a `MbedTLS` instance already exists. [`crate::report`] calls this once, after DHCP is up, so
+/// this is a statement about the program rather than something that can happen later.
 pub fn instance(trng: Trng) -> &'static Tls<'static> {
     let trng: &'static mut Trng = static_cell::make_static!(trng);
 
     static_cell::make_static!(Tls::new(trng).expect("one MbedTLS instance, created once at boot"))
+}
+
+/// Enables the entropy source and builds the factory every exchange is made through.
+///
+/// A plain function rather than a task, for the same reason `src/ntp.rs` builds its socket outside
+/// its task: `make_static!` inside a task body is a cycle the compiler cannot resolve, and a plain
+/// function has no such future.
+///
+/// The source is enabled here — once an address is up — rather than at boot because enabling it is
+/// what keeps a C6 from joining at all: the source is the SAR ADC, and [`TrngSource::new`]
+/// reprograms it while the station has not even authenticated. Measured by bisecting the join
+/// failure to that one call: everything at or before `3a3706b` joins in seconds, `4cbbdfe` never
+/// does, and adding only those two lines back reproduces it. DHCP up implies the station joined, so
+/// from here on the radio is associated and the ADC is this exchange's to use.
+///
+/// The source is parked in a static rather than held because nothing outlives this call to keep it:
+/// dropping it would switch the SAR ADC back off underneath the [`Trng`] that [`instance`] keeps,
+/// and from there the key material would silently stop being key material.
+///
+/// # Panics
+///
+/// If the trust anchor in `certs/` does not parse — see [`connector`] — or if the entropy source
+/// was not enabled, which here means the two lines below stopped agreeing with each other.
+pub fn boot(
+    rng: RNG<'static>,
+    adc: ADC1<'static>,
+    stack: Stack<'static>,
+    name: &'static CStr,
+) -> &'static TlsConnector<'static, EmbassyTcp<'static>> {
+    let buffers = static_cell::make_static!(TcpBuffers::new());
+    let _source: &'static mut TrngSource = static_cell::make_static!(TrngSource::new(rng, adc));
+    let trng = Trng::try_new().expect("the entropy source above is enabled");
+    let tls = instance(trng);
+
+    connector(tls, buffers, stack, name)
 }
 
 /// The factory every connection is made through, built once and kept for the life of the program.

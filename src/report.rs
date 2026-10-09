@@ -64,12 +64,12 @@ use edge_http::Method;
 use edge_http::io::Body;
 use edge_http::io::client::Connection;
 use edge_nal::io::{Read, Write};
-use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
+use edge_nal_embassy::Tcp as EmbassyTcp;
 use edge_nal_tls::TlsConnector;
 use embassy_executor::Spawner;
 use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use esp_hal::rng::Trng;
+use esp_hal::peripherals::{ADC1, RNG};
 use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
 use crate::{clock, status, tls};
@@ -255,16 +255,16 @@ const STATUS_LEN: usize = 256;
 /// once the network stack exists, and every step inside it is bounded by a timeout of its own. A
 /// network that never comes up costs this task nothing but its own waiting.
 ///
-/// `trng` is the chip's hardware random number generator, which `MbedTLS` needs for its key exchange
-/// and which `esp_hal` only hands out once the entropy source has been enabled — see the comment in
-/// `src/bin/main.rs`. It is taken by value because [`crate::tls::instance`] keeps it for the life of
-/// the program.
+/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange: the
+/// generator is only handed out once the SAR ADC source behind it has been enabled, which takes
+/// both peripherals. They travel by value because the task enables the source itself, once DHCP is
+/// up — not here, where nothing has joined yet. See [`crate::tls::boot`] for why the wait matters.
 ///
 /// # Panics
 ///
-/// If the executor has no room left for another task. All four are allocated once, at boot, so this
-/// is a fact about the size of the task pool rather than something that can happen later.
-pub fn start(spawner: Spawner, stack: Stack<'static>, trng: Trng) {
+/// If the executor has no room left for another task. It is allocated once, at boot, so this is a
+/// fact about the size of the task pool rather than something that can happen later.
+pub fn start(spawner: Spawner, stack: Stack<'static>, rng: RNG<'static>, adc: ADC1<'static>) {
     // Where this build reports to, before anything else about it, because the two halves come from
     // the environment and the reader of a serial log cannot see an environment. A log that starts
     // with "joining my-network" and never says which API it is talking to cannot answer the question
@@ -285,27 +285,23 @@ pub fn start(spawner: Spawner, stack: Stack<'static>, trng: Trng) {
 
     // Here rather than inside the task, for the reason `src/ntp.rs` builds its socket in the same
     // place: `make_static!` builds its type out of `impl Trait`, and a task's body is itself an
-    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. All of it
-    // is storage rather than state: the pool of socket buffers, the server name, and the factory
-    // that holds the trust anchor and the MbedTLS instance.
-    let buffers = static_cell::make_static!(TcpBuffers::new());
+    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. This one
+    // is storage rather than state — and building it touches no hardware, so it costs the radio
+    // nothing.
     let name = server_name(static_cell::make_static!([0; NAME_LEN]));
-    let tls = tls::instance(trng);
-    let connector = tls::connector(tls, buffers, stack, name);
 
-    spawner.spawn(report(stack, connector).expect("report is a task"));
+    spawner.spawn(report(stack, rng, adc, name).expect("report is a task"));
 }
 
 /// The task behind [`start`].
 #[embassy_executor::task]
-async fn report(
-    stack: Stack<'static>,
-    connector: &'static TlsConnector<'static, EmbassyTcp<'static>>,
-) {
+async fn report(stack: Stack<'static>, rng: RNG<'static>, adc: ADC1<'static>, name: &'static CStr) {
     // The first report waits for DHCP rather than firing into a stack that has no address yet: the
     // exchange needs an address to send from, and the resolver it needs to find the API with is
     // configured by the same lease.
     stack.wait_config_up().await;
+
+    let connector = tls::boot(rng, adc, stack, name);
 
     loop {
         once(stack, connector).await;

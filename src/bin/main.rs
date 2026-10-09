@@ -21,7 +21,6 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::main;
 use esp_hal::ram;
-use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 // The C library's `memchr`, which `MbedTLS` calls from `x509.c`. It is named here rather than left to
@@ -104,17 +103,11 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 96 * 1024);
 
-    // MbedTLS draws its key material from the chip's hardware random number generator, and
-    // `esp_hal` only issues that generator once the entropy source behind it has been enabled — so
-    // it has to be enabled here, and the source has to outlive everything that reads it. Dropping
-    // it would switch the SAR ADC back off and take the Wi-Fi driver's randomness with it, which is
-    // why this is a binding with a name rather than a `_`: it lives as long as `main` does, which is
-    // forever.
-    //
-    // `ADC1` goes with it because the SAR ADC is what the entropy source is made of. Nothing in this
-    // firmware reads an analogue input, so it costs nothing here.
-    let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
-    let trng = Trng::try_new().expect("the entropy source above is enabled");
+    // The entropy MbedTLS draws its key material from is enabled later, not here: the
+    // source is the SAR ADC, and enabling it before the station has joined keeps the C6 from
+    // joining at all — measured, `TrngSource::new` at boot is the whole of that failure. So the
+    // peripherals below travel into the reporting task, which enables the source once DHCP is up.
+    // See `src/report.rs`.
 
     // The radio needs a preemptive scheduler and will not start without one, so this has to come
     // before anything touches the radio. `FROM_CPU_INTR0` is how the scheduler is woken.
@@ -131,7 +124,7 @@ async fn main(spawner: Spawner) -> ! {
     // said nothing at all.
     if let Some(stack) = stack {
         esp_poc::ntp::sync(spawner, stack);
-        esp_poc::report::start(spawner, stack, trng);
+        esp_poc::report::start(spawner, stack, peripherals.RNG, peripherals.ADC1);
     }
 
     loop {

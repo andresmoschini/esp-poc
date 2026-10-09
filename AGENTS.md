@@ -200,6 +200,14 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   than trusting whatever is offered, and `certs/README.md` is what has to change. `.gitattributes`
   marks the `.der` binary and `.editorconfig-checker.json` excludes it, so the gate reads it as
   neither text nor prose.
+- **The TRNG entropy source stays off until the network is up.** `TrngSource::new` reprograms the
+  SAR ADC for entropy, and on the C6 that keeps the station from joining at all: narrowed to that
+  one call by flashing each side (`3a3706b` joins in seconds, `4cbbdfe` never does, and adding only
+  those two lines back reproduces it), always as `AuthenticationExpired` at a signal too strong for
+  range to explain. So `src/bin/main.rs` passes `RNG`/`ADC1` into the reporting task, and
+  `src/tls.rs`'s `boot` enables the source once DHCP is up — which implies the station joined. Plain
+  `Rng` is not a substitute: it is only `RngCore`, never `CryptoRng`, and without RF or ADC running
+  it is pseudo-random, so it cannot be what TLS draws its key material from.
 - `src/report.rs` sends **no `Authorization` header**, so the API answers `401` and the log says so
   on every pass — that line is the feature working, not a bug. It is now safe to add the token,
   which is the next piece of work: the exchange is HTTPS through `src/tls.rs` on port 443, so a
