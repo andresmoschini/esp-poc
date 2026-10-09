@@ -196,13 +196,10 @@ const TRANSMIT: usize = 40;
 /// Where a server echoes the client's timestamp back at it.
 const ORIGINATE: usize = 24;
 
-/// Mode 3: a client asking for the time.
 const MODE_CLIENT: u8 = 3;
 
-/// Mode 4: a server answering.
 const MODE_SERVER: u8 = 4;
 
-/// Version 4 of the protocol, which is the version this client speaks.
 const VERSION_4: u8 = 4;
 
 /// Seconds between the two epochs: 1900-01-01T00:00:00Z is 2 208 988 800 seconds before

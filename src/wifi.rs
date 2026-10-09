@@ -31,7 +31,6 @@ use esp_radio::wifi::{
 };
 use poc_report::Address;
 
-/// The SSID of the network to join, read from the environment when this was compiled.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
 
 /// The password of that network, likewise. Empty for an open network.
@@ -40,7 +39,6 @@ const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
 /// How long to wait between attempts to join, whether the last one failed or succeeded.
 const RETRY: Duration = Duration::from_secs(5);
 
-/// How many access points to name when a connection attempt fails.
 const NEIGHBORS: usize = 10;
 
 /// Sockets the network stack is sized for.
