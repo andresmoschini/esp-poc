@@ -38,6 +38,10 @@
 //! is current". `src/clock.rs` already holds a real time from SNTP, so enabling the hook and
 //! supplying it is the fix; it is a build-environment change rather than a code change, which is why
 //! it is its own piece of work.
+//!
+//! TODO: read the peer certificate's validity dates from the session and compare them against
+//! `clock::time()` once SNTP has answered. That closes the expiry hole while keeping the
+//! shipped static libraries, unlike `hook-wall-clock`.
 
 use core::ffi::CStr;
 
