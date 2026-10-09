@@ -71,6 +71,20 @@ jobs:
       - name: Enable caching
         uses: Swatinem/rust-cache@v2.9.2
 
+      # Not a step of the gate, and deliberately so: a gate the CI workflow and a person can
+      # disagree about is two definitions of green. This is the one thing a checkout does not have.
+      #
+      # `.cargo/config.toml` includes `local.toml`, and Cargo requires an included file to exist —
+      # `failed to read configuration file ... No such file or directory`. It is gitignored on
+      # purpose, because it is where the Wi-Fi credentials go, so CI has none.
+      #
+      # Measured, and this is why the gate ran red here for a while the job reported green: with the
+      # include added and `tools/gate.mjs` discarding its exit code, every `cargo` step failed with
+      # that message and `npm run check` still exited 0. An empty file is the whole fix — the gate
+      # builds with no credentials, which is what `option_env!` in `src/wifi.rs` is for.
+      - name: Provide the untracked cargo config the build expects
+        run: touch .cargo/local.toml
+
       - name: Install the Node tooling
         run: npm run setup
 

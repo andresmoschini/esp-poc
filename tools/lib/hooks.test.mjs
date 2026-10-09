@@ -287,6 +287,12 @@ test("the fixer changes the mode without staging the file's contents", async () 
 
 // The repair is sticky, so it is a fix rather than something to remember on the next commit: a later
 // `git add` of the same path keeps the bit the fixer set.
+//
+// This is the test that caught the repair being half of itself. `--cacheinfo` on its own holds on
+// Windows, which has no executable bit to read back, and does not hold on Linux, where `git add`
+// takes the mode from the file again — measured in WSL: `--cacheinfo` to `100755`, then `git add`,
+// gives `100644`. So the fixer marks the file executable as well as writing the index, and this
+// asserts the outcome rather than either half of how it gets there.
 test("the bit the fixer sets survives a later add", async () => {
   const root = repositoryWith(".claude/git-hooks/pre-commit", RUNNABLE);
 

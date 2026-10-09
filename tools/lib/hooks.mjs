@@ -35,15 +35,13 @@
 // the rule is now the real one, which is that a fixer repairs what Git would refuse at the commit —
 // and refusing a hook Git will not run is refusing the commit, not the file.
 //
-// **The repair is `--cacheinfo`, not `--chmod=+x`, and the difference is the whole reason.** Both set
-// the bit and both are sticky across a later `git add`, but `--chmod=+x <path>` re-reads the
-// working-tree copy and stages it: measured, on a hook staged at one revision and then edited in the
-// worktree, `git update-index --chmod=+x h/p` left `git status` reading `A  h/p` with the *edited*
-// bytes in the index. That is a fixer deciding what a commit contains, which is the one thing a
-// fixer must not do. `--cacheinfo <mode>,<object>,<path>` writes the entry the index already holds
-// with one field changed: the same object name, the same path, the mode from `100644` to `100755`, so
-// the edit stays unstaged — `AM h/p` before and after, measured. The object name comes from
-// `git ls-files --stage`, which is the entry being repaired, so nothing has to be guessed.
+// **The repair is `--cacheinfo`, not `--chmod=+x`, and it is not enough on its own.** Both set the
+// bit and both are sticky across a later `git add` — but only on Windows, which has no executable
+// bit to read back. Measured on Linux: `--chmod=+x <path>` re-reads the working-tree copy and stages
+// it, so a hook edited since it was staged would go into the commit unasked; and on either platform
+// `--cacheinfo` alone is undone by the next `git add`, because Git reads the mode back from the file.
+// So the fixer writes the index entry and marks the file executable, and the object name it writes
+// comes from the `git ls-files --stage` record the mode came from rather than from anywhere else.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -155,6 +153,25 @@ async function repair(root) {
         `gate: could not set the executable bit on ${hook.relative}.\n` +
           `    If the hook is not tracked, \`git add --chmod=+x ${hook.relative}\` tracks it and\n` +
           `    sets the bit together.`,
+      );
+    }
+
+    // The index is one half, and on a filesystem that has an executable bit the copy on disk is
+    // the other: `git add` reads the mode back from the file, so a repair to the index alone is one
+    // the next add undoes. Measured on Linux — `--cacheinfo` to `100755`, then `git add`, gives
+    // `100644` again — and not measurable on Windows, which has no such bit and therefore could not
+    // produce the failure. Both halves or the repair is not one.
+    //
+    // `chmod` is harmless on Windows, where it only toggles the read-only attribute and `0o755`
+    // has the write bits set.
+    try {
+      fs.chmodSync(path.join(root, hook.relative), 0o755);
+    } catch (error) {
+      throw new Error(
+        `gate: set the executable bit on ${hook.relative} in the index, but not on the file\n` +
+          `    itself: ${error.code ?? error.message}\n` +
+          `    Git reads the mode back from the file on the next \`git add\`, so this repair will\n` +
+          `    not hold until the file is executable too.`,
       );
     }
   }
