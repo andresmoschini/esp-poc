@@ -1,56 +1,45 @@
-// The tests for what this firmware sends to the events API, and for what an answer from it means.
+// The tests for what this firmware sends to the events API.
 //
 // They are here in `tests/` for the reason `tests/report.rs` opens with: this crate is `#![no_std]`,
 // and an integration test is a separate crate with the standard prelude, so `assert_eq!` and `String`
 // are available without the library giving up `no_std` for its own build.
 //
-// What is worth testing is the wire format and the reading of an answer. The body is JSON written by
-// hand, and a body that is wrong is wrong in a way nothing on the board can see: a missing brace is
-// a 400 from a server, an unescaped quote is a 400, and a timestamp in the wrong format is stored as
-// a string nobody can sort. The status line is the other direction — an answer off the network is
-// untrusted input, and "the first fifteen bytes were HTML" is the case a chip on a hotel network
-// actually hits.
+// What is worth testing is the body. The body is JSON written by hand, and a body that is wrong is
+// wrong in a way nothing on the board can see: a missing brace is a 400 from a server, and
+// a timestamp in the wrong format is stored as a string nobody can sort. What an answer means is
+// deliberately not tested: a status code is reported as the number it is, because a mapping from
+// numbers to sentences goes stale the day a status changes what it means.
+//
+// **The HTTP framing is not tested here because this crate no longer does any.** It used to: this
+// file held the request head, a `status_line_arrived` predicate, and a parser for the status line, and
+// the read-boundary bug that shipped — reading a reply once and judging whatever arrived — was caught
+// by a test right here. All of that is `edge-http`'s now, and `src/report.rs` builds a
+// `RequestHeaders`, writes it, and reads back a `ResponseHeaders` and a `Body`. What is logged there
+// is a status code and a body: a number, these bytes, or the fact that neither came.
 
 use std::fmt::Write as _;
 
 use poc_report::{
-    Address, EVENT_TELEMETRY, EVENTS_PATH, Event, LOGGED_LEN, Link, REPORT_EVERY_SECS, Reply,
-    Request, Status, Time, Timestamp, Verdict, logged, status_line_arrived,
+    Address, Clock, EVENT_TELEMETRY, Event, LOGGED_LEN, Obstruction, REPORT_EVERY_SECS, Refusal,
+    STALE_AFTER_SECS, Time, Timestamp, logged,
 };
 
 /// 2026-10-04T18:22:31Z, written as the arithmetic so the number is not produced by the code under
 /// test.
 const AT: u64 = 20_730 * 24 * 60 * 60 + 18 * 3_600 + 22 * 60 + 31;
 
-/// A real 401 from this API, captured on 2026-10-07 with the bytes the firmware sends.
+/// The body of a real 401 from this API, captured on 2026-10-07.
 ///
-/// The `Date`, `CF-RAY`, `Report-To` and `Nel` headers are trimmed, and everything else is byte for
-/// byte what came back — in particular the `Connection: close` and the 24-byte JSON body, both of
-/// which are what a real worker sends and neither of which a hand-written fixture would have thought
-/// of. It is 650 bytes against a 25-byte status line, which is the ratio that makes the read-boundary
-/// bug in [`Verdict::from_reply`] ordinary rather than exotic: one read of this reply is very likely
-/// not the whole of it.
-const REPLY_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
-Date: Wed, 07 Oct 2026 11:36:42 GMT\r\n\
-Content-Type: application/json\r\n\
-Content-Length: 24\r\n\
-Connection: close\r\n\
-WWW-Authenticate: Bearer realm=\"cfpoc\"\r\n\
-Server: cloudflare\r\n\
-\r\n\
-{\"error\":\"Unauthorized\"}";
+/// Taken out of the reply it arrived in: the head is [`edge-http`]'s to write and parse, so this
+/// file has no opinion about CRLF, about a status line arriving in pieces, or about where the blank
+/// line is. What is left is these bytes, the API's own wording rather than a fixture's.
+const BODY_401: &[u8] = br#"{"error":"Unauthorized"}"#;
 
-/// The status line of an event from a chip that has joined and has a time.
-fn status() -> Status {
-    Status {
-        time: Time::answered(AT, 2, 5),
-        link: Link::Joined,
-        address: Some(Address {
-            ip: "192.168.0.225".parse().unwrap(),
-            prefix_len: 24,
-        }),
-    }
-}
+/// The state line of an event from a chip that has joined and has a time, as `src/status.rs`
+/// renders it: the payload carries what the chip would have printed, and this crate stores it
+/// verbatim rather than rendering it.
+const PAYLOAD: &str =
+    "2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, wifi: joined";
 
 /// Renders a value the way the firmware's `Display2Format` does on the chip, and as `String` here.
 fn render(value: &impl std::fmt::Display) -> String {
@@ -67,7 +56,7 @@ fn body() -> String {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT,
         event_type: EVENT_TELEMETRY,
-        status: &status(),
+        payload: PAYLOAD,
     })
 }
 
@@ -80,7 +69,7 @@ fn body() -> String {
 fn an_event_is_the_json_the_api_asks_for() {
     assert_eq!(
         body(),
-        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
+        r#"{"device_id":"esp32c3-001122334455","timestamp":"2026-10-04T18:22:31Z","event_type":"telemetry","payload":"2026-10-04T18:22:31Z (from a stratum 2 server), 192.168.0.225/24, wifi: joined"}"#,
     );
 }
 
@@ -101,11 +90,11 @@ fn every_field_of_an_event_is_a_json_string() {
     assert!(body.starts_with('{') && body.ends_with('}'), "{body}");
 }
 
-/// The timestamp is what the API will read back as a date, so it has to be RFC 3339 and not the
-/// space-separated form the state line prints. The two renderings come out of the same number, and
-/// which one goes into the body is the decision this test pins.
+/// The timestamp is what the API will read back as a date, so it has to be RFC 3339 — the same
+/// rendering the state line's clock shares. The two come out of the same number, and which one goes
+/// into the body is the decision this test pins.
 #[test]
-fn the_timestamp_is_rfc_3339_and_not_the_state_line_s_form() {
+fn the_timestamp_is_rfc_3339() {
     assert_eq!(render(&Timestamp::at(AT)), "2026-10-04T18:22:31Z");
 
     // Both ends of the day, and the leap day itself: a timestamp that rolls over wrongly is a row
@@ -131,6 +120,11 @@ fn the_timestamp_handles_the_ends_of_a_leap_year() {
         "2028-02-29T12:00:00Z",
     );
 
+    // 2000-02-29T00:00:00Z and the day after it: a century divisible by 400 is a leap year, so
+    // February has 29 days rather than 28.
+    assert_eq!(render(&Timestamp::at(951_782_400)), "2000-02-29T00:00:00Z",);
+    assert_eq!(render(&Timestamp::at(951_868_800)), "2000-03-01T00:00:00Z",);
+
     // 2100-02-28T23:59:59Z, the last second before a century that is divisible by 100 and not by
     // 400 takes its leap day away. A calendar that divides by four here is wrong once every hundred
     // years, which is exactly the sort of thing that is right in every test somebody writes.
@@ -140,320 +134,225 @@ fn the_timestamp_handles_the_ends_of_a_leap_year() {
     );
 }
 
-/// A quote in any string field would end the JSON string early and turn the rest of the body into
-/// something the server either rejects or, worse, parses as a different document.
-///
-/// The status line is the field that could grow one without anybody deciding to: it is a sentence
-/// this crate writes, and a sentence about a radio is exactly the kind of thing that eventually
-/// quotes the firmware. A device id comes from outside in principle and an event type from a
-/// constant, so all three are exercised here.
+/// Every month of a year, which is the property that a month length is 30 or 31 and not 31 for all
+/// of them. One table rather than twelve tests, because the property is that the set is covered:
+/// the day either side of each boundary is the assertion, because a month length written into the
+/// arithmetic twice shows up as a date that is one day out.
 #[test]
-fn a_quote_in_a_field_is_escaped_rather_than_ending_the_string() {
-    let body = render(&Event {
-        device_id: r#"esp"32c3"#,
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
+fn every_month_has_the_length_it_has() {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-    // The quote is still in the body — as part of the device id — but escaped, so the document has
-    // one string where it had one before.
-    assert!(body.starts_with(r#"{"device_id":"esp\"32c3","#), "{body}");
-    // One escaped quote, and the four fields are still four strings: a quote that ended the string
-    // early would have swallowed the rest of the document into one field.
-    assert_eq!(body.matches(r#"\""#).count(), 1, "{body}");
-    // All four fields are still there, in order: a quote that ended the string early would have
-    // swallowed the rest of the document into the device id.
-    let mut rest = body.as_str();
+    // 2025-01-01T00:00:00Z, and 2025 is not a leap year, so February below is 28 days.
+    let mut first = 1_735_689_600;
 
-    for field in ["device_id", "timestamp", "event_type", "payload"] {
-        let found = rest
-            .find(field)
-            .unwrap_or_else(|| panic!("{field} is gone: {body}"));
+    for (index, length) in LENGTHS.iter().enumerate() {
+        let month = index as u64 + 1;
 
-        rest = &rest[found + field.len()..];
+        assert_eq!(
+            render(&Timestamp::at(first)),
+            format!("2025-{month:02}-01T00:00:00Z"),
+            "the first of month {month}",
+        );
+
+        // The last day of the month is the one the table names, and the first of the next month is
+        // the day after it — which is the whole claim being made here: the two are one day apart.
+        let last = first + (length - 1) * 86_400;
+
+        assert_eq!(
+            render(&Timestamp::at(last)),
+            format!("2025-{month:02}-{length:02}T00:00:00Z"),
+            "the last of month {month}",
+        );
+
+        first = last + 86_400;
     }
-}
 
-/// A backslash is the other half of the same rule: JSON spells `\"` as an escape, so a literal
-/// backslash has to become `\\` or the character after it is swallowed as part of an escape.
-#[test]
-fn a_backslash_in_a_field_is_escaped() {
-    let body = render(&Event {
-        device_id: r"domain\chip",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
-
-    assert!(
-        body.starts_with(r#"{"device_id":"domain\\chip","#),
-        "{body}"
+    assert_eq!(
+        render(&Timestamp::at(first)),
+        "2026-01-01T00:00:00Z",
+        "after December comes January"
     );
 }
 
-/// JSON forbids raw control characters in a string. The one that can appear here without anybody
-/// trying is a newline, and a status line is the sort of thing that grows one.
+/// A count of seconds no calendar has is not a time any server would send, but it is one the
+/// firmware can be handed — from a packet that passed every other check — and printing it has to
+/// produce a timestamp rather than an overflow panic. A panic here would be in the reporting task,
+/// and it would take the report down.
 #[test]
-fn a_control_character_in_a_field_is_escaped() {
-    let body = render(&Event {
-        device_id: "two\nlines",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    });
+fn an_impossible_epoch_renders_rather_than_overflowing() {
+    // The largest count there is, which in a debug build is where an unchecked addition would panic
+    // rather than wrap. The year is absurd; the point is that the arithmetic gets to the formatting.
+    let absurd = render(&Timestamp::at(u64::MAX));
 
-    assert!(body.starts_with(r#"{"device_id":"two\nlines","#), "{body}");
-    assert!(!body.contains('\n'), "{body}");
+    assert!(
+        absurd.starts_with("584"),
+        "the year is finite even though the date is absurd: {absurd}"
+    );
+    assert!(
+        absurd.contains('T') && absurd.contains('Z') && absurd.contains(':'),
+        "a timestamp rather than a panic: {absurd}"
+    );
 }
 
-/// Two events from the same chip differ in the timestamp and nothing else, and the payload is the
-/// state line rather than a second rendering of its three fields.
+/// Every sentence this crate can put in a body stays quotable without escaping: no `"`, no `\`,
+/// nothing below `U+0020`.
+///
+/// `Quoted` writes a `'"'` and the sentence and another `'"'`, so a sentence that grew one of
+/// those would end the JSON string early and turn the rest of the body into something the server
+/// either rejects or, worse, parses as a different document. This is the one test that keeps that
+/// from happening: a wording that needs quoting fails here rather than in somebody's database.
+///
+/// One table rather than one test per sentence, because the property is that the set is covered: a
+/// sentence added to the firmware without staying inside the alphabet fails to compile, which is
+/// the point. The id and the event type are not here — a hex string and a constant, quotable by
+/// construction at the call site — and neither is the timestamp, which is digits and fixed
+/// punctuation. The state line itself is not here either: it is assembled in `src/status.rs` now,
+/// next to the radio it reports on, and a test on it needs a board. If the payload ever grows a
+/// field from outside (an SSID, a driver's words), this test is where it lands, or the escaping
+/// comes back.
 #[test]
-fn the_payload_is_the_state_line() {
+fn every_sentence_in_a_body_stays_quotable() {
+    let mut sentences = vec![
+        render(&Address {
+            ip: "192.168.0.225".parse().unwrap(),
+            prefix_len: 24,
+        }),
+        render(&Address {
+            ip: "10.0.0.7".parse().unwrap(),
+            prefix_len: 0,
+        }),
+        render(&Clock::since_boot(0)),
+        render(&Clock::since_boot(u64::MAX)),
+        render(&Clock::utc(0)),
+        render(&Clock::utc(AT)),
+        render(&Clock::utc(u64::MAX)),
+        render(&Timestamp::at(0)),
+        render(&Timestamp::at(AT)),
+        render(&Timestamp::at(u64::MAX)),
+        render(&Time::since_boot(63)),
+        render(&Time::since_boot_after(63, Obstruction::AnswerTimedOut)),
+        render(&Time::since_boot_after(
+            63,
+            Obstruction::Refused(Refusal::KissOfDeath),
+        )),
+        render(&Time::answered(AT, 2, 5)),
+        render(&Time::answered(AT, 3, STALE_AFTER_SECS + 5 * 60)),
+    ];
+
+    let refusals = [
+        Refusal::Short,
+        Refusal::NotAReply,
+        Refusal::Version,
+        Refusal::KissOfDeath,
+        Refusal::NotAServer,
+        Refusal::Unsynchronized,
+        Refusal::NotOurs,
+        Refusal::NoTime,
+        Refusal::BeforeTheEpoch,
+    ];
+
+    let obstructions = [
+        Obstruction::LookupTimedOut,
+        Obstruction::RequestTimedOut,
+        Obstruction::AnswerTimedOut,
+        Obstruction::NoServer,
+        Obstruction::Stranger,
+        Obstruction::WouldNotSend,
+        Obstruction::TooLong,
+    ];
+
+    sentences.extend(refusals.iter().map(render));
+    sentences.extend(obstructions.iter().map(render));
+    sentences.extend(
+        refusals
+            .iter()
+            .map(|refusal| render(&Obstruction::Refused(*refusal))),
+    );
+
+    for sentence in &sentences {
+        assert!(
+            !sentence.chars().any(|c| c == '"' || c == '\\' || c < ' '),
+            "a sentence that would end its JSON string: {sentence:?}",
+        );
+    }
+}
+
+/// Two events from the same chip differ in the timestamp and nothing else, and the payload is
+/// stored verbatim: the state line is rendered in the firmware and this crate keeps what it was
+/// given rather than rendering it a second time.
+#[test]
+fn the_payload_is_stored_verbatim() {
     let earlier = render(&Event {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT - 300,
         event_type: EVENT_TELEMETRY,
-        status: &status(),
+        payload: PAYLOAD,
     });
     let later = body();
 
-    fn payload(body: &str) -> &str {
-        body.split(r#""payload":""#)
-            .nth(1)
-            .expect("a body with a payload")
-            .split('"')
-            .next()
-            .expect("a payload with an end")
-    }
-
-    assert_eq!(payload(&earlier), payload(&later));
-    assert_eq!(
-        payload(&later),
-        "2026-10-04 18:22:31 UTC (from a stratum 2 server), 192.168.0.225/24, wifi: joined"
-    );
     assert_ne!(
         earlier, later,
         "two events five minutes apart are the same body"
     );
-}
 
-/// The head is the part a server refuses a request over rather than stores wrongly, and CRLF is the
-/// detail: a request whose lines end in a bare `\n` is a request some servers will not answer at
-/// all, which on a board looks exactly like the API being down.
-#[test]
-fn the_head_is_an_http_1_1_post_with_crlf_lines() {
-    let head = render(&Request {
-        host: "cfpoc.example.workers.dev",
-        path: EVENTS_PATH,
-        content_length: 42,
-    });
-
-    assert_eq!(
-        head,
-        concat!(
-            "POST /events HTTP/1.1\r\n",
-            "Host: cfpoc.example.workers.dev\r\n",
-            "Content-Type: application/json\r\n",
-            "Content-Length: 42\r\n",
-            "Connection: close\r\n",
-            "\r\n",
-        ),
-    );
-}
-
-/// `Content-Length` is the number the caller measured, and the body is written into a buffer before
-/// the head is built because the head cannot be written without it. This is the pairing of the two
-/// that matters: a length that does not match the body is a request a server waits on until it gives
-/// up, which is a hang rather than an error.
-#[test]
-fn the_content_length_is_the_length_the_caller_measured() {
-    let event = Event {
-        device_id: "esp32c3-001122334455",
-        timestamp_secs: AT,
-        event_type: EVENT_TELEMETRY,
-        status: &status(),
-    };
-
-    let body = render(&event);
-
-    let head = render(&Request {
-        host: "cfpoc.example.workers.dev",
-        path: EVENTS_PATH,
-        content_length: body.len(),
-    });
-
-    assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
-    assert!(
-        head.ends_with("\r\n\r\n"),
-        "the head ends where the body begins"
-    );
-}
-
-/// A reply arrives in as many reads as the network decides, and the status line is not guaranteed to
-/// be whole in the first one. Measured against this API, the real 401 below is 650 bytes and the
-/// status line is the first 25 of them, so a read that lands inside the line is ordinary rather than
-/// exotic.
-///
-/// This is the bug this file exists to stop repeating. The firmware read the reply exactly once and
-/// judged whatever arrived, so a read landing inside the line reported "what answered was not the
-/// API" — for a reply the API had already sent, in full, correctly. Both halves are pinned here: the
-/// reader must be able to say when the line is whole, and once it says so every prefix must give the
-/// same answer.
-#[test]
-fn a_reply_read_one_byte_at_a_time_is_still_a_reply() {
-    let line_end = REPLY_401
-        .windows(2)
-        .position(|pair| pair == b"\r\n")
-        .expect("a status line");
-
-    for read in 1..=line_end {
-        let arrived = &REPLY_401[..read];
-
-        // Before the CRLF arrives the reader must know it has to read more, and must not have an
-        // opinion about what it has.
+    for body in [&earlier, &later] {
         assert!(
-            !status_line_arrived(arrived),
-            "{read} bytes of a reply were taken for a whole first line: {}",
-            String::from_utf8_lossy(arrived),
-        );
-    }
-
-    // The CRLF itself, which is the byte that ends the line: one byte earlier than this the line is
-    // not whole and one byte later it is.
-    assert!(!status_line_arrived(&REPLY_401[..line_end + 1]));
-    assert!(status_line_arrived(&REPLY_401[..line_end + 2]));
-
-    // From the moment the line is whole, every byte that can be in the buffer after it gives the same
-    // answer, including the CRLF, the headers, and the body.
-    for read in (line_end + 2)..=REPLY_401.len() {
-        assert_eq!(
-            Reply::from_bytes(&REPLY_401[..read]).verdict(),
-            Verdict::Unauthorized,
-            "{read} bytes of a valid reply read as something else: {}",
-            String::from_utf8_lossy(&REPLY_401[..read]),
+            body.contains(&format!("\"payload\":\"{PAYLOAD}\"")),
+            "the payload did not survive verbatim: {body}"
         );
     }
 }
 
-/// The point of the loop above, stated on its own: a first line that has half arrived and a first line
-/// that is wrong look identical in the bytes, and the firmware has to be able to tell them apart
-/// rather than guess. This is the exact prefix that made the guess, and what it is made of.
+/// The body is the API's own words, and on a 400 it is the only thing that says *which* field was
+/// wrong. This is the body of the real 401 captured on 2026-10-07, so it is the API's wording rather
+/// than a fixture's — and it is logged as-is, because a mapping from numbers to sentences would go
+/// stale the day a status changes what it means.
 #[test]
-fn a_half_arrived_status_line_is_not_the_same_as_a_wrong_one() {
-    let half = &REPLY_401[..11];
-
-    assert_eq!(half, b"HTTP/1.1 40");
-    assert!(
-        !status_line_arrived(half),
-        "a truncated line was taken for a whole one",
-    );
-    assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 2011 Created\r\n\r\n").verdict(),
-        Verdict::NotTheApi,
-        "a whole line that is not a status line is still a whole line",
-    );
+fn the_body_is_the_apis_own_words() {
+    assert_eq!(render(&logged(BODY_401)), r#"{"error":"Unauthorized"}"#);
 }
 
-/// Nothing at all is its own answer, and it is not the same thing as a portal's login page: one means
-/// nothing answered and the other means something that is not the API answered. They want different
-/// fixes, so they do not share a sentence.
+/// A reply with no body logs as saying so, rather than as an empty line. By the time this crate is
+/// handed one, `edge-http` has already said where the body ended, so there is nothing here to guess
+/// at: an empty slice is a body of no bytes.
 #[test]
-fn no_bytes_at_all_is_not_the_same_as_something_that_is_not_the_api() {
-    assert_eq!(Reply::from_bytes(b"").verdict(), Verdict::NothingCameBack);
-    assert_eq!(
-        render(&Verdict::NothingCameBack),
-        "nothing came back: the connection closed silently",
-    );
-
-    assert_eq!(
-        Reply::from_bytes(b"<!DOCTYPE html><html>...").verdict(),
-        Verdict::NotTheApi,
-    );
-}
-
-/// The status code is the one thing in a reply that is not this firmware's opinion, so it has to be
-/// readable for every status and not only for the ones this crate happens to have a name for. That
-/// was the actual gap: a verdict on its own throws 401 away and keeps 503, which is backwards.
-#[test]
-fn the_status_code_is_readable_for_every_status() {
-    for status in [200u16, 201, 204, 400, 401, 403, 404, 405, 429, 500, 503] {
-        let reply = format!("HTTP/1.1 {status} Something\r\nContent-Length: 0\r\n\r\n");
-
-        assert_eq!(
-            Reply::from_bytes(reply.as_bytes()).status(),
-            Some(status),
-            "{status}",
-        );
-    }
-}
-
-/// A reply that is not HTTP has no status, and inventing one would be a guess: a zero in a log reads
-/// as a status the API sent, and there is no such status. `None` is the truth and the caller says so.
-#[test]
-fn a_reply_that_is_not_http_has_no_status_code() {
-    for reply in [
-        &b""[..],
-        b"<!DOCTYPE html>\r\n\r\n",
-        b"HTTP/1.1 20x Created\r\n\r\n",
-        b"{\"ok\":true}",
-    ] {
-        assert_eq!(Reply::from_bytes(reply).status(), None, "{reply:?}");
-    }
-}
-
-/// The body is what follows the first blank line, and it is the only thing a 400 says about which
-/// field was wrong. This is the API's own, from [`REPLY_401`].
-#[test]
-fn the_body_is_what_follows_the_headers() {
-    let reply = Reply::from_bytes(REPLY_401);
-
-    assert_eq!(reply.body(), br#"{"error":"Unauthorized"}"#);
-    assert_eq!(render(&logged(reply.body())), r#"{"error":"Unauthorized"}"#);
-}
-
-/// A reply with no blank line has no body yet, which is not the same as a reply with an empty one.
-/// Both log as "(no body)" here, and the reason is in [`logged`]: the body is the only thing the
-/// status line does not already say, so a guess about framing would be a guess about the only part
-/// that is not already known.
-#[test]
-fn a_reply_with_no_blank_line_has_no_body() {
-    // The status line and nothing else, which is what the reader has the moment the line arrives.
-    let line_end = REPLY_401
-        .windows(2)
-        .position(|pair| pair == b"\r\n")
-        .expect("a status line")
-        + 2;
-    let just_the_line = &REPLY_401[..line_end];
-
-    assert!(status_line_arrived(just_the_line));
-    assert_eq!(Reply::from_bytes(just_the_line).body(), b"");
-
-    // An explicitly empty body, which is what a 204 or a 304 carries.
-    let empty = b"HTTP/1.1 204 No Content\r\n\r\n";
-    assert_eq!(Reply::from_bytes(empty).body(), b"");
-
+fn a_reply_with_no_body_logs_as_saying_so() {
     assert_eq!(render(&logged(b"")), "(no body)");
 }
 
-/// A body is untrusted bytes and it goes into a serial log, so anything unprintable is replaced
-/// rather than written through: a NUL or an escape sequence in a reply would garble the terminal of
-/// whoever is reading, which destroys the output the line exists to produce.
+/// A body that is not text is counted rather than rendered: the bytes cannot go into a serial log
+/// as they are, and there is no lossy conversion worth having for a line a person reads once.
+///
+/// The body below mixes printable text with a NUL, a bell, an escape sequence and two bytes no
+/// UTF-8 text holds. What the log gets is the count and nothing else, so no byte in it can garble
+/// the terminal of whoever is reading.
 #[test]
-fn a_body_that_is_not_text_cannot_break_the_log() {
+fn a_body_that_is_not_text_is_counted_rather_than_rendered() {
     let body = b"{\"n\":0}\x00\x07\x1b[31m\xff\xfe end";
 
-    let line = render(&logged(body));
+    assert_eq!(render(&logged(body)), "(20 non-utf8 bytes)");
+}
 
-    // The escape is replaced and the `[31m` after it is not: what follows an escape sequence is
-    // ordinary printable text once the escape that introduced it is gone, and there is nothing left
-    // for a terminal to interpret. What matters is that the `0x1b` itself did not reach the log.
-    assert_eq!(line, "{\"n\":0}···[31m·· end");
-    assert!(
-        !line.chars().any(|character| character.is_control()),
-        "a control character reached the log: {line:?}",
-    );
+/// Every byte value is safe to hand over, because nothing is rendered before the UTF-8 check: a
+/// body from the wire has no type, so there is no value a caller could have promised anything
+/// about. All 256 of them together are not UTF-8, so the sweep's own tail is not in the output.
+#[test]
+fn every_byte_value_can_be_logged() {
+    let all: Vec<u8> = (0..=255).collect();
+
+    assert_eq!(render(&logged(&all)), "(256 non-utf8 bytes)");
+}
+
+/// A body cut mid-character is cut at the character before it rather than in the middle of its
+/// bytes: 119 `a` followed by a two-byte `é` is 121 bytes, so the bound of 120 falls inside the
+/// second byte of the `é` and the line holds the 119 `a` plus the mark — never half a character.
+#[test]
+fn a_body_cut_inside_a_character_is_cut_before_it() {
+    let body = "a".repeat(119) + "é";
+
+    let line = render(&logged(body.as_bytes()));
+
+    assert_eq!(line, format!("{}…", "a".repeat(119)));
 }
 
 /// The body is cut at a bound and marked when it is, so that a truncated body cannot read as a
@@ -475,23 +374,13 @@ fn a_body_longer_than_the_bound_is_cut_and_says_so() {
     assert_eq!(render(&logged(&exact)), "x".repeat(LOGGED_LEN));
 }
 
-/// Every byte value survives `logged` without becoming a control character or a panic. This is the
-/// property that makes it safe to hand it anything off the network, and a sweep is the only way to
-/// check all 256 of them — a body from the wire has no type, so there is no value a caller could have
-/// promised anything about.
+/// Control characters in an otherwise printable body are blanked rather than written through: a
+/// newline would split the log line it is printed on, and an escape would reach the reader's
+/// terminal. Bodies from this API are JSON without either, so this is a guard rather than
+/// a rendering.
 #[test]
-fn every_byte_value_can_be_logged() {
-    let all: Vec<u8> = (0..=255).collect();
-
-    let line = render(&logged(&all));
-
-    assert!(
-        !line.chars().any(|character| character.is_control()),
-        "a control character reached the log: {line:?}",
-    );
-    // Cut at the bound, so the sweep's own tail is not in the output; every byte that was written
-    // came out as one character and none of them was a control character.
-    assert_eq!(line.chars().count(), LOGGED_LEN + 1, "the ellipsis");
+fn control_characters_in_a_body_are_blanked() {
+    assert_eq!(render(&logged(b"a\nb\tc\x1bd")), "a b c d");
 }
 
 /// Printable ASCII comes through as itself, which is the other half: replacing everything unprintable
@@ -510,159 +399,6 @@ fn printable_ascii_survives_logging() {
     );
 }
 
-/// The 201 the API answers a stored event with is the one that means the exchange worked, and it is
-/// the only answer that does.
-#[test]
-fn a_stored_event_is_recognized() {
-    assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 201 Created\r\n\r\n").verdict(),
-        Verdict::Stored,
-    );
-    assert_eq!(render(&Verdict::Stored), "the API stored the event");
-}
-
-/// The 401 this firmware gets today is the point of the exercise: the request went out, the API read
-/// it, and it was refused for want of credentials. That is three facts and the status line carries
-/// all three.
-#[test]
-fn a_refusal_for_want_of_credentials_is_recognized() {
-    assert_eq!(
-        Reply::from_bytes(b"HTTP/1.1 401 Unauthorized\r\n\r\n").verdict(),
-        Verdict::Unauthorized,
-    );
-    assert_eq!(
-        render(&Verdict::Unauthorized),
-        "the API refused the event: no credentials were sent with it",
-    );
-}
-
-/// A reply does not have to be only a status line: headers and a body follow it in the same buffer,
-/// and only the first line is read.
-#[test]
-fn a_status_line_is_read_out_of_whatever_follows_it() {
-    let whole = b"HTTP/1.1 201 Created\r\n\
-                  Content-Type: application/json\r\n\
-                  Content-Length: 11\r\n\
-                  \r\n\
-                  {\"ok\":true}";
-    assert_eq!(Reply::from_bytes(whole).verdict(), Verdict::Stored);
-}
-
-/// Something that is not a status line is the captive-portal case: on a network with a login page,
-/// the first fifteen bytes of the answer are a `<!DOCTYPE`. These are all whole replies — every one of
-/// them has bytes and none of them has a status line in them — and they must not be confused with a
-/// reply that has not finished arriving, which is [`Verdict`]'s problem and not this one's.
-#[test]
-fn something_that_is_not_a_status_line_is_reported_as_such() {
-    let not_status_lines: [&[u8]; 6] = [
-        b"<!DOCTYPE html>\r\n\r\n<html>",
-        b"HTTP/1.1\r\n\r\n",
-        b"HTTP/1.1 20x Created\r\n\r\n",
-        // Four digits, which is a length or a version rather than a status code.
-        b"HTTP/1.1 2011 Created\r\n\r\n",
-        b"{\"ok\":true}",
-        b"  HTTP/1.1 401 Unauthorized\r\n\r\n",
-    ];
-
-    for line in not_status_lines {
-        assert_eq!(
-            Reply::from_bytes(line).verdict(),
-            Verdict::NotTheApi,
-            "{line:?}",
-        );
-    }
-
-    assert_eq!(
-        render(&Verdict::NotTheApi),
-        "what answered was not the API: the first line was not a status line",
-    );
-}
-
-/// Every other status is named as a number rather than guessed at, because a status this firmware
-/// does not know is a status somebody has to go and read about.
-#[test]
-fn an_unnamed_status_is_reported_as_the_number_it_is() {
-    for status in [200u16, 204, 301, 404, 429, 500, 503] {
-        let reply = format!(
-            "HTTP/1.1 {status} Something
-
-"
-        );
-
-        assert_eq!(
-            Reply::from_bytes(reply.as_bytes()).verdict(),
-            Verdict::Unexpected(status),
-            "{status}",
-        );
-    }
-
-    assert_eq!(
-        render(&Verdict::Unexpected(503)),
-        "the API answered with a status this firmware does not name: 503",
-    );
-}
-
-/// Every verdict has a sentence, because the sentence is what ends up in the serial log, and a log
-/// line saying `Unauthorized` answers "what happened" and not "what now".
-#[test]
-fn every_verdict_says_something() {
-    let expected = [
-        (Verdict::Stored, "the API stored the event"),
-        (
-            Verdict::Unauthorized,
-            "the API refused the event: no credentials were sent with it",
-        ),
-        (
-            Verdict::Malformed,
-            "the API could not read the event: it rejected the body",
-        ),
-        (
-            Verdict::NotAllowed,
-            "the API would not take a POST on this path",
-        ),
-        (
-            Verdict::Unexpected(500),
-            "the API answered with a status this firmware does not name: 500",
-        ),
-        (
-            Verdict::NotTheApi,
-            "what answered was not the API: the first line was not a status line",
-        ),
-        (
-            Verdict::NothingCameBack,
-            "nothing came back: the connection closed silently",
-        ),
-    ];
-
-    for (verdict, words) in expected {
-        assert_eq!(render(&verdict), words, "sentence for {verdict:?}");
-    }
-}
-
-/// Two verdicts that read alike are two that will be confused, and the set here has one case per
-/// thing the API can do with this exchange: take it, refuse it for want of credentials, fail to
-/// parse it, refuse the method, say something else, answer with something that is not the API, or
-/// not answer at all.
-#[test]
-fn the_answers_are_distinguishable() {
-    let sentences = [
-        Verdict::Stored,
-        Verdict::Unauthorized,
-        Verdict::Malformed,
-        Verdict::NotAllowed,
-        Verdict::Unexpected(500),
-        Verdict::NotTheApi,
-        Verdict::NothingCameBack,
-    ]
-    .map(|verdict| render(&verdict));
-
-    let mut unique = sentences.to_vec();
-    unique.sort_unstable();
-    unique.dedup();
-
-    assert_eq!(unique.len(), sentences.len(), "two answers read the same");
-}
-
 /// Five minutes, and it is a constant here rather than a number in the task that waits so that the
 /// interval is one thing the tests can read and the firmware and this test cannot disagree about.
 #[test]
@@ -670,29 +406,23 @@ fn the_reporting_interval_is_five_minutes() {
     assert_eq!(REPORT_EVERY_SECS, 300);
 }
 
-/// The body is a little over two hundred bytes for a chip that has joined, and a long address plus a
-/// sentence about a failed join is the largest it gets. A buffer the firmware sizes has to hold the
+/// The body is a little over two hundred bytes for a chip that has joined, and a long state line
+/// with a failed join in it is the largest it gets. A buffer the firmware sizes has to hold the
 /// worst case rather than this one, and this is the measurement of the ordinary case that says how
 /// much headroom there is.
 #[test]
 fn a_body_is_small_enough_to_fit_a_buffer() {
     let joined = body().len();
 
+    // A clock counting from boot with a failure to explain, a long address, and a failed join with
+    // a signal in it — the longest shape a state line takes.
     let failing = render(&Event {
         device_id: "esp32c3-001122334455",
         timestamp_secs: AT,
         event_type: EVENT_TELEMETRY,
-        status: &Status {
-            time: Time::since_boot_after(3_600, poc_report::Obstruction::AnswerTimedOut),
-            link: Link::Failed(poc_report::JoinFailure {
-                reason: poc_report::Reason::HandshakeStalled,
-                signal: Some(-55),
-            }),
-            address: Some(Address {
-                ip: "192.168.100.200".parse().unwrap(),
-                prefix_len: 24,
-            }),
-        },
+        payload: "01:00:00 (counting from boot: the server's time is before 1970, so there is no \
+            epoch to count it from), 192.168.100.200/24, wifi: not joined: FourWayHandshakeTimeout \
+            (signal -55 dBm)",
     });
 
     assert!(joined < 256, "{joined} bytes");

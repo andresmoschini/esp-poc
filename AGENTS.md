@@ -171,9 +171,13 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   behind it, and on the C3 it is the hardware RNG that seeds the network stack — `esp-metadata`
   marks `RNG` as unstable for that chip and not for the other. Every new `unstable` API used is one
   more thing a future `esp-hal` may rename, so prefer the stable surface where one exists.
-- The statics in `src/clock.rs` and `src/wifi.rs` are one word wide deliberately rather than by
-  default. Each holds a value that another task reads, so it is published as a single atomic that a
-  reader can take whole; no RISC-V target here has an atomic wider than a word, so `AtomicU64` is
+- `src/wifi.rs` holds what the radio is doing and `src/clock.rs` the last failure behind one
+  `embassy-sync` lock each, taken as a brief critical section: on a chip with one core that is the
+  whole of the contention story at two reads a second, and what a lock holds is the value itself
+  rather than an encoding of it. The `RefCell` inside is what makes the write safe without an
+  `unsafe` — nothing locks again inside a lock closure and no interrupt handler touches either
+  static, so the borrow cannot fail. The clock's own numbers stay one-word atomics deliberately
+  rather than by default: no RISC-V target here has an atomic wider than a word, so `AtomicU64` is
   not a type this firmware can name on either chip. Widening one of them is a design change, not a
   simplification.
 - `esp-radio` is pinned to an exact pre-release (`=1.0.0-beta.1`) and needs `opt-level = 3` in both
@@ -196,6 +200,14 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   than trusting whatever is offered, and `certs/README.md` is what has to change. `.gitattributes`
   marks the `.der` binary and `.editorconfig-checker.json` excludes it, so the gate reads it as
   neither text nor prose.
+- **The TRNG entropy source stays off until the network is up.** `TrngSource::new` reprograms the
+  SAR ADC for entropy, and on the C6 that keeps the station from joining at all: narrowed to that
+  one call by flashing each side (`3a3706b` joins in seconds, `4cbbdfe` never does, and adding only
+  those two lines back reproduces it), always as `AuthenticationExpired` at a signal too strong for
+  range to explain. So `src/bin/main.rs` passes `RNG`/`ADC1` into the reporting task, and
+  `src/tls.rs`'s `boot` enables the source once DHCP is up — which implies the station joined. Plain
+  `Rng` is not a substitute: it is only `RngCore`, never `CryptoRng`, and without RF or ADC running
+  it is pseudo-random, so it cannot be what TLS draws its key material from.
 - `src/report.rs` sends **no `Authorization` header**, so the API answers `401` and the log says so
   on every pass — that line is the feature working, not a bug. It is now safe to add the token,
   which is the next piece of work: the exchange is HTTPS through `src/tls.rs` on port 443, so a
@@ -203,31 +215,50 @@ What the generator will _not_ overwrite, and which you should keep an eye on: ev
   variables rather than from source: `EVENTS_API_HOST` and `EVENTS_API_PORT`, whose defaults are the
   deployed Worker and port 443. `HOST` is printed only in the lines about a name that does not
   resolve.
-- **One socket per exchange, and this is load-bearing rather than tidy.** `smoltcp` answers
-  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of the
-  task means every exchange after the first is refused by the stack before a packet goes out.
-  Measured on the board: the first exchange succeeded and the second logged `InvalidState` five
-  minutes later. The socket is opened by the loop in `report` and dropped at the end of each pass;
-  the buffers are built once in `start` and passed in, because `make_static!` cannot hand the same
-  `StaticCell` slot out twice and a per-exchange buffer would panic on the second exchange. It hid
-  for a long time for two reasons worth remembering: the cleartext version half-closed the
-  connection itself before reading, which left the socket in a state the next `connect` tolerated,
-  and **nothing shorter than two intervals can show this class of bug at all** — one exchange has to
-  succeed before a second can fail.
+- **One connection per exchange, and it is `edge-nal`'s job rather than ours.** `smoltcp` answers
+  `connect` on a socket that is still open with `InvalidState`, so a socket held for the life of a
+  task means every exchange after the first is refused by the stack before a packet goes out —
+  measured on the board, the first exchange succeeded and the second logged `InvalidState` five
+  minutes later. `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a
+  pool on drop, so this is now the library's property; **do not reintroduce a socket that outlives
+  one exchange.** The factory in `src/tls.rs` is built once and parked in a static because a
+  `TlsSocket` borrows the factory that made it — that is the one constraint the abstraction adds,
+  and it costs two statics. It hid for a long time for two reasons worth remembering: the cleartext
+  version half-closed the connection itself before reading, which left the socket in a state the
+  next `connect` tolerated, and **nothing shorter than two intervals can show this class of bug at
+  all** — one exchange has to succeed before a second can fail.
+- **The exchange runs through `edge-http`'s `Connection`, connect included.** Its
+  `io::client::Connection` state machine calls `connect` itself — TCP and the TLS handshake with it
+  — so there is no `tls::open` any more: the handshake's twenty-second budget lives on the
+  `initiate_request` in `src/report.rs`, and the `the API's certificate verified: …` line is read
+  back off the connection right after it, which is still the only evidence in this repository that
+  the certificate was checked rather than merely received. What that costs is one lost distinction:
+  a refused connection, a failed handshake and a head that did not go out are one call now, and one
+  line when it fails. Two things about the pieces are not negotiable: the answer head is parsed into
+  `Headers`, whose `set` **panics** with `No space left` rather than returning an error, so
+  `HEADERS` in `src/report.rs` is a promise the compiler does not check (it is 16 for the 10 the
+  Worker answers with), and the `Content-Length` tuple borrows from a `heapless::String<20>` that
+  must outlive the headers borrowing from it.
 - **Nothing is closed before the reply is read.** The head says `Connection: close`, so the _server_
   closes when it has answered. Shutting the write half first — TLS `close_notify` then the TCP FIN,
   as the cleartext version did — measured as `IO("ConnectionReset")` before a single byte came back,
-  so `once` reads first and closes afterwards. Close on **both** paths: `MbedTLS` warns on a session
+  so `once` reads first and closes afterwards. Close on **every** path: `MbedTLS` warns on a session
   dropped while still open, and a warning on every failed exchange would be a warning about the
-  reporting rather than about the failure.
-- **A reply is not a read.** `stream.read` returns whatever has arrived, which is not the same thing
-  as a whole HTTP reply: the 401 this API sends is 650 bytes against a 25-byte status line, and
-  nothing in TCP promises where the boundary falls. So `read_reply` loops and asks
-  `poc_report::status_line_arrived` before it judges anything. **Reading once and parsing that was
-  the bug that produced "what answered was not the API" against a working API** — the read had
-  landed inside the status line, and the first eleven bytes of a valid `401` (`HTTP/1.1 40`) parse
-  as no status at all. `tests/report_api.rs` pins it against a captured real reply, one byte at a
-  time. Anything that parses a reply needs the same question asked first.
+  reporting rather than about the failure. The split borrow of the answer is over before `close`
+  takes the connection back.
+- **A reply is not a read, and that is now `edge-http`'s problem rather than ours.** `stream.read`
+  returns whatever has arrived, which is not the same thing as a whole HTTP reply: the 401 this API
+  sends is 650 bytes against a 25-byte status line, and nothing in TCP promises where the boundary
+  falls. **Reading once and parsing that was the bug that produced "what answered was not the API"
+  against a working API** — the read had landed inside the status line, and the first eleven bytes
+  of a valid `401` (`HTTP/1.1 40`) parse as no status at all. This firmware used to own the loop and
+  the predicate, and `tests/report_api.rs` pinned it against a captured real reply one byte at a
+  time; both are gone. `Connection` reads the head with `exact = true`, one byte at a time looking
+  for `\r\n\r\n` — over TLS each of those is a session read rather than a packet, and a few hundred
+  of them is what a head costs. What matters is that it keeps reading until the head is whole, which
+  is what makes a reply that arrives in pieces a reply. **Reinstating a hand-written read loop over
+  a raw `read` would reintroduce the bug**, and the test that caught it went with the code it was
+  testing, so nothing here would notice.
 - `.cargo/config.toml` contains the generated target, runner, build flags, and `[env]` defaults.
   Espressif crates expose additional configuration through environment variables; use `esp-config`
   to inspect/set those options. The linked "Additional configuration" sections for the enabled
@@ -296,14 +327,17 @@ part of the reasoning; read them before changing what reads what.
   to hardware, and it lives in `crates/poc-report` so that the gate's `test-firmware` step can run
   it on the host: no dependencies, `#![no_std]`, buildable for both targets. **Put logic there when
   it is worth testing, and expect it not to be there** — logic that needs the radio stays in
-  `src/wifi.rs` untested, logic that needs a socket or a clock stays in `src/ntp.rs` untested, logic
-  that needs a TCP connection stays in `src/report.rs` untested, and logic that needs a certificate
-  to be trusted stays in `src/tls.rs` untested, because moving any of them would mean moving the
-  hardware it is about. What has moved out is what none of them needs: the calendar arithmetic, the
-  SNTP header, the whole of the state line — its wording, its order, and the encoding each state is
-  published in for another task to read — and the whole of what goes on the wire when that line is
-  reported: the JSON body and its escaping, the timestamp's format, the request head, and the
-  reading of a status line.
+  `src/wifi.rs` untested, the state line stays in `src/status.rs` untested, logic that needs a
+  socket or a clock stays in `src/ntp.rs` untested, logic that needs a TCP connection stays in
+  `src/report.rs` untested, and logic that needs a certificate to be trusted stays in `src/tls.rs`
+  untested, because moving any of them would mean moving the hardware it is about. What has moved
+  out is what none of them needs: the calendar arithmetic, the SNTP header, and the whole of what
+  goes on the wire when that line is reported: the JSON body and the alphabet its sentences stay
+  inside, and the timestamp's format. What an answer means is not here: a status code is reported as
+  the number it is. **The HTTP framing is the exception and went the other way:** the request head,
+  the read-until-whole loop, and the status-line parser were here once, are `edge-http`'s now, and
+  took about a dozen tests with them. So this bullet is no longer "everything on the wire is here"
+  and should not be read that way: what is here is what the _API_ means, not how HTTP is spelled.
 - **`test-firmware` runs Cargo from outside the repository, and that is not incidental.**
   `.cargo/config.toml` sets `[build] target` and `build-std`, both of which are right for the
   firmware and fatal for a host test, and Cargo merges configuration arrays rather than replacing

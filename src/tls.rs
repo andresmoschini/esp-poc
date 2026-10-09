@@ -1,11 +1,29 @@
-//! The TLS under one HTTPS exchange: the trust anchor the API's certificate is checked against, the
-//! entropy `MbedTLS` is fed from, and the handshake that turns a socket into a verified stream.
+//! One HTTPS connection to the API: the trust anchor it is verified against, and the factory every
+//! connection is made through.
 //!
-//! This is the layer between a TCP connection and an HTTP request, so it is a separate file from
-//! [`crate::report`]: that one decides *what* to say to the API every five minutes, and this one says
-//! whether the thing answering is the API. Only one [`Tls`] may exist at a time, which is why
-//! [`instance`] is called once from [`crate::report::start`] rather than per exchange — the `Tls`
-//! itself is then carried by the reporting task and handed out as a [`TlsReference`].
+//! ## Why this goes through `edge-nal`
+//!
+//! The first version of this file talked to `embassy-net` directly: a `TcpSocket` owned by the
+//! reporting task, `connect` called on it, and a TLS session over it. That is not much code, but two
+//! of its properties were wrong and one of them was a bug this repository shipped and then found:
+//!
+//! - **A socket is not reusable.** `smoltcp` answers `connect` on an open socket with
+//!   `InvalidState`, so a socket has to be built per connection and dropped after. The task was
+//!   holding one, which meant every report after the first failed before a packet went out. The
+//!   buffers then had to be built separately and threaded through the reporter to make that work.
+//! - **TLS over it is a second API.** The session borrows the socket, borrows a NUL-terminated server
+//!   name, and borrows a `&'static mut` to the RNG, and every one of those lifetimes had to be
+//!   spelled out at every use.
+//!
+//! `edge-nal-embassy` builds the socket per `connect` and returns its buffers to a pool when the
+//! connection is dropped, which makes both of the first two facts the library's problem rather than
+//! this file's. `edge-nal-tls` layers the TLS session on top of a factory rather than on a borrowed
+//! socket, and `edge-http`'s `Connection` drives the connect itself. What is left here is the part
+//! none of them knows about: which root the API's certificate has to chain to.
+//!
+//! `mbedtls-rs` is still a direct dependency, and deliberately so. It is what puts the bytes on the
+//! wire, `edge-nal-tls` re-exports it, and the trust anchor is built from its types — but nothing
+//! here names `embassy_net::tcp` any more.
 //!
 //! ## What is verified, and what is not
 //!
@@ -15,19 +33,24 @@
 //! built: `MBEDTLS_HAVE_TIME_DATE` is compiled out unless `mbedtls-rs`'s `hook-wall-clock` feature is
 //! on, and turning it on changes the C library's configuration, which makes `mbedtls-rs-sys`
 //! discard the static libraries it ships and compile `MbedTLS` from C source instead — needing
-//! `CMake`, Clang and a RISC-V cross-compiler, none of which this project otherwise requires. So the
+//! `CMake`, Clang and a RISC-V C cross-compiler, none of which this project otherwise requires. So the
 //! promise this firmware can keep is "this chain leads to ISRG", not "this chain leads to ISRG and
 //! is current". `src/clock.rs` already holds a real time from SNTP, so enabling the hook and
 //! supplying it is the fix; it is a build-environment change rather than a code change, which is why
 //! it is its own piece of work.
+//!
+//! TODO: read the peer certificate's validity dates from the session and compare them against
+//! `clock::time()` once SNTP has answered. That closes the expiry hole while keeping the
+//! shipped static libraries, unlike `hook-wall-clock`.
 
 use core::ffi::CStr;
 
-use defmt::{error, info};
-use embassy_net::tcp::TcpSocket;
-use embassy_time::{Duration, with_timeout};
-use esp_hal::rng::Trng;
-use mbedtls_rs::{Certificate, ClientSessionConfig, Session, SessionConfig, Tls, TlsReference};
+use edge_nal_embassy::{Tcp as EmbassyTcp, TcpBuffers};
+use edge_nal_tls::{TlsConnector, TlsSocket};
+use embassy_net::Stack;
+use esp_hal::peripherals::{ADC1, RNG};
+use esp_hal::rng::{Trng, TrngSource};
+use mbedtls_rs::{Certificate, ClientSessionConfig, Tls};
 
 /// The trust anchor: ISRG Root X1, in DER, in flash. See `certs/README.md` for where it came from,
 /// what it is a promise about, and how to replace it.
@@ -38,120 +61,133 @@ use mbedtls_rs::{Certificate, ClientSessionConfig, Session, SessionConfig, Tls, 
 /// `MbedTLS` can parse that way at all.
 const ROOT: &[u8] = include_bytes!("../certs/isrg-root-x1.der");
 
-/// How long the handshake may take before it is given up on.
+/// How many socket buffer pairs this reporter keeps.
 ///
-/// Its own budget rather than the reporter's per-step one because it is not the same kind of wait:
-/// every other step is a request going out or a reply coming back over an established connection,
-/// while this one is the API proving who it is, which on a 160 MHz RISC-V running `MbedTLS`' own
-/// arithmetic rather than the chip's accelerators is seconds rather than milliseconds. The handshake
-/// is also given a fresh [`Session`] each time, so it is renegotiated from scratch every five minutes
-/// and paid for in full every time.
-///
-/// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
-/// inside the reporter's own five-second budget, so this only bounds the failure where nothing comes
-/// back at all.
-const HANDSHAKE: Duration = Duration::from_secs(20);
+/// One, because there is one reporter that makes one connection at a time. This is the number
+/// `embassy-net`'s fixed socket set has to give back, and the pool is what gives it back: a connection
+/// that is dropped returns its pair here, so the next one can have it.
+const POOL: usize = 1;
 
-/// A TLS session over one socket, verified against the root in `certs/`.
+/// Receive buffer for the socket, in bytes.
 ///
-/// Two lifetimes rather than one because the socket's own lifetime is not the session's: the socket is
-/// borrowed for as long as the session, but it was created earlier and outlives the session by
-/// however long it takes to drop. A type alias rather than the session type spelled out at each use,
-/// because the lifetimes are the awkward part and four of them in [`crate::report`] is four places
-/// to get subtly wrong.
-pub type Stream<'a, 'socket> = Session<'a, &'a mut TcpSocket<'socket>>;
+/// Larger than any reply this API gives — the largest is a Cloudflare error page of a few hundred
+/// bytes. `smoltcp` drops a datagram that does not fit rather than truncating it, so a buffer sized
+/// to the status line alone would throw away every body there is.
+///
+/// It is also large enough for the largest record TLS will deliver in one piece. A TLS record is at
+/// most 16 KiB by `MbedTLS`' default, and the socket hands the session whatever `mbedtls_ssl_read`
+/// returns, which is one record's worth of plaintext — so a peer whose first record is larger than
+/// this would have it split across reads rather than truncated. Measured on the deployed Worker: one
+/// 634-byte reply, arriving in one read.
+///
+/// Public because [`crate::report`] sizes the scratch of its `Connection` from it: the head is parsed
+/// out of that scratch, and a scratch smaller than the socket's would stop the read early.
+pub const RX_LEN: usize = 1024;
+
+/// Transmit buffer for the socket, in bytes, which has to hold the head and the body.
+const TX_LEN: usize = 512;
+
+/// The connection the reporter writes its request through, once the handshake is done.
+///
+/// A type alias rather than the type spelled out: the type is the awkward part.
+pub type Stream<'a> = TlsSocket<'a, edge_nal_embassy::TcpSocket<'a>>;
 
 /// The one `MbedTLS` instance this firmware has, holding the entropy source it draws from.
 ///
-/// `Trng` is moved in rather than borrowed because `MbedTLS` wants a `&'static mut` to a
-/// `CryptoRng`: there is exactly one of these for the life of the program, so the chip's hardware
-/// RNG is parked in a static here and never moved again. The alternative — the safe constructor that
-/// takes a shorter borrow — is `unsafe` precisely because the pointer outlives the borrow, which is
-/// not a trade this firmware needs to make.
+/// `Trng` is moved in rather than borrowed because `MbedTLS` wants a `&'static mut` to a `CryptoRng`:
+/// there is exactly one of these for the life of the program, so the chip's hardware RNG is parked
+/// in a static here and never moved again. The alternative — the safe constructor that takes a
+/// shorter borrow — is `unsafe` precisely because the pointer outlives the borrow, which is not a
+/// trade this firmware needs to make.
+///
+/// It is returned as a `&'static` rather than as a value because [`connector`] borrows it and the
+/// factory has to outlive every exchange.
 ///
 /// # Panics
 ///
-/// If a `MbedTLS` instance already exists. [`crate::report::start`] calls this once, at boot, so this
-/// is a statement about the program rather than something that can happen later.
-pub fn instance(trng: Trng) -> Tls<'static> {
+/// If a `MbedTLS` instance already exists. [`crate::report`] calls this once, after DHCP is up, so
+/// this is a statement about the program rather than something that can happen later.
+pub fn instance(trng: Trng) -> &'static Tls<'static> {
     let trng: &'static mut Trng = static_cell::make_static!(trng);
 
-    Tls::new(trng).expect("one MbedTLS instance, created once at boot")
+    static_cell::make_static!(Tls::new(trng).expect("one MbedTLS instance, created once at boot"))
 }
 
-/// Opens a TLS session over `socket` and negotiates it with the API named `name`.
+/// Enables the entropy source and builds the factory every exchange is made through.
 ///
-/// Nothing is left half-open on failure: a session that could not be created or could not complete a
-/// handshake is dropped, which drops the borrow of `socket` and so returns the caller a usable TCP
-/// connection rather than a TLS one that is stuck partway through a handshake.
+/// A plain function rather than a task, for the same reason `src/ntp.rs` builds its socket outside
+/// its task: `make_static!` inside a task body is a cycle the compiler cannot resolve, and a plain
+/// function has no such future.
 ///
-/// `name` is the host as a NUL-terminated string, which is the form `MbedTLS` wants for both SNI and
-/// the certificate's hostname check, and it must outlive the session because it is part of the
-/// configuration the session borrows. [`crate::report`] builds it once for the life of the program,
-/// from the same build-time value it resolves and prints.
+/// The source is enabled here — once an address is up — rather than at boot because enabling it is
+/// what keeps a C6 from joining at all: the source is the SAR ADC, and [`TrngSource::new`]
+/// reprograms it while the station has not even authenticated. Measured by bisecting the join
+/// failure to that one call: everything at or before `3a3706b` joins in seconds, `4cbbdfe` never
+/// does, and adding only those two lines back reproduces it. DHCP up implies the station joined, so
+/// from here on the radio is associated and the ADC is this exchange's to use.
 ///
-/// Returns `None` having already said why in the log, because every way this can fail is a
-/// different problem with a different fix: a certificate this firmware does not trust, a name the
-/// certificate does not carry, and a handshake that ran out of time are three of them.
-pub async fn open<'a, 'socket>(
-    tls: TlsReference<'a>,
-    socket: &'a mut TcpSocket<'socket>,
-    name: &'a CStr,
-) -> Option<Stream<'a, 'socket>> {
-    let root = match Certificate::new_no_copy(ROOT) {
-        Ok(root) => root,
-        Err(e) => {
-            error!("the API's root certificate did not parse: {:?}", e);
+/// The source is parked in a static rather than held because nothing outlives this call to keep it:
+/// dropping it would switch the SAR ADC back off underneath the [`Trng`] that [`instance`] keeps,
+/// and from there the key material would silently stop being key material.
+///
+/// # Panics
+///
+/// If the trust anchor in `certs/` does not parse — see [`connector`] — or if the entropy source
+/// was not enabled, which here means the two lines below stopped agreeing with each other.
+pub fn boot(
+    rng: RNG<'static>,
+    adc: ADC1<'static>,
+    stack: Stack<'static>,
+    name: &'static CStr,
+) -> &'static TlsConnector<'static, EmbassyTcp<'static>> {
+    let buffers = static_cell::make_static!(TcpBuffers::new());
+    let _source: &'static mut TrngSource = static_cell::make_static!(TrngSource::new(rng, adc));
+    let trng = Trng::try_new().expect("the entropy source above is enabled");
+    let tls = instance(trng);
 
-            return None;
-        }
-    };
+    connector(tls, buffers, stack, name)
+}
+
+/// The factory every connection is made through, built once and kept for the life of the program.
+///
+/// Building it once rather than per exchange is what lets a connection outlive this function: a
+/// `TlsSocket` borrows the factory that made it, so a factory on the stack would return a socket
+/// that could not leave. `TlsConnector::new` takes the configuration by reference and clones it,
+/// which is why a local here is enough and no self-reference is involved.
+///
+/// The handshake is driven by whoever writes through the socket first — in practice `edge-http`'s
+/// `Connection`, which also owns the connect — so the twenty-second budget for it and the line
+/// saying what it settled on live on the exchange in `src/report.rs` rather than here. What stays
+/// here is the part neither the factory nor the client knows about: which root the API's
+/// certificate has to chain to.
+///
+/// # Panics
+///
+/// If the trust anchor in `certs/` does not parse. Those bytes are a constant this repository ships,
+/// so a failure here is a defect in the repository rather than a condition on the network, and it
+/// is why this returns a value rather than an `Option`.
+pub fn connector(
+    tls: &'static Tls<'static>,
+    pool: &'static TcpBuffers<POOL, TX_LEN, RX_LEN>,
+    stack: Stack<'static>,
+    name: &'static CStr,
+) -> &'static TlsConnector<'static, EmbassyTcp<'static>> {
+    let root = Certificate::new_no_copy(ROOT)
+        .expect("the trust anchor in certs/ is a certificate this build shipped");
 
     // `ClientSessionConfig::new()` is the whole struct with the defaults, and the defaults are the
     // ones wanted here: `AuthMode::Required`, so a certificate that does not verify aborts the
     // handshake rather than being logged after the fact, and TLS 1.2 as the floor. Only the trust
     // anchor and the name are added.
-    let config = SessionConfig::Client(ClientSessionConfig {
+    let config = ClientSessionConfig {
         ca_chain: Some(root),
         server_name: Some(name),
         ..ClientSessionConfig::new()
-    });
-
-    let mut session = match Session::new(tls, &mut *socket, &config) {
-        Ok(session) => session,
-        Err(e) => {
-            error!("the TLS session could not be set up: {:?}", e);
-
-            return None;
-        }
     };
 
-    match with_timeout(HANDSHAKE, session.connect()).await {
-        Err(_) => {
-            error!(
-                "the API did not complete a TLS handshake in {} seconds",
-                HANDSHAKE.as_secs()
-            );
-
-            None
-        }
-        Ok(Err(e)) => {
-            error!("the API's TLS handshake failed: {:?}", e);
-
-            None
-        }
-        Ok(Ok(())) => {
-            // The version and the verification flags together are what says the API was checked and
-            // not merely reached: a zero flag is the only value that means the chain, the signature
-            // and the hostname all agreed, and the version says what was agreed about. Neither
-            // replaces the log line the refusal itself produces.
-            info!(
-                "the API's certificate verified: {:?}, flags {:#x}",
-                session.tls_version(),
-                session.tls_verification_details()
-            );
-
-            Some(session)
-        }
-    }
+    static_cell::make_static!(TlsConnector::new(
+        tls.reference(),
+        EmbassyTcp::new(stack, pool),
+        &config
+    ))
 }

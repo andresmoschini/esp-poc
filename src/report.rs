@@ -9,14 +9,30 @@
 //!
 //! ## What it sends, and what it expects back
 //!
-//! One event every [`REPORT_EVERY_SECS`], carrying the state line as its payload. The body, the
-//! timestamp's format, the request head and the reading of a status line are all in `poc-report`
-//! because those are decisions a host can check; this file is the part that needs a network.
+//! One event every [`REPORT_EVERY_SECS`], carrying the state line as its payload. The body and the
+//! timestamp's format are in `poc-report` because those are decisions a host can check; this file is
+//! the part that needs a network.
+//!
+//! **The HTTP framing is `edge-http`'s.** The connect, the request head, the reading of a reply,
+//! and the loop that keeps reading until one is whole are all [`edge_http`]: this file builds a
+//! [`Connection`], sends the head and the body through it, and
+//! reads back the answer. That is not an arbitrary line to draw. The framing is the part of an HTTP
+//! client that is fiddly in the detail nobody reads — `Content-Length` versus a header the library
+//! guesses, CRLF, a reply that arrives in as many reads as the network decides — and this firmware
+//! shipped the resulting bug: it read the reply once and judged whatever arrived, so a read landing
+//! inside the 25-byte status line of a 650-byte reply reported "what answered was not the API" for
+//! a reply the API had sent correctly. What `edge-http` removes is that class of bug, and what is
+//! left here is the one thing a general-purpose HTTP client cannot decide: **which API this build
+//! reports to**, and what to say about what it said back.
+//!
+//! The `Connection` does the `connect` itself — TCP and the TLS handshake with it — which is why
+//! there is no `tls::open` any more: the handshake's twenty-second budget and the line saying what
+//! the handshake settled on live on this exchange rather than in [`crate::tls`]. What that costs is
+//! one lost distinction: a refused connection, a failed handshake and a head that did not go out
+//! are one call now, and one line when it fails.
 //!
 //! **It sends no credentials.** There is no `Authorization` header, so the API answers 401 and
-//! [`poc_report::Verdict::Unauthorized`] is what this logs. That is the point of the exercise as it
-//! stands: a 401 says the request reached the API, was understood, and was refused for want of a
-//! token — three facts in one status line, where a timeout says only the first. Adding the token is
+//! the log says so on every pass — that line is the feature working, not a bug. Adding the token is
 //! the next piece of work, and nothing here has to change for it.
 //!
 //! ## What is here now, and what is not
@@ -29,23 +45,32 @@
 //! - **A retry that is not "wait five minutes".** One attempt per interval, and a failure to reach
 //!   the API is a line in the log. It is not a state on the greeting, because the greeting is about
 //!   this chip and the API is somebody else's server.
+//!
+//! ## What `edge-http` does not decide, and this file still does
+//!
+//! A general-purpose HTTP client knows nothing about which API it is talking to, so everything about
+//! *that* is here and is what this file is for: which host and path from the build's configuration,
+//! which headers this exchange sends and why each is there, and what to say about what came back.
+//! The three lines it prints are the same three lines whatever the status, because a reader of a
+//! serial log should not have to know which failure they are looking at to find out what the log
+//! says.
 
 use core::ffi::CStr;
 use core::fmt::Write as _;
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use defmt::{error, info, warn};
+use edge_http::Method;
+use edge_http::io::Body;
+use edge_http::io::client::Connection;
+use edge_nal::io::{Read, Write};
+use edge_nal_embassy::Tcp as EmbassyTcp;
+use edge_nal_tls::TlsConnector;
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsQueryType;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{IpAddress, Stack};
+use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use esp_hal::rng::Trng;
-use mbedtls_rs::{Tls, TlsReference};
-use poc_report::{
-    EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Reply, Request, Time, Verdict,
-    status_line_arrived,
-};
+use esp_hal::peripherals::{ADC1, RNG};
+use poc_report::{EVENT_TELEMETRY, EVENTS_PATH, Event, REPORT_EVERY_SECS, Time};
 
 use crate::{clock, status, tls};
 
@@ -145,28 +170,31 @@ fn server_name(buffer: &'static mut [u8; NAME_LEN]) -> &'static CStr {
     CStr::from_bytes_until_nul(buffer).expect("a NUL was just written")
 }
 
-/// How long any single step of an exchange may take.
+/// How long any single step of an exchange may take, save the first one.
 ///
 /// Each step is timed on its own, as in `src/ntp.rs`, so that a line saying an exchange failed also
-/// says which part of it failed: a name that does not resolve and a server that does not answer are
-/// different problems with different fixes.
+/// says which part of it failed: a body that does not go out and a server that does not answer are
+/// different problems with different fixes. The first step — connect, shake hands, send the head —
+/// is one call inside `edge-http`'s `Connection` and keeps its own budget in [`HANDSHAKE`].
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Receive buffer for the socket.
+/// How long the connect, the handshake and the request head may take together.
 ///
-/// Larger than any reply this API gives — the largest is a Cloudflare error page of a few hundred
-/// bytes. `smoltcp` drops a datagram that does not fit rather than truncating it, so a buffer sized
-/// to the status line alone would throw away every body there is.
+/// One budget rather than three because `edge-http`'s `Connection` does all three inside one call:
+/// the TCP connect, the TLS handshake and the head going out are a single `initiate_request`, so a
+/// line saying "the handshake failed" and a line saying "the head did not go out" would be two names
+/// for one timeout.
 ///
-/// It is also large enough for the largest record TLS will deliver in one piece. A TLS record is at
-/// most 16 KiB by `MbedTLS`' default, and `mbedtls-rs` hands the socket whatever `mbedtls_ssl_read`
-/// returns, which is one record's worth of plaintext — so a peer whose first record is larger than
-/// this would have it split across reads rather than truncated. Measured on the deployed Worker:
-/// one 634-byte reply, arriving in one read.
-const RX_LEN: usize = 1024;
-
-/// Transmit buffer for the socket, which has to hold the head and the body.
-const TX_LEN: usize = 512;
+/// The handshake is what makes this longer than [`TIMEOUT`]: every other step is a request going out
+/// or a reply coming back over an established connection, while this one is the API proving who it
+/// is, which on a 160 MHz RISC-V running `MbedTLS`' own arithmetic rather than the chip's
+/// accelerators is seconds rather than milliseconds. The handshake is also renegotiated from scratch
+/// every five minutes, because the connection is built fresh each time and paid for in full every
+/// time.
+///
+/// Twenty seconds is a ceiling, not a measurement: the observed handshake on the C3 completes well
+/// inside five seconds, so this only bounds the failure where nothing comes back at all.
+const HANDSHAKE: Duration = Duration::from_secs(20);
 
 /// How many bytes of body to build.
 ///
@@ -176,11 +204,35 @@ const TX_LEN: usize = 512;
 /// that is silently not sent.
 const BODY_LEN: usize = 512;
 
-/// How many bytes of head to build.
+/// How many headers this exchange will accept back.
 ///
-/// A fixed set of headers, a path and a number, over [`Request`]'s worst case by a wide margin: the
-/// only variable part is the host name, and a DNS name is at most 253 characters.
-const HEAD_LEN: usize = 256;
+/// `edge-http`'s `Headers` is `[httparse::Header; N]` held **by value**, so `N` is stack rather than
+/// heap: its default of 64 is about a kilobyte of the reporting task's stack for no benefit, since
+/// the deployed Worker answers with ten.
+///
+/// Sixteen rather than ten because `Headers::set` **panics** with `No space left` rather than
+/// returning an error, so the count is a promise the type system does not check. The request headers
+/// are a slice of tuples and grow without one — the `Authorization` header that is the next piece of
+/// work is one more tuple, not another visit to this constant.
+const HEADERS: usize = 16;
+
+/// How many bytes of scratch `Content-Length` is rendered into.
+///
+/// The length goes out as one of the header tuples, and a header value is text while the number is
+/// not one yet. Twenty is a `u64` in full: more than any length this body can have, and the type
+/// says so.
+const LENGTH_LEN: usize = 20;
+
+/// How many bytes of the API's answer to keep.
+///
+/// 256, over the largest body this API sends: the 401 is 24 bytes and the largest thing behind it is
+/// a Cloudflare error page of a few hundred. The head itself goes in [`tls::RX_LEN`], which is the
+/// socket's own receive buffer — `edge-http` parses the head out of that and hands back what is left,
+/// which is where this one is read from.
+///
+/// Cut rather than refused, and said so in the log when it happens: a body too long for this is a
+/// Cloudflare error page, and the first 120 characters of one already say it is HTML.
+const BODY_REPLY_LEN: usize = 256;
 
 /// How many bytes [`device_id`] writes.
 ///
@@ -189,22 +241,30 @@ const HEAD_LEN: usize = 256;
 /// matched on rather than read.
 const ID_LEN: usize = 32;
 
+/// How many bytes of state line to build.
+///
+/// 256, comfortably over the longest line this firmware can produce: a clock counting from boot
+/// with a failure to explain, an address, and a failed join with a signal in it. The line is
+/// rendered before the event because the payload is what the chip would have printed, and a line
+/// that does not fit is a report that is not sent.
+const STATUS_LEN: usize = 256;
+
 /// Starts reporting, and returns once the task is spawned.
 ///
 /// Nothing is returned and nothing is waited for: the whole reporter is one task, spawned from `main`
 /// once the network stack exists, and every step inside it is bounded by a timeout of its own. A
 /// network that never comes up costs this task nothing but its own waiting.
 ///
-/// `trng` is the chip's hardware random number generator, which `MbedTLS` needs for its key exchange
-/// and which `esp_hal` only hands out once the entropy source has been enabled — see the comment in
-/// `src/bin/main.rs`. It is taken by value because [`crate::tls::instance`] keeps it for the life of
-/// the program.
+/// `rng` and `adc` are the two halves of the entropy `MbedTLS` needs for its key exchange: the
+/// generator is only handed out once the SAR ADC source behind it has been enabled, which takes
+/// both peripherals. They travel by value because the task enables the source itself, once DHCP is
+/// up — not here, where nothing has joined yet. See [`crate::tls::boot`] for why the wait matters.
 ///
 /// # Panics
 ///
-/// If the executor has no room left for another task. All four are allocated once, at boot, so this
-/// is a fact about the size of the task pool rather than something that can happen later.
-pub fn start(spawner: Spawner, stack: Stack<'static>, trng: Trng) {
+/// If the executor has no room left for another task. It is allocated once, at boot, so this is a
+/// fact about the size of the task pool rather than something that can happen later.
+pub fn start(spawner: Spawner, stack: Stack<'static>, rng: RNG<'static>, adc: ADC1<'static>) {
     // Where this build reports to, before anything else about it, because the two halves come from
     // the environment and the reader of a serial log cannot see an environment. A log that starts
     // with "joining my-network" and never says which API it is talking to cannot answer the question
@@ -225,56 +285,26 @@ pub fn start(spawner: Spawner, stack: Stack<'static>, trng: Trng) {
 
     // Here rather than inside the task, for the reason `src/ntp.rs` builds its socket in the same
     // place: `make_static!` builds its type out of `impl Trait`, and a task's body is itself an
-    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. What is
-    // built here is the *storage*, not the socket: the socket itself is opened per exchange by the
-    // task, which is what has to own its lifetime.
-    let rx = static_cell::make_static!([0; RX_LEN]);
-    let tx = static_cell::make_static!([0; TX_LEN]);
-
-    // Also here, and for the same reason: the TLS session borrows the server name for as long as it
-    // lives, and `MbedTLS` has one instance for the whole program rather than one per exchange.
+    // opaque type to the compiler, so one inside the other is a cycle it cannot resolve. This one
+    // is storage rather than state — and building it touches no hardware, so it costs the radio
+    // nothing.
     let name = server_name(static_cell::make_static!([0; NAME_LEN]));
-    let tls = tls::instance(trng);
 
-    spawner.spawn(report(stack, tls, name, rx, tx).expect("report is a task"));
-}
-
-/// Opens one socket for one exchange.
-///
-/// The buffers are passed in rather than built here because they outlive the socket, and that
-/// asymmetry is the whole of why this works. `embassy-net` has a fixed number of sockets and a
-/// socket set that is full panics rather than refusing, so a socket whose buffers were also
-/// per-exchange would hand the same `StaticCell` slot to `make_static!` twice and panic on the second
-/// call. One pair of buffers for the life of the task, one socket at a time borrowed from them, and
-/// the loop in [`report`] is what guarantees only one socket exists at a time.
-fn open<'a>(stack: Stack<'a>, rx: &'a mut [u8; RX_LEN], tx: &'a mut [u8; TX_LEN]) -> TcpSocket<'a> {
-    TcpSocket::new(stack, rx, tx)
+    spawner.spawn(report(stack, rng, adc, name).expect("report is a task"));
 }
 
 /// The task behind [`start`].
 #[embassy_executor::task]
-async fn report(
-    stack: Stack<'static>,
-    tls: Tls<'static>,
-    name: &'static CStr,
-    rx: &'static mut [u8; RX_LEN],
-    tx: &'static mut [u8; TX_LEN],
-) {
+async fn report(stack: Stack<'static>, rng: RNG<'static>, adc: ADC1<'static>, name: &'static CStr) {
     // The first report waits for DHCP rather than firing into a stack that has no address yet: the
     // exchange needs an address to send from, and the resolver it needs to find the API with is
     // configured by the same lease.
     stack.wait_config_up().await;
 
-    loop {
-        // A socket per exchange, dropped at the end of it. That is not a stylistic choice: a
-        // `TcpSocket` that is still open cannot be connected again — `smoltcp` answers `connect`
-        // on an open socket with `InvalidState`, which is what the second pass used to log five
-        // minutes after the first one succeeded. Dropping it takes it out of the socket set and
-        // leaves the next pass a socket that has never been connected, which is the only state
-        // `connect` accepts.
-        let mut socket = open(stack, rx, tx);
+    let connector = tls::boot(rng, adc, stack, name);
 
-        once(&stack, tls.reference(), &mut socket, name).await;
+    loop {
+        once(stack, connector).await;
 
         Timer::after(Duration::from_secs(REPORT_EVERY_SECS)).await;
     }
@@ -283,345 +313,335 @@ async fn report(
 /// One exchange: resolve the host, connect, shake hands, write the head and the body, and read the
 /// answer.
 async fn once(
-    stack: &Stack<'static>,
-    tls: TlsReference<'_>,
-    socket: &mut TcpSocket<'_>,
-    name: &'static CStr,
+    stack: Stack<'static>,
+    connector: &'static TlsConnector<'static, EmbassyTcp<'static>>,
 ) {
-    let Ok(address) = resolve(stack).await else {
+    let Ok(address) = resolve(&stack).await else {
         return;
     };
 
     // Read here, in the task that is about to report, rather than passed in: the greeting reads the
     // same three facts twice a second and this reads them once every five minutes, and the state a
     // report carries has to be the state at the moment it is stamped.
-    let state = status::report(Some(*stack));
+    let state = status::report(Some(stack));
 
-    let mut id = [0; ID_LEN];
-    let id_len = write_id(&mut id, esp_hal::efuse::base_mac_address());
+    // Rendered before the event because the payload is what the chip would have printed at that
+    // moment rather than the three fields behind it: three fields in a payload would be a second
+    // way of writing the same line, and the two would drift.
+    let Some(payload) = fill::<STATUS_LEN>(&state) else {
+        return;
+    };
 
-    // The bytes are ASCII because a hex digit is ASCII and nothing else was written into them, so
-    // this cannot fail. An `expect` on something that cannot is the honest way to say so without
-    // writing `unsafe`.
-    let device_id = core::str::from_utf8(&id[..id_len]).expect("a hex device id is ASCII");
+    let id = write_id(esp_hal::efuse::base_mac_address());
 
     let event = Event {
-        device_id,
+        device_id: id.as_str(),
         timestamp_secs: now_secs(),
         event_type: EVENT_TELEMETRY,
-        status: &state,
+        payload: payload.as_str(),
     };
 
     // The body is built before the head because `Content-Length` is its length and the head goes
     // first on the wire. A body that does not fit is a report that is not sent, and [`fill`] says so
     // in the log rather than sending a truncated one.
-    let mut body = [0; BODY_LEN];
-    let Some(body_len) = fill(&mut body, &event) else {
+    let Some(body) = fill::<BODY_LEN>(&event) else {
         return;
     };
 
-    let mut head = [0; HEAD_LEN];
-    let Some(head_len) = fill(
-        &mut head,
-        &Request {
-            host: HOST,
-            path: EVENTS_PATH,
-            content_length: body_len,
-        },
-    ) else {
-        return;
-    };
+    // The scratch `Content-Length` is rendered into outlives the headers borrowing from it: the
+    // tuples below hold a `&str` each, so the string they borrow lives here rather than inside
+    // whatever builds them.
+    let mut length = heapless::String::<LENGTH_LEN>::new();
+    write!(length, "{}", body.len()).ok();
 
-    // Each step below returns `Err` having already said what went wrong, so the caller only has to
-    // stop. Nothing here has to arrange for the socket to be reusable: the caller drops it on the way
-    // out whatever the outcome, which is also what a `connect` that timed out mid-handshake needs,
-    // since `smoltcp`'s state machine would refuse the next `connect` on it as an invalid state.
-    if connect(socket, address).await.is_err() {
-        return;
+    // Four headers, and each is here for a reason rather than by habit. `Host` is the name this
+    // firmware asked for rather than the address it resolved to, because that is what a server routes
+    // on and what a log can be read against. `Content-Length` is measured rather than declared,
+    // because the body was written into a buffer before any of this and a length that disagrees with
+    // it is a request the server waits on until it gives up. `Connection: close` because this client
+    // reads the answer and does nothing else with the connection: without it the server may hold the
+    // socket open, and the read below then waits for bytes that are not coming, which is a timeout
+    // on every single report rather than once.
+    let headers = [
+        ("Host", HOST),
+        ("Content-Type", "application/json"),
+        ("Content-Length", length.as_str()),
+        ("Connection", "close"),
+    ];
+
+    // The scratch the exchange runs in: `Connection` parses the answer's head out of it and hands
+    // back what arrived past the blank line as the start of the body. About a kilobyte of stack for
+    // the life of one exchange, freed on the way out rather than held across five-minute sleeps.
+    let mut scratch = [0; tls::RX_LEN];
+    let mut connection = Connection::new(
+        &mut scratch,
+        connector,
+        SocketAddr::new(IpAddr::V4(address), port()),
+    );
+
+    // Connect, shake hands and send the head in one call, under the handshake's own budget: the
+    // handshake is seconds of `MbedTLS` arithmetic on this chip rather than milliseconds of
+    // network, and twenty seconds bounds only the failure where nothing comes back at all. Each
+    // step below returns having already said what went wrong, so the caller only has to stop.
+    //
+    // Nothing here has to arrange for the connection to be reusable: the factory builds the socket
+    // out of a pool and the connection is dropped on the way out whatever the outcome, which is
+    // also what a handshake that timed out needs — `smoltcp` refuses the next `connect` on a socket
+    // that is still open as an invalid state.
+    match with_timeout(
+        HANDSHAKE,
+        connection.initiate_request(true, Method::Post, EVENTS_PATH, &headers),
+    )
+    .await
+    {
+        Err(_) => {
+            error!("the request did not go out: it timed out");
+
+            return;
+        }
+        Ok(Err(e)) => {
+            error!("the request did not go out: {:?}", e);
+
+            return;
+        }
+        Ok(Ok(())) => {}
     }
 
-    // The TCP connection is established but nothing has been said yet, so this is the first moment
-    // at which a certificate could be checked and the first moment at which the API is known to be
-    // the API. The borrow of the socket ends with the session, so a handshake that fails leaves the
-    // socket in the state the step above left it in.
-    let Some(mut stream) = tls::open(tls, socket, name).await else {
-        return;
-    };
+    // The version and the verification flags together are what says the API was checked and not
+    // merely reached: a zero flag is the only value that means the chain, the signature and the
+    // hostname all agreed, and the version says what was agreed about. The handshake is already
+    // over — the head above went out through it — so this reads what it settled on rather than
+    // driving it.
+    match connection.raw_connection() {
+        Err(e) => {
+            error!("the handshake could not be read back: {:?}", e);
 
-    if send(&mut stream, &head[..head_len]).await.is_err() {
-        return;
+            return;
+        }
+        Ok(socket) => {
+            let session = socket.session_mut();
+
+            info!(
+                "the API's certificate verified: {:?}, flags {:#x}",
+                session.tls_version(),
+                session.tls_verification_details()
+            );
+        }
     }
 
-    if send(&mut stream, &body[..body_len]).await.is_err() {
-        return;
+    match with_timeout(TIMEOUT, connection.write_all(body.as_bytes())).await {
+        Err(_) => {
+            error!("the request body did not go out: it timed out");
+
+            return;
+        }
+        Ok(Err(e)) => {
+            error!("the request body did not go out: {:?}", e);
+
+            return;
+        }
+        Ok(Ok(())) => {}
     }
 
-    // Nothing is closed before the reply is read. The head says `Connection: close`, so the server
-    // closes when it has answered, and the answer is what this is waiting for: shutting the write
-    // half first measured as a `ConnectionReset` before a single byte came back, which is this
-    // server's answer to being told the conversation was over before it had replied to it.
-    let mut buffer = [0; RX_LEN];
+    match with_timeout(TIMEOUT, connection.initiate_response()).await {
+        Err(_) => {
+            error!("the API did not finish answering in time");
 
-    let read = read_reply(&mut stream, &mut buffer).await;
+            close(connection).await;
 
-    // Finished asking, once whatever was coming has come — TLS `close_notify`, which is the
-    // protocol's own way of saying there is no more of this exchange. On both paths rather than
+            return;
+        }
+        Ok(Err(edge_http::io::Error::ConnectionClosed)) => {
+            // Nothing at all came back: a peer that accepted the connection and then stopped. That is
+            // not the same as something answering that was not the API, and it wants a different
+            // sentence — one names the API being unreachable, the other names a portal.
+            close(connection).await;
+
+            say(None, &[]);
+
+            return;
+        }
+        Ok(Err(e)) => {
+            // Something answered and it was not HTTP, which is the captive-portal case: on a network
+            // with a login page, the first bytes of the answer are a `<!DOCTYPE`.
+            error!("what answered was not HTTP: {:?}", e);
+
+            close(connection).await;
+
+            say(None, &[]);
+
+            return;
+        }
+        Ok(Ok(())) => {}
+    }
+
+    let (head, reader) = connection.split();
+    let code = head.code;
+
+    let mut collected = [0; BODY_REPLY_LEN];
+    let total = collect(reader, &mut collected).await;
+
+    // Finished asking, once whatever was coming has come: closing the connection politely, which is
+    // the protocol's own way of saying there is no more of this exchange. On every path rather than
     // only the happy one: MbedTLS warns on a session dropped while still open, and a warning that
     // fires on every failed exchange would be a warning about the reporting, not about the failure.
-    match with_timeout(TIMEOUT, stream.close()).await {
+    close(connection).await;
+
+    say(Some(code), &collected[..total]);
+}
+
+/// Reads the answer's body into `collected`, and says how many bytes it took.
+///
+/// Its own function rather than more of [`once`] because that function is long enough already, and
+/// the loop is the one part of the exchange with a buffer of its own.
+///
+/// Cut rather than refused when the body does not fit, and said so in the log when it happens: a
+/// body too long for this is a Cloudflare error page, and the first 120 characters of one already
+/// say it is HTML.
+async fn collect(
+    reader: &mut Body<'_, tls::Stream<'_>>,
+    collected: &mut [u8; BODY_REPLY_LEN],
+) -> usize {
+    let mut total = 0;
+
+    loop {
+        match with_timeout(TIMEOUT, reader.read(&mut collected[total..])).await {
+            Err(_) => {
+                error!(
+                    "the API stopped answering after {} of {} bytes",
+                    total,
+                    collected.len()
+                );
+
+                return total;
+            }
+            // Zero bytes is the end of the body rather than a failure, and for a `Connection:
+            // close` reply with no `Content-Length` it is the *only* way to learn where the body
+            // stopped: nothing declared a length, so nothing else says.
+            Ok(Ok(0)) => return total,
+            Ok(Ok(got)) => {
+                total += got;
+
+                if total == collected.len() {
+                    // The buffer is full with the body still going, which is only possible for a
+                    // body whose length was never declared. Said rather than passed off as
+                    // complete: a Cloudflare error page cut at 256 bytes and one cut at 255 read
+                    // the same otherwise.
+                    warn!(
+                        "the API's answer is longer than {} bytes and was cut",
+                        collected.len()
+                    );
+
+                    return total;
+                }
+            }
+            Ok(Err(e)) => {
+                error!("the API's answer could not be read: {:?}", e);
+
+                return total;
+            }
+        }
+    }
+}
+
+/// Closes the connection politely, and says when it could not.
+///
+/// Its own function because it is on the failure paths as well as the happy one, and a closure
+/// repeated at five call sites would be five chances to word the same event five different ways.
+///
+/// Nothing is closed before the answer is read. The head says `Connection: close`, so the server
+/// closes when it has answered, and the answer is what this is waiting for: shutting the write half
+/// first measured as a `ConnectionReset` before a single byte came back, which is this server's
+/// answer to being told the conversation was over before it had replied to it.
+async fn close(connection: Connection<'_, TlsConnector<'static, EmbassyTcp<'static>>, HEADERS>) {
+    match with_timeout(TIMEOUT, connection.close()).await {
         Err(_) => warn!("the exchange was not closed politely: it timed out"),
         Ok(Err(e)) => warn!("the exchange was not closed politely: {:?}", e),
         Ok(Ok(())) => {}
     }
+}
 
-    let Some(read) = read else {
-        return;
-    };
-
-    let reply = Reply::from_bytes(&buffer[..read]);
-
-    // The status code goes on every line, and it is the one thing here that is not this firmware's
-    // opinion: it is what the API actually did, where the sentence beside it is what to make of it. A
-    // reader who does not believe the sentence can still go and read the number.
-    match reply.status() {
-        // No code at all, for a reply that was not HTTP. Saying "no status" beats printing a zero,
-        // which is not a thing this API can send and would read as a status.
-        None => warn!(
-            "the API did not store the event: {}",
-            defmt::Display2Format(&reply.verdict())
-        ),
-        Some(status) if reply.verdict() == Verdict::Stored => info!(
-            "the API stored the event, {} after {}",
-            status,
+/// Says what the API answered, which is the whole of what this file is for.
+///
+/// Takes the status code and the body rather than a verdict on them: 201 is the one status that
+/// means the exchange worked, and every other status is reported as the number it is plus the
+/// API's own words. A mapping from numbers to sentences would be a claim about what each status
+/// means — tomorrow a 401 can mean a token that expired rather than one that was never sent —
+///
+/// `None` for the code when no status line was read at all: nothing came back, or something that
+/// was not the API answered. Saying "no status" beats printing a zero, which is not a thing this
+/// API can send and would read as a status.
+fn say(code: Option<u16>, body: &[u8]) {
+    // The status code goes on every line that has one, and it is the one thing here that is not
+    // this firmware's opinion: it is what the API actually did. A reader who wants more than the
+    // number has the body on the next line.
+    match code {
+        Some(201) => info!(
+            "the API stored the event, 201 after {}",
             defmt::Display2Format(&poc_report::age(Instant::now().as_secs()))
         ),
-        Some(status) => warn!(
-            "the API did not store the event: {} {}",
-            status,
-            defmt::Display2Format(&reply.verdict())
-        ),
+        Some(status) => warn!("the API did not store the event: {}", status),
+        None => warn!("the API did not store the event: no status"),
     }
 
     // The API's own words, on anything that was not a store. On a 400 this is the only thing that
-    // says which field was wrong; on a status this firmware does not name, it is the only thing the
-    // API said at all. Left out for a store, whose body is eleven bytes saying "ok" — every five
-    // minutes, forever, and a log line nobody reads is a log line that costs time to skip.
-    if reply.verdict() != Verdict::Stored {
+    // says which field was wrong; on a status nobody named, it is the only thing the API said at
+    // all. Left out for a store, whose body is eleven bytes saying "ok" — every five minutes,
+    // forever, and a log line nobody reads is a log line that costs time to skip.
+    if code != Some(201) {
         info!(
             "the API said: {}",
-            defmt::Display2Format(&poc_report::logged(reply.body()))
+            defmt::Display2Format(&poc_report::logged(body))
         );
-    }
-}
-
-/// Reads until the reply's first line is whole, and says how much of it there is.
-///
-/// The buffer belongs to the caller, and only the count comes back: [`Reply`] borrows the bytes, and
-/// a value that borrowed a local would not survive this function. That turns out to be the better
-/// split anyway — this is the part that talks to the network and the caller is the part that reads
-/// what arrived.
-///
-/// The loop is the whole point of this function. A TCP read returns whatever has arrived, which is
-/// not the same thing as a reply: the 401 this API sends is 650 bytes against a 25-byte status line,
-/// and nothing in TCP promises where the boundary between them falls. Reading once and judging that
-/// is what this firmware used to do, and it reported "what answered was not the API" for replies the
-/// API had sent correctly — because the read had landed inside the status line and a line with eleven
-/// of its twenty-five bytes looks like no line at all.
-///
-/// Three ways to stop, and each is a different thing to say:
-///
-/// - the status line is whole, which is the answer;
-/// - the peer closed with nothing more, which is a server that answered and then stopped;
-/// - the buffer filled up with no CRLF in it, which is a reply this firmware cannot read.
-///
-/// `None` means the last two, or a read that failed, and each has already said which.
-async fn read_reply(stream: &mut tls::Stream<'_, '_>, into: &mut [u8; RX_LEN]) -> Option<usize> {
-    let mut read = 0;
-
-    while read < into.len() {
-        // Ask before reading again, on the bytes from the previous read: this is the answer to "is
-        // there anything left to wait for", and it can be true before the read that completes it.
-        if status_line_arrived(&into[..read]) {
-            return Some(read);
-        }
-
-        let got = match with_timeout(TIMEOUT, stream.read(&mut into[read..])).await {
-            Err(_) => {
-                error!("the API did not finish answering after {} bytes", read);
-
-                return None;
-            }
-            Ok(Err(e)) => {
-                error!("the answer could not be read: {:?}", e);
-
-                return None;
-            }
-            Ok(Ok(got)) => got,
-        };
-
-        // Zero bytes with the connection open is the end of the stream: the server said everything it
-        // was going to say. A status line inside it is still a status line, so this is checked
-        // before giving up rather than after.
-        if got == 0 {
-            return Some(read);
-        }
-
-        read += got;
-    }
-
-    // The buffer is full and no CRLF is in it, so the first line is longer than the whole buffer.
-    // That is not a reply this firmware can read, and saying so beats handing back a count and
-    // letting the caller judge a line it has not finished collecting.
-    if status_line_arrived(into) {
-        return Some(read);
-    }
-
-    error!(
-        "the first line of the reply is longer than the {} byte buffer",
-        RX_LEN
-    );
-
-    None
-}
-
-/// Opens the connection to the API, or says why it did not.
-///
-/// Its own function rather than a step inside [`once`] because it is the one step whose failure is
-/// not about the request: everything after it is about bytes this firmware is sending, and a reader
-/// of a log line saying which step failed needs the two to be separable.
-async fn connect(socket: &mut TcpSocket<'_>, address: Ipv4Addr) -> Result<(), ()> {
-    match with_timeout(TIMEOUT, socket.connect((address, port()))).await {
-        Err(_) => {
-            error!("the API did not complete the connection: it timed out");
-
-            Err(())
-        }
-        // The driver's own words are logged here rather than folded into a sentence: what a
-        // connection was refused for is a numbered reason out of a set this firmware does not name,
-        // and a reader of this log is better served by it than by a guess.
-        Ok(Err(e)) => {
-            error!("the API would not accept the connection: {:?}", e);
-
-            Err(())
-        }
-        Ok(Ok(())) => Ok(()),
-    }
-}
-
-/// Writes all of `bytes` to the stream, or gives up.
-///
-/// `write` says how many bytes it took, and it is routinely fewer than all of them — over TLS a
-/// request is cut into records of at most 16 KiB, and it may be less than that for want of room in
-/// the socket's 512-byte transmit buffer. The loop is not optional: a request sent in two pieces
-/// with the second missing is a request the server waits on.
-///
-/// `Err(())` rather than the stack's error because every failure here has already said what it was
-/// in the log, and a caller that logged it again would print the same sentence twice.
-async fn send(stream: &mut tls::Stream<'_, '_>, bytes: &[u8]) -> Result<(), ()> {
-    let mut sent = 0;
-
-    while sent < bytes.len() {
-        let wrote = match with_timeout(TIMEOUT, stream.write(&bytes[sent..])).await {
-            Err(_) => {
-                error!(
-                    "the request did not go out: it timed out after {} bytes",
-                    sent
-                );
-
-                return Err(());
-            }
-            Ok(Err(e)) => {
-                error!(
-                    "the request could not be written after {} bytes: {:?}",
-                    sent, e
-                );
-
-                return Err(());
-            }
-            Ok(Ok(wrote)) => wrote,
-        };
-
-        // A write of nothing while the socket claims it can send is the case that would otherwise
-        // spin here forever: the connection is open, there is no room and there is no progress. It is
-        // what a server that accepted the connection and then stopped reading looks like.
-        if wrote == 0 {
-            error!(
-                "the request stopped going out after {} of {} bytes",
-                sent,
-                bytes.len()
-            );
-
-            return Err(());
-        }
-
-        sent += wrote;
-    }
-
-    match stream.flush().await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            error!("the request could not be flushed: {:?}", e);
-
-            Err(())
-        }
     }
 }
 
 /// The address of [`HOST`], once DHCP has given the resolver some to ask.
 ///
-/// Its own function rather than the one in `src/ntp.rs` because that one is private to it and this is
-/// another server in another exchange. The two refusals mean different things, so the sentences are
-/// different too: a name that does not resolve is DNS or the network, and the name is in both
-/// sentences because a log line about a name is not answerable without the name.
+/// The lookup itself is [`crate::dns::resolve`], which this shares with `src/ntp.rs`; the sentences
+/// are here because a name that does not resolve means something different for an API than for a
+/// time server, and a log line about a name is not answerable without the name.
 async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, ()> {
-    let found = match with_timeout(TIMEOUT, stack.dns_query(HOST, DnsQueryType::A)).await {
-        Err(_) => {
+    match crate::dns::resolve(stack, HOST).await {
+        Ok(address) => Ok(address),
+        Err(crate::dns::Failure::TimedOut) => {
             error!("the name of the API did not resolve in time: {}", HOST);
 
-            return Err(());
+            Err(())
         }
-        Ok(Err(e)) => {
+        Err(crate::dns::Failure::Refused(e)) => {
             error!("the name of the API did not resolve: {} ({:?})", HOST, e);
 
-            return Err(());
+            Err(())
         }
-        Ok(Ok(found)) => found,
-    };
+        Err(crate::dns::Failure::NoIpv4) => {
+            error!("the name of the API is not one this can send to: {}", HOST);
 
-    // An A record is a question about IPv4 and this firmware has no other protocol to send over, so an
-    // answer that is empty or IPv6-only is not a name that did not exist: it is a name this cannot be
-    // reached at.
-    if let Some(IpAddress::Ipv4(address)) = found.first() {
-        return Ok(*address);
+            Err(())
+        }
     }
-
-    error!("the name of the API is not one this can send to: {}", HOST);
-
-    Err(())
 }
 
-/// Writes this chip's name into `into`: the chip, a dash, and the MAC address in hex.
+/// Writes this chip's name: the chip, a dash, and the MAC address in hex.
 ///
 /// Six bytes in and twelve out, so [`ID_LEN`] is twice what is needed and there is room for the chip
-/// name and the dash. A length rather than a `&str` because the buffer belongs to the caller, which is
-/// what lets this run on the stack of the task that is reporting.
-fn write_id(into: &mut [u8; ID_LEN], mac: esp_hal::efuse::MacAddress) -> usize {
-    let mut writer = Slice {
-        buffer: into,
-        written: 0,
-    };
+/// name and the dash. A value rather than a `&str` into a buffer of the caller's, because
+/// `heapless::String` is already what the body is rendered into — one way of building text on this
+/// chip rather than two.
+fn write_id(mac: esp_hal::efuse::MacAddress) -> heapless::String<ID_LEN> {
+    let mut id = heapless::String::new();
 
-    // The `.ok()`s rather than an `unwrap`: a `fmt::Write` into a fixed buffer fails when it is full,
+    // The `.ok()`s rather than an `unwrap`: a `fmt::Write` into a fixed string fails when it is full,
     // and this one is sized from what goes into it — twelve hex digits and at most seven for the chip
-    // name, in a buffer of thirty-two. If that ever stops being true the id is written as far as it
+    // name, in a string of thirty-two. If that ever stops being true the id is written as far as it
     // went, which is visible in the API's table, rather than a panic in a network task.
-    write!(writer, "{CHIP}-").ok();
+    write!(id, "{CHIP}-").ok();
 
     for byte in mac.as_bytes() {
-        write!(writer, "{byte:02x}").ok();
+        write!(id, "{byte:02x}").ok();
     }
 
-    writer.written
+    id
 }
 
 /// The time the event is stamped with, in seconds since the epoch.
@@ -637,47 +657,20 @@ fn now_secs() -> u64 {
     }
 }
 
-/// Formats one value into a buffer, and says how many bytes it took.
+/// Formats one value into a [`heapless::String`], and says what it took.
 ///
 /// `None` when the value does not fit, which is a report that is not sent. A function rather than an
-/// inline `write!` because that failure is worth one line in the log naming the buffer, and
+/// inline `write!` because that failure is worth one line in the log naming the capacity, and
 /// `core::fmt::Error` says nothing of the sort.
-fn fill<const N: usize>(buffer: &mut [u8; N], value: &impl core::fmt::Display) -> Option<usize> {
-    let mut writer = Slice { buffer, written: 0 };
+fn fill<const N: usize>(value: &impl core::fmt::Display) -> Option<heapless::String<N>> {
+    let mut rendered = heapless::String::new();
 
-    match write!(writer, "{value}") {
-        Ok(()) => Some(writer.written),
+    match write!(rendered, "{value}") {
+        Ok(()) => Some(rendered),
         Err(e) => {
             error!("a {} byte buffer was too small for this report: {:?}", N, e);
 
             None
         }
-    }
-}
-
-/// A [`core::fmt::Write`] that writes into a fixed slice and counts what it wrote.
-///
-/// `core` has no such thing and `heapless` would be a dependency for one adapter. `Err` on a full
-/// buffer is what [`core::fmt::Write`] says to do, and the count is what `Content-Length` needs.
-struct Slice<'a, const N: usize> {
-    /// Where the bytes go.
-    buffer: &'a mut [u8; N],
-
-    /// How many of them have gone so far.
-    written: usize,
-}
-
-impl<const N: usize> core::fmt::Write for Slice<'_, N> {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let room = self
-            .buffer
-            .get_mut(self.written..self.written + text.len())
-            .ok_or(core::fmt::Error)?;
-
-        room.copy_from_slice(text.as_bytes());
-
-        self.written += text.len();
-
-        Ok(())
     }
 }

@@ -26,9 +26,10 @@
 //! second. A build with no credentials says so on that line, rather than leaving a reader to work
 //! out from a missing address that nothing was ever attempted.
 //!
-//! The state is published as one word rather than as the enum itself, because a value published as
-//! several words is a value whose parts can be read at different moments. [`Link::to_word`] is the
-//! other end of that.
+//! The state is published as the value itself, behind a lock the greeting takes to read it, rather
+//! than as one word: a value published as several words is a value whose parts can be read at
+//! different moments, and a single word for six states is an encoding with a test for every byte of
+//! it. The lock is a brief critical section on a chip with one core, taken twice a second.
 //!
 //! ## Credentials
 //!
@@ -41,11 +42,12 @@
 //! still has to build, because the gate and CI are such a build. There, [`join`] says so and
 //! returns `None`, and the rest of the firmware runs exactly as it did before Wi-Fi existed.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::RefCell;
 
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_net::{Runner, Stack, StackResources, StaticConfigV4};
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
@@ -53,7 +55,7 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ConnectionError, ControllerConfig, DisconnectReason,
     Interface, Password, Ssid, WifiController, WifiError, scan::ScanConfig, sta::StationConfig,
 };
-use poc_report::{Address, JoinFailure, Link, Reason};
+use poc_report::Address;
 
 /// The SSID of the network to join, read from the environment when this was compiled.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
@@ -79,15 +81,102 @@ const SOCKETS: usize = 5;
 
 /// What the radio is doing, published for [`link`] to read.
 ///
-/// One atomic rather than a lock around a [`Link`]: the greeting reads this from a different task
-/// than the one that writes it, twice a second, and a lock to protect one small answer is a lock
-/// the radio could block on while it is trying to join. The word is written whole, so a reader sees
-/// a state the writer had finished rather than half of an answer.
+/// A lock around the [`Link`] rather than one atomic holding a word for it: on a chip with one
+/// core the lock is a brief critical section, taken twice a second by the greeting and written on
+/// every join attempt, and what it holds is the value itself rather than an encoding of it. The
+/// `RefCell` is what makes the write safe without an `unsafe`: nothing locks again inside a lock
+/// closure and no interrupt handler touches this static, so the borrow cannot fail — and if that
+/// ever stops being true it panics rather than corrupting.
 ///
 /// It starts as [`Link::Joining`] because that is the state this chip is in from the moment it
 /// starts: the radio is expected to be trying, and `join` replaces this with something more specific
 /// within a few lines of returning.
-static LINK: AtomicU32 = AtomicU32::new(Link::Joining.to_word());
+static LINK: Mutex<CriticalSectionRawMutex, RefCell<Link>> =
+    Mutex::new(RefCell::new(Link::Joining));
+
+/// What the radio is doing, and — when it is not doing what it should — why.
+///
+/// A state rather than a sequence of log lines because a log is read long after the event. A line
+/// saying it could not join helps only whoever is watching when it happens; a line that still says
+/// so twice a second is what someone reading the log from the top finds, and to them the two are the
+/// same thing.
+///
+/// The states are separate rather than one "not connected" because each wants a different thing done
+/// about it: fill in the credentials, fix a credential, replace the board, or go and look for the
+/// network and how loudly it can be heard from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    /// There was never a network to join, because no `SSID` was compiled in.
+    ///
+    /// The normal state of the gate and of CI, and the state a build made before `.cargo/local.toml`
+    /// was filled in is in. Nothing is wrong with the hardware, which is what makes this worth
+    /// distinguishing from every other state here.
+    NoNetwork,
+
+    /// There was a network to join and the radio would not take one of its credentials.
+    ///
+    /// Both values are compiled in, so this is a mistake in the file the firmware was built from
+    /// rather than anything that can happen on a board.
+    UnusableCredential,
+
+    /// The radio would not start at all, which is neither a network problem nor a credentials one.
+    NoRadio,
+
+    /// An attempt is in progress, or one is due.
+    Joining,
+
+    /// The station is on the network.
+    Joined,
+
+    /// The last attempt did not work, and this is what the radio said.
+    Failed(JoinFailure),
+}
+
+impl core::fmt::Display for Link {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // The same three words on the three states with no network in them, because what they
+            // have in common is what a reader has to act on first: there is nothing to wait for.
+            Self::NoNetwork => f.write_str("nothing to join: no credentials were compiled in"),
+            Self::UnusableCredential => f.write_str(
+                "nothing to join: a compiled-in credential is not one the radio can use",
+            ),
+            Self::NoRadio => f.write_str("nothing to join: the radio did not start"),
+            Self::Joining => f.write_str("joining"),
+            Self::Joined => f.write_str("joined"),
+            Self::Failed(failure) => write!(f, "not joined: {failure}"),
+        }
+    }
+}
+
+/// A join that failed, with what the radio said and the signal it last measured.
+///
+/// The reason is the driver's own [`DisconnectReason`], carried as-is rather than grouped: any
+/// grouping is a claim about what to do next, and a wrong claim sends whoever is reading the serial
+/// output after the wrong problem. What the grouping used to be for — telling a wrong password from
+/// a station too far away — is what the signal is for: the two failures that look identical in the
+/// radio's own words are not identical to fix.
+///
+/// The reason renders as the driver's own variant name, which is a Rust identifier: no quotes, no
+/// backslash, no controls, so it cannot end the JSON string the state line is reported in — by
+/// construction rather than by test, since this file cannot be compiled for a host at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinFailure {
+    /// What the radio reported.
+    pub reason: DisconnectReason,
+
+    /// How strong the signal was, in dBm, when the radio measured one.
+    pub signal: Option<i8>,
+}
+
+impl core::fmt::Display for JoinFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.signal {
+            Some(dbm) => write!(f, "{:?} (signal {dbm} dBm)", self.reason),
+            None => write!(f, "{:?}", self.reason),
+        }
+    }
+}
 
 /// Starts the radio, joins the network, and returns the network stack once it exists.
 ///
@@ -162,20 +251,19 @@ pub fn join(spawner: Spawner, device: WIFI<'static>) -> Option<Stack<'static>> {
 /// What the radio is doing right now, as of the last thing this file published.
 ///
 /// Never waits and never fails, which is what lets the greeting call it twice a second without
-/// knowing anything about the radio. Six of the seven states it can be in were only ever decided in
-/// this file's own task: what the hardware said is here, and so is what to do about it.
+/// knowing anything about the radio. Every state it can be in was only ever decided in this file's
+/// own task: what the hardware said is here, and so is what to do about it.
 #[must_use]
 pub fn link() -> Link {
-    Link::from_word(LINK.load(Ordering::Acquire))
+    LINK.lock(|link| *link.borrow())
 }
 
 /// Records what the radio is doing, for [`link`] to read.
 ///
-/// One whole word, so there is no order to get right between two halves of an answer. Release and
-/// acquire rather than `Relaxed` because the word is written by the radio's task and read by the
-/// greeting's, and the chip has one core: this is the ordering that makes the write visible.
+/// The whole value under one lock, so a reader sees a state the writer had finished rather than
+/// half of an answer.
 fn publish(link: Link) {
-    LINK.store(link.to_word(), Ordering::Release);
+    LINK.lock(|slot| *slot.borrow_mut() = link);
 }
 
 /// The address in a stack's IPv4 configuration, in the form the firmware prints.
@@ -267,95 +355,40 @@ async fn keep_joined(mut controller: WifiController<'static>) {
 ///
 /// A disconnected station is reported by the radio as a numbered reason out of about fifty, which
 /// answers "what did the hardware say" and leaves "what do I do about it" to whoever is reading the
-/// serial output. This translates the ones that come up in practice and keeps the rest, because a
-/// wrong guess is worse than an honest unknown: two of these look alike in the radio's words and want
-/// opposite fixes — a refused password is a typo, and a network that stops answering is a station too
-/// far away.
+/// serial output: a wrong guess here is worse than an honest unknown, because two failures that look
+/// alike in the radio's words want opposite fixes — a refused password is a typo, and a network
+/// that stops answering is a station too far away. So this carries the reason as-is rather than
+/// grouping it, and the scan printed after a failure is what tells the cases apart.
 ///
-/// `poc_report` decides the wording and is tested on the host; the radio's own words are still printed
-/// underneath for anything this does not name. Published rather than only printed, because the last
-/// failure is what the greeting keeps saying for as long as the link is down — which, with the retry
-/// above, is most of the time on a network that is not there.
+/// Published rather than only printed, because the last failure is what the greeting keeps saying
+/// for as long as the link is down — which, with the retry above, is most of the time on a network
+/// that is not there.
 fn report(failure: &ConnectionError) {
     match failure {
         ConnectionError::Failed(info) => {
             let failure = JoinFailure {
-                reason: named(info.reason),
+                reason: info.reason,
                 signal: measured(info.rssi),
             };
 
             publish(Link::Failed(failure));
 
             error!(
-                "could not join {}: {} ({:?})",
+                "could not join {}: {}",
                 info.ssid,
                 defmt::Display2Format(&failure),
-                info.reason,
             );
         }
         // Not a join at all, so there is no network name and no signal to report either: whatever the
-        // radio said is in the line below, and the state line says only that the attempt did not work
-        // and that this firmware has no name for why.
+        // radio said is in the line below, and the state line carries the driver's own shrug.
         other => {
             publish(Link::Failed(JoinFailure {
-                reason: Reason::Other,
+                reason: DisconnectReason::Unspecified,
                 signal: None,
             }));
 
             error!("could not join: {:?}", other);
         }
-    }
-}
-
-/// The cause, in as few words as the radio's fifty reasons allow.
-///
-/// Everything not named here is [`Reason::Other`]: the enum is `#[non_exhaustive]`, so a reason added
-/// upstream lands there rather than failing to build, and this is the place to teach the firmware a
-/// new one.
-fn named(reason: DisconnectReason) -> Reason {
-    match reason {
-        // Nothing answered with this name at all: the network is not there, the name is wrong, or the
-        // station is out of range. The scan printed after a failure is what tells those apart.
-        DisconnectReason::NoAccessPointFound
-        | DisconnectReason::NoAccessPointFoundInRssiThreshold
-        | DisconnectReason::BeaconTimeout => Reason::NoSuchNetwork,
-
-        // The network was heard and said no. A refused PSK is the usual answer, and a WPA3-only
-        // network is the other one worth suspecting before the password.
-        DisconnectReason::NoAccessPointFoundWithCompatibleSecurity
-        | DisconnectReason::NoAccessPointFoundInAuthmodeThreshold
-        | DisconnectReason::AuthenticationFailed
-        | DisconnectReason::MicFailure
-        | DisconnectReason::IeIn4wayDiffers
-        | DisconnectReason::_802_1xAuthenticationFailed
-        | DisconnectReason::CipherSuiteRejected
-        | DisconnectReason::BadCipherOrAkm => Reason::SecurityRefused,
-
-        // A handshake that started and stopped. This one was grouped with the refusals above, which
-        // made the firmware say the network rejected the password when the radio had reported only
-        // that the exchange ran out of time — seen on a board, at a signal too strong for range to
-        // explain, where the sentence was the one thing in the log that was certainly wrong. It has
-        // its own reason rather than joining the timeouts below because a stalled four-way handshake
-        // is the commonest symptom of a wrong password as well as of a station out of range, and
-        // either of those two sentences would send the reader to the wrong place.
-        DisconnectReason::FourWayHandshakeTimeout => Reason::HandshakeStalled,
-
-        // The exchange began and the other end went quiet. From the station's side this is what being
-        // too far away looks like: the beacons arrive, the handshake does not.
-        DisconnectReason::AuthenticationExpired
-        | DisconnectReason::HandshakeTimeout
-        | DisconnectReason::Timeout => Reason::NoAnswer,
-
-        // It was up, and then it was not.
-        DisconnectReason::DisassociatedDueToInactivity
-        | DisconnectReason::AuthenticationLeave
-        | DisconnectReason::AssociationLeave
-        | DisconnectReason::PeerInitiated
-        | DisconnectReason::AccessPointInitiatedDisassociation => Reason::LinkLost,
-
-        // The enum is `#[non_exhaustive]`: a reason this build has never heard of is reported rather
-        // than guessed at.
-        _ => Reason::Other,
     }
 }
 

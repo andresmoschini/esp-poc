@@ -20,7 +20,6 @@ use core::net::Ipv4Addr;
 
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsQueryType;
 use embassy_net::udp::{PacketMetadata, RecvError, UdpSocket};
 use embassy_net::{IpAddress, Stack};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
@@ -144,7 +143,7 @@ async fn keep_in_time(stack: Stack<'static>, mut socket: UdpSocket<'static>) {
                 clock::set(answer.epoch_secs, answer.stratum);
 
                 info!(
-                    "the clock is set to {} UTC by a stratum {} server",
+                    "the clock is set to {} by a stratum {} server",
                     defmt::Display2Format(&Clock::utc(answer.epoch_secs)),
                     answer.stratum,
                 );
@@ -224,22 +223,18 @@ async fn ask(
 }
 
 /// The address of [`SERVER`], once DHCP has given the resolver some to ask.
+///
+/// The lookup itself is [`crate::dns::resolve`], which this shares with `src/report.rs`; the mapping
+/// onto an [`Obstruction`] is here because only this client knows which of its failures a refusal is.
 async fn resolve(stack: &Stack<'static>) -> Result<Ipv4Addr, Obstruction> {
-    let found = match with_timeout(TIMEOUT, stack.dns_query(SERVER, DnsQueryType::A)).await {
-        Err(_) => return Err(Obstruction::LookupTimedOut),
-        Ok(Err(e)) => {
+    match crate::dns::resolve(stack, SERVER).await {
+        Ok(address) => Ok(address),
+        Err(crate::dns::Failure::TimedOut) => Err(Obstruction::LookupTimedOut),
+        Err(crate::dns::Failure::Refused(e)) => {
             error!("the name of the time server did not resolve: {:?}", e);
 
-            return Err(Obstruction::NoServer);
+            Err(Obstruction::NoServer)
         }
-        Ok(Ok(found)) => found,
-    };
-
-    // An A record is a question about IPv4 and this firmware has no other protocol to send over, so
-    // an answer that is empty or IPv6-only is not a name that did not exist: it is a name this
-    // cannot be reached at.
-    match found.first() {
-        Some(IpAddress::Ipv4(address)) => Ok(*address),
-        _ => Err(Obstruction::NoServer),
+        Err(crate::dns::Failure::NoIpv4) => Err(Obstruction::NoServer),
     }
 }

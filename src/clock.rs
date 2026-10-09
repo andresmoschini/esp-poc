@@ -20,8 +20,10 @@
 //! into a [`poc_report::Time`], and the wording and the arithmetic of that are in `poc-report` where
 //! a host can check them.
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
 use poc_report::{Obstruction, Time};
 
@@ -55,9 +57,13 @@ static ANSWERED_AT: AtomicU32 = AtomicU32::new(0);
 ///
 /// Kept here rather than in `src/ntp.rs` because the question it answers — why is the time still
 /// counting from boot — is about the clock, and because [`time`] reads it in the same breath as the
-/// rest. A word rather than the whole type, for the same reason and because [`Obstruction`] is
-/// published for exactly this: one value, written once per failed attempt, read until the next one.
-static OBSTRUCTED: AtomicU32 = AtomicU32::new(Obstruction::NONE);
+/// rest. `None` before the first attempt rather than an explanation of nothing having gone wrong.
+///
+/// A lock around the value rather than one atomic holding a word for it, for the same reason
+/// `src/wifi.rs` holds its state that way: on a chip with one core the lock is a brief critical
+/// section, and what it holds is the obstruction itself rather than an encoding of it.
+static OBSTRUCTED: Mutex<CriticalSectionRawMutex, RefCell<Option<Obstruction>>> =
+    Mutex::new(RefCell::new(None));
 
 /// Where the clock was last set, and how long ago.
 ///
@@ -96,7 +102,7 @@ pub fn set(epoch_secs: u64, stratum: u8) {
 
     // An answer clears the last failure: the reason there was no time was that the last attempt did
     // not produce one, and there is one now.
-    OBSTRUCTED.store(Obstruction::NONE, Ordering::Relaxed);
+    OBSTRUCTED.lock(|slot| *slot.borrow_mut() = None);
 
     ANSWERED.store(true, Ordering::Release);
 }
@@ -106,13 +112,14 @@ pub fn set(epoch_secs: u64, stratum: u8) {
 /// The reason is kept rather than only printed, because "why is this still counting from boot" is
 /// the question the greeting raises twice a second and the log answered only once.
 pub fn report_failure(obstruction: Obstruction) {
-    OBSTRUCTED.store(obstruction.to_word(), Ordering::Release);
+    OBSTRUCTED.lock(|slot| *slot.borrow_mut() = Some(obstruction));
 }
 
 /// What the firmware believes the time is, and why it believes it.
 ///
-/// This never waits and never fails: it is a handful of atomic loads and a subtraction, which is what
-/// lets the greeting call it twice a second without knowing anything about the network. What it
+/// This never waits and never fails: it is a handful of loads under brief critical sections and a
+/// subtraction, which is what lets the greeting call it twice a second without knowing anything
+/// about the network. What it
 /// cannot say is anything the four facts it reads do not add up to, which is the point — the shape of
 /// the answer says whether it is a time of day or a count from boot, and now also whether a server
 /// confirmed it recently enough to be believed.
@@ -149,7 +156,7 @@ fn source() -> Option<Source> {
 
 /// What stood between this chip and a time, the last time something did.
 fn last_obstruction() -> Option<Obstruction> {
-    Obstruction::from_word(OBSTRUCTED.load(Ordering::Acquire))
+    OBSTRUCTED.lock(|slot| *slot.borrow())
 }
 
 /// Seconds since the Unix epoch, as this chip's own count plus the offset of the last answer.

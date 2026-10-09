@@ -1,28 +1,28 @@
 //! What the firmware decides for itself, decided here so that something can check it.
 //!
-//! Seven decisions live in this crate, and every one of them is one the firmware would otherwise get
+//! Four decisions live in this crate, and every one of them is one the firmware would otherwise get
 //! subtly wrong and nobody would notice until it mattered:
 //!
 //! - How an address is written. The greeting in `src/bin/main.rs` and the report in `src/wifi.rs`
 //!   both print one, and they used to be two pieces of formatting that could drift apart.
-//! - What a failed join says. The radio names about fifty reasons, and printing its own words for
-//!   them answers the question "what did the hardware say" rather than the question an operator is
-//!   asking, which is what to do next.
-//! - What the radio is doing, and the word that state is published in. A link that is down is
-//!   something a reader of a serial log has to be told about, and it is something the radio knows
-//!   and the greeting does not.
 //! - How a time is written, from a count of seconds. Leap years and month lengths are arithmetic
 //!   that cannot be checked by looking at it, and this is the only part of the firmware that knows
 //!   what day it is.
 //! - What an SNTP packet means, and what an attempt to get one came to when it did not. A packet
 //!   off the network is untrusted input, and a 48-byte header of offsets is exactly the sort of
 //!   thing that is right in the common case and wrong in 2036.
-//! - What the line the firmware prints twice a second reads, and whether the time on it is real.
-//!   That line is the whole of what this repository says about itself to whoever is reading it, and
-//!   it was assembled from three `format!`s in a generated file.
-//! - What the body of a reported event looks like, and what an answer from the API means. The bytes
-//!   of an HTTP request are the same kind of thing as the bytes of an SNTP header: right in the
-//!   common case, wrong in the detail nobody reads, and impossible to check on a board.
+//! - What the body of a reported event looks like. The body is JSON written by hand: right in the
+//!   common case, wrong in the detail nobody reads, and impossible to check on a board. What an
+//!   answer from the API means is deliberately not here — a status code is reported as the number
+//!   it is, because a mapping from numbers to sentences goes stale the day a status changes what
+//!   it means. **The HTTP framing around both is not here** — `edge-http` writes the request and
+//!   parses the reply in `src/report.rs`, and what is logged there is a status code and a body
+//!   rather than a buffer to parse.
+//!
+//! What the radio is doing is deliberately not here either: the reason a join failed is the driver's
+//! own words, carried as-is in `src/wifi.rs`, and the state line as a whole is assembled in
+//! `src/status.rs`. Both need the radio or the network stack, so neither can be compiled for a host
+//! at all — and a test on them needs a board.
 //!
 //! It is a crate of its own because this is the only part of the firmware that can be tested at all.
 //! `src/wifi.rs`, `src/clock.rs`, `src/ntp.rs`, `src/status.rs` and `src/bin/main.rs` all depend on
@@ -32,9 +32,9 @@
 //! and for the host alike, and `tests/report.rs`, `tests/status.rs` and `tests/ntp.rs` run on
 //! whichever machine is running the gate.
 //!
-//! It knows nothing about Wi-Fi or about the network stack. `esp_radio::wifi::DisconnectReason` is
-//! translated into a [`Reason`] in `src/wifi.rs`, and an SNTP packet is read in the firmware and
-//! handed here as bytes, so that a change in either driver costs that one file rather than this
+//! It knows nothing about Wi-Fi or about the network stack. A failed join carries the driver's own
+//! `esp_radio::wifi::DisconnectReason` in `src/wifi.rs`, and an SNTP packet is read in the firmware
+//! and handed here as bytes, so that a change in either driver costs that one file rather than this
 //! crate's API.
 
 #![no_std]
@@ -62,309 +62,6 @@ impl fmt::Display for Address {
     }
 }
 
-/// Why joining a network did not work, in as few words as the radio allows.
-///
-/// The four cases below are the ones that want four different things done about them; everything else
-/// the radio can report is [`Reason::Other`], which is a deliberate admission rather than a guess.
-/// A wrong guess here is worse than a missing one, because it sends whoever is reading the serial
-/// output after the wrong problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// Nothing with that name was heard.
-    ///
-    /// One of three things: the name is wrong, the network is not there, or the station is too far
-    /// from it to be answered. The scan printed alongside this failure is what tells those apart.
-    NoSuchNetwork,
-
-    /// The network was heard and refused how this station asked to join it.
-    ///
-    /// In practice the password, or a security type that WPA2 does not cover.
-    SecurityRefused,
-
-    /// The exchange started and the other end stopped answering.
-    ///
-    /// This is what a station too far from its access point looks like from its own side: strong
-    /// enough to hear a beacon, too weak to finish a handshake.
-    NoAnswer,
-
-    /// The handshake began and did not finish, and the radio does not say why.
-    ///
-    /// Its own variant rather than one of the two above because both of them would be a claim the
-    /// radio did not make. A four-way handshake that times out is the commonest symptom of a wrong
-    /// password, and it is also what a station just out of range looks like; `SecurityRefused` says
-    /// the network refused, and `NoAnswer` says it went away, and a timeout establishes neither. What
-    /// the radio reported is that the exchange started and stopped, so that is what this says.
-    ///
-    /// Observed on a board rather than reasoned about: an ESP32-C6 that never joined logged
-    /// `FourWayHandshakeTimeout` at -55 dBm, which is a strong signal and not a refused password.
-    HandshakeStalled,
-
-    /// The link came up and then went down.
-    LinkLost,
-
-    /// The radio reported something this firmware does not name.
-    Other,
-}
-
-impl fmt::Display for Reason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(write_reason(*self))
-    }
-}
-
-/// A join that failed, with the signal the radio last measured.
-///
-/// Named for the join rather than just "a failure", because [`Obstruction`] is the other failure in
-/// this crate and `Failure` alone stopped saying which of the two a use was talking about.
-///
-/// The signal is there because the two failures that look identical in the radio's own words are not
-/// identical to fix: a wrong password and a station too far away both arrive as an exchange that
-/// stops, and the dBm reading is what separates them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JoinFailure {
-    /// What went wrong.
-    pub reason: Reason,
-
-    /// How strong the signal was, in dBm, when the radio measured one.
-    pub signal: Option<i8>,
-}
-
-impl fmt::Display for JoinFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.signal {
-            Some(dbm) => write!(f, "{} (signal {dbm} dBm)", self.reason),
-            None => fmt::Display::fmt(&self.reason, f),
-        }
-    }
-}
-
-/// The sentence for a reason, on its own.
-///
-/// It is a function rather than an arm of the `Display` above so that adding a case to the enum stays
-/// one edit: [`JoinFailure`] reaches it for the arm that has no signal to add, and a match written
-/// twice is a match that gets changed in one of the two places.
-fn write_reason(reason: Reason) -> &'static str {
-    match reason {
-        Reason::NoSuchNetwork => "nothing with that name was heard",
-        Reason::SecurityRefused => "the network refused these credentials",
-        Reason::NoAnswer => "the network stopped answering partway through",
-        Reason::HandshakeStalled => "the handshake started and did not finish",
-        Reason::LinkLost => "the link came up and then went down",
-        Reason::Other => "the radio reported a reason this firmware does not name",
-    }
-}
-
-/// What the radio is doing, and — when it is not doing what it should — why.
-///
-/// A state rather than a sequence of log lines because a log is read long after the event. A line
-/// saying it could not join helps only whoever is watching when it happens; a line that still says
-/// so twice a second is what someone reading the log from the top finds, and to them the two are the
-/// same thing.
-///
-/// The states are separate rather than one "not connected" because each wants a different thing done
-/// about it: fill in the credentials, fix a credential, replace the board, or go and look for the
-/// network and how loudly it can be heard from here.
-///
-/// `src/wifi.rs` publishes this and `src/status.rs` reads it. It is a published value rather than a
-/// return value because the radio runs in its own task and the greeting runs in the main one, and
-/// nothing either of them waits for the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Link {
-    /// There was never a network to join, because no `SSID` was compiled in.
-    ///
-    /// The normal state of the gate and of CI, and the state a build made before `.cargo/local.toml`
-    /// was filled in is in. Nothing is wrong with the hardware, which is what makes this worth
-    /// distinguishing from every other state here.
-    NoNetwork,
-
-    /// There was a network to join and the radio would not take one of its credentials.
-    ///
-    /// Both values are compiled in, so this is a mistake in the file the firmware was built from
-    /// rather than anything that can happen on a board.
-    UnusableCredential,
-
-    /// The radio would not start at all, which is neither a network problem nor a credentials one.
-    NoRadio,
-
-    /// An attempt is in progress, or one is due.
-    Joining,
-
-    /// The station is on the network.
-    Joined,
-
-    /// The last attempt did not work, and this is what it said.
-    Failed(JoinFailure),
-
-    /// A word this build of the firmware did not write.
-    ///
-    /// Not reachable from this crate — it is what [`Link::from_word`] answers for a word whose tag
-    /// names no state here, which is the honest reading of a value another build published with a
-    /// different idea of the layout. An explicit variant rather than an `Option` so that the reader
-    /// of the greeting, which runs twice a second, has nothing to do about it either.
-    Unknown,
-}
-
-impl fmt::Display for Link {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // The same three words on the three states with no network in them, because what they
-            // have in common is what a reader has to act on first: there is nothing to wait for.
-            Self::NoNetwork => f.write_str("nothing to join: no credentials were compiled in"),
-            Self::UnusableCredential => f.write_str(
-                "nothing to join: a compiled-in credential is not one the radio can use",
-            ),
-            Self::NoRadio => f.write_str("nothing to join: the radio did not start"),
-            Self::Joining => f.write_str("joining"),
-            Self::Joined => f.write_str("joined"),
-            Self::Failed(failure) => write!(f, "not joined: {failure}"),
-            Self::Unknown => f.write_str("in a state this firmware does not name"),
-        }
-    }
-}
-
-/// The word each state is published as.
-///
-/// Written down rather than derived from the order of the variants, because a word is a thing that
-/// two builds of this firmware have to agree about and `as u8` would make that agreement a property
-/// of an enum that anyone may reorder. `Unknown` is last and not `6`, so that the tags a build does
-/// not recognize are the ones in the middle.
-const TAG_NO_NETWORK: u8 = 0;
-const TAG_UNUSABLE: u8 = 1;
-const TAG_NO_RADIO: u8 = 2;
-const TAG_JOINING: u8 = 3;
-const TAG_JOINED: u8 = 4;
-const TAG_FAILED: u8 = 5;
-const TAG_UNKNOWN: u8 = 255;
-
-/// The byte saying that the one beside it is a measurement rather than an absence.
-///
-/// `0 dBm` and "no reading at all" are the same byte and not the same claim, and the radio is willing
-/// to report one as though it were the other — `src/wifi.rs` maps its "no reading" of -128 to `None`
-/// — so the presence of the reading is a byte of its own rather than a value the byte cannot hold.
-const SIGNAL_MEASURED: u8 = 1;
-
-/// The byte that says the signal beside it is not a reading.
-const SIGNAL_NONE: u8 = 0;
-
-impl Link {
-    /// The four bytes this state is published as, lowest first.
-    const fn bytes(self) -> [u8; 4] {
-        match self {
-            Self::NoNetwork => [TAG_NO_NETWORK, 0, 0, 0],
-            Self::UnusableCredential => [TAG_UNUSABLE, 0, 0, 0],
-            Self::NoRadio => [TAG_NO_RADIO, 0, 0, 0],
-            Self::Joining => [TAG_JOINING, 0, 0, 0],
-            Self::Joined => [TAG_JOINED, 0, 0, 0],
-            Self::Unknown => [TAG_UNKNOWN, 0, 0, 0],
-            Self::Failed(JoinFailure { reason, signal }) => {
-                let [measured, reading] = signal_bytes(signal);
-
-                [TAG_FAILED, reason_byte(reason), reading, measured]
-            }
-        }
-    }
-
-    /// The word this state is published as, for [`Self::from_word`] to read back.
-    ///
-    /// One word rather than several held in a fixed order, because several is more than one write
-    /// and an ordering argument between them — one that a reader from another task can only get
-    /// right by trusting the order two writers happened to use. A single word cannot be half
-    /// written.
-    ///
-    /// `const` because the static in `src/wifi.rs` that holds it has to be initialized by one.
-    #[must_use]
-    pub const fn to_word(self) -> u32 {
-        u32::from_le_bytes(self.bytes())
-    }
-
-    /// The state a published word stands for.
-    ///
-    /// Total rather than an `Option`: the greeting reads this twice a second, and a value it has to
-    /// match on before it can print anything is a place for a match to be wrong. Every tag no build
-    /// of this firmware writes — including [`Link::Unknown`]'s own — reads as [`Link::Unknown`],
-    /// which is the sentence for a word that means nothing here.
-    #[must_use]
-    pub fn from_word(word: u32) -> Self {
-        let [tag, reason, reading, measured] = word.to_le_bytes();
-
-        match tag {
-            TAG_FAILED => Self::Failed(JoinFailure {
-                reason: reason_from_byte(reason),
-                signal: signal_from_byte([measured, reading]),
-            }),
-            TAG_NO_NETWORK => Self::NoNetwork,
-            TAG_UNUSABLE => Self::UnusableCredential,
-            TAG_NO_RADIO => Self::NoRadio,
-            TAG_JOINING => Self::Joining,
-            TAG_JOINED => Self::Joined,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-/// The presence of a signal and the signal itself, as the two bytes they are published as.
-///
-/// The reading is read out of its own bytes rather than cast: `clippy::cast_sign_loss` is on, it is
-/// right about what the cast does, and an `i8` and the `u8` holding the same eight bits are the same
-/// number — there is no sign here to lose, only a number that happens to be negative.
-const fn signal_bytes(signal: Option<i8>) -> [u8; 2] {
-    match signal {
-        Some(dbm) => {
-            let [byte] = dbm.to_le_bytes();
-
-            [SIGNAL_MEASURED, byte]
-        }
-        None => [SIGNAL_NONE, 0],
-    }
-}
-
-/// The signal two published bytes stand for, or `None` when the first says there is none.
-const fn signal_from_byte(bytes: [u8; 2]) -> Option<i8> {
-    match bytes[0] {
-        SIGNAL_MEASURED => {
-            let [byte] = bytes[1].to_le_bytes();
-
-            Some(i8::from_le_bytes([byte]))
-        }
-        _ => None,
-    }
-}
-
-/// The byte a reason is published as.
-///
-/// A match rather than `as u8` for the reason given on [`TAG_NO_NETWORK`]: this is a wire format, and
-/// a match is something a reader can check against the enum it encodes without knowing Rust.
-const fn reason_byte(reason: Reason) -> u8 {
-    match reason {
-        Reason::NoSuchNetwork => 0,
-        Reason::SecurityRefused => 1,
-        Reason::NoAnswer => 2,
-        // 3 and 4 are the two this one was added between: `LinkLost` and `Other` keep the bytes they
-        // had. Both are within one firmware build, so renumbering them would change nothing the gate
-        // can see — and a published word that means something else after an edit is not worth the
-        // tidiness of consecutive numbers.
-        Reason::HandshakeStalled => 5,
-        Reason::LinkLost => 3,
-        Reason::Other => 4,
-    }
-}
-
-/// The reason a published byte stands for.
-///
-/// A byte no build of this firmware writes reads as [`Reason::Other`], which is the sentence the
-/// enum already has for a reason this firmware does not name — and which is what
-/// `src/wifi.rs` publishes for a reason added upstream, since the two are the same case.
-const fn reason_from_byte(byte: u8) -> Reason {
-    match byte {
-        0 => Reason::NoSuchNetwork,
-        1 => Reason::SecurityRefused,
-        2 => Reason::NoAnswer,
-        3 => Reason::LinkLost,
-        5 => Reason::HandshakeStalled,
-        _ => Reason::Other,
-    }
-}
-
 /// Seconds in a day, which is as far as [`Clock::SinceBoot`] goes before it starts again.
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
@@ -374,7 +71,8 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// battery-backed clock on this chip, so [`Self::SinceBoot`] is the only reading it can make on its
 /// own: the scheduler's counter, which starts at zero when the firmware starts. A real time has to
 /// come from the network, and until one has arrived the two are told apart by their shape rather
-/// than by anything else, which is why [`Self::Utc`] prints a date and this one does not.
+/// than by anything else, which is why [`Self::Utc`] prints a date and time and this one a
+/// time of day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clock {
     /// How long the chip has been running, wrapped into a day.
@@ -384,12 +82,14 @@ pub enum Clock {
     /// rather than counting hours forever so that it cannot be mistaken for a clock that stopped.
     SinceBoot(u64),
 
-    /// A time of day in UTC, as a count of seconds since the Unix epoch.
+    /// A time in UTC, as a count of seconds since the Unix epoch.
     ///
     /// UTC and nothing else: this is what a network time source hands out, and a reading that
     /// disagrees with it by a timezone has been adjusted by somebody, which is not this crate's
     /// business. The count is unsigned because a time before 1970 is not a time this can print,
     /// and an SNTP server that reports one is refused rather than rendered — see [`sntp_reply`].
+    /// Printed as RFC 3339, the same rendering as [`Timestamp`]: the greeting that carries it is
+    /// read twice a second, and one shared shape is one less thing for a reader to learn.
     Utc(u64),
 }
 
@@ -420,17 +120,9 @@ impl fmt::Display for Clock {
 
                 write!(f, "{hours:02}:{minutes:02}:{seconds:02}")
             }
-            // A date as well as a time: a clock that cannot say which day the hours belong to is
-            // half a clock, and the date is the part that catches a reading that is a century out.
-            Self::Utc(epoch_secs) => {
-                let civil = civil(*epoch_secs);
-
-                write!(
-                    f,
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
-                )
-            }
+            // RFC 3339, shared with [`Timestamp`]: one calendar rendering for the greeting and
+            // the reported event, so a line on the serial log reads the same as its row.
+            Self::Utc(epoch_secs) => write!(f, "{}", Timestamp::at(*epoch_secs)),
         }
     }
 }
@@ -459,7 +151,8 @@ struct Civil {
 ///
 /// It is here rather than in the firmware because it is arithmetic that cannot be checked by
 /// looking at it. Month lengths and leap years are exactly the sort of thing that is right in the
-/// common cases and wrong in February, and `tests/report.rs` pins the ends of each of them.
+/// common cases and wrong in February, and `tests/report_api.rs` pins the ends of each of them
+/// through [`Timestamp`], which is also the rendering [`Clock::Utc`] shares.
 fn civil(epoch_secs: u64) -> Civil {
     let seconds_of_day = epoch_secs % SECONDS_PER_DAY;
 
@@ -763,9 +456,9 @@ pub fn sntp_reply(packet: &[u8], nonce: u32) -> Result<Answer, Refusal> {
 /// between a name that does not resolve and a server that does not answer, and those want opposite
 /// fixes — the first is a DNS or a network problem, the second is a server or a firewall.
 ///
-/// Published as a word by [`Self::to_word`] and read back by [`Self::from_word`], for the same
-/// reason [`Link`] is: the task that asks a server and the task that keeps the clock are different
-/// tasks, and what the first one learned has to reach the second one.
+/// Published as the value itself for the task that keeps the clock to read: what the one attempt
+/// that failed came to, written once per attempt and read until the next one. `None` before the
+/// first attempt rather than an explanation of nothing having gone wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Obstruction {
     /// The server's name did not resolve before the exchange gave up on it.
@@ -813,98 +506,6 @@ impl fmt::Display for Obstruction {
             Self::TooLong => f.write_str("the reply was larger than the receive buffer"),
             Self::Refused(refused) => write!(f, "{refused}"),
         }
-    }
-}
-
-impl Obstruction {
-    /// The word for "no attempt has failed", which is the state a chip boots in.
-    ///
-    /// Zero because it is not an obstruction to anything, and it is also what
-    /// [`Self::from_word`] answers for a word no build of this firmware writes: before the first
-    /// attempt, and something this build cannot describe, are both "nothing has gone wrong that this
-    /// firmware has words for".
-    pub const NONE: u32 = 0;
-
-    /// The four bytes this is published as, lowest first.
-    ///
-    /// The tag is a number written down rather than derived from the order of the variants, for the
-    /// same reason [`TAG_NO_NETWORK`] is: this is a wire format, and a match that can be read
-    /// against the enum it encodes is worth more here than the few lines a derived number saves.
-    /// Only [`Self::Refused`] puts anything in the second byte, and it is a [`Refusal`] whole rather
-    /// than a name for one, because the refusal is eight sentences and each of them is the answer to
-    /// a different thing a server can do wrong.
-    const fn bytes(self) -> [u8; 4] {
-        match self {
-            Self::LookupTimedOut => [1, 0, 0, 0],
-            Self::RequestTimedOut => [2, 0, 0, 0],
-            Self::AnswerTimedOut => [3, 0, 0, 0],
-            Self::NoServer => [4, 0, 0, 0],
-            Self::Stranger => [5, 0, 0, 0],
-            Self::WouldNotSend => [6, 0, 0, 0],
-            Self::TooLong => [7, 0, 0, 0],
-            Self::Refused(refusal) => [8, refusal_byte(refusal), 0, 0],
-        }
-    }
-
-    /// The word this is published as, for [`Self::from_word`] to read back.
-    ///
-    /// `const` because the static in `src/clock.rs` that holds it has to be initialized by one.
-    #[must_use]
-    pub const fn to_word(self) -> u32 {
-        u32::from_le_bytes(self.bytes())
-    }
-
-    /// The obstruction a published word stands for, or `None` for [`Self::NONE`] and for a word no
-    /// build of this firmware writes.
-    #[must_use]
-    pub fn from_word(word: u32) -> Option<Self> {
-        let [tag, refused, _, _] = word.to_le_bytes();
-
-        match tag {
-            1 => Some(Self::LookupTimedOut),
-            2 => Some(Self::RequestTimedOut),
-            3 => Some(Self::AnswerTimedOut),
-            4 => Some(Self::NoServer),
-            5 => Some(Self::Stranger),
-            6 => Some(Self::WouldNotSend),
-            7 => Some(Self::TooLong),
-            8 => Some(Self::Refused(refusal_from_byte(refused))),
-            _ => None,
-        }
-    }
-}
-
-/// The byte a refusal is published as.
-const fn refusal_byte(refusal: Refusal) -> u8 {
-    match refusal {
-        Refusal::Short => 0,
-        Refusal::NotAReply => 1,
-        Refusal::Version => 2,
-        Refusal::KissOfDeath => 3,
-        Refusal::NotAServer => 4,
-        Refusal::Unsynchronized => 5,
-        Refusal::NotOurs => 6,
-        Refusal::NoTime => 7,
-        Refusal::BeforeTheEpoch => 8,
-    }
-}
-
-/// The refusal a published byte stands for.
-///
-/// A byte no build of this firmware writes reads as [`Refusal::Short`], which is the one refusal that
-/// is a fact about the packet rather than about its contents, and the one whose sentence describes
-/// something that could not be read at all.
-const fn refusal_from_byte(byte: u8) -> Refusal {
-    match byte {
-        0 => Refusal::Short,
-        1 => Refusal::NotAReply,
-        2 => Refusal::Version,
-        3 => Refusal::KissOfDeath,
-        4 => Refusal::NotAServer,
-        5 => Refusal::Unsynchronized,
-        6 => Refusal::NotOurs,
-        7 => Refusal::NoTime,
-        _ => Refusal::BeforeTheEpoch,
     }
 }
 
@@ -1000,7 +601,7 @@ impl fmt::Display for Time {
             } => {
                 write!(
                     f,
-                    "{} UTC (from a stratum {stratum} server",
+                    "{} (from a stratum {stratum} server",
                     Clock::utc(*epoch_secs)
                 )?;
 
@@ -1016,17 +617,16 @@ impl fmt::Display for Time {
     }
 }
 
-/// How long something took, in as few words as say it: "45 seconds", "3 minutes", "1 hour 5 minutes".
+/// How long something took, in seconds.
 ///
-/// The two largest units that are not zero, and no more than two, because this goes at the end of a
-/// line that already has a date on it and a third unit is a precision nobody acts on — an hour is
-/// either enough to go and look at the radio or it is not.
+/// A bare count rather than words: "3661s" instead of "1 hour 1 minute". Two units with
+/// singulars and plurals is a precision nobody acts on at the end of a line that already has a
+/// date on it, and a count is nothing to test beyond the number.
 ///
 /// Public, and returning something that formats rather than a `String`, for one reason: this is a
-/// decision — which units, how many, singular or plural — and a decision made in a private function
-/// is a decision nothing checks. The choice of units is the same one the calendar in [`Clock`] makes
-/// and is tested in the same place for the same reason. A `String` would have needed an allocator,
-/// which this crate does not have and does not need for two numbers and two words.
+/// decision — seconds, always — and a decision made in a private function is a decision nothing
+/// checks. A `String` would have needed an allocator, which this crate does not have and does not
+/// need for one number and one letter.
 #[must_use]
 pub fn age(secs: u64) -> impl fmt::Display {
     Age(secs)
@@ -1037,89 +637,7 @@ struct Age(u64);
 
 impl fmt::Display for Age {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        /// The units of an age, largest first: the first two that are not zero are the two written.
-        const UNITS: [(u64, &str); 4] = [
-            (24 * 60 * 60, "day"),
-            (60 * 60, "hour"),
-            (60, "minute"),
-            (1, "second"),
-        ];
-
-        let mut secs = self.0;
-        let mut said = 0;
-
-        for (size, name) in UNITS {
-            let count = secs / size;
-
-            // The remainder is carried into the next unit rather than dropped, because the units
-            // below are the ones that share it: 1 hour 5 minutes is not 1 hour and 65 minutes.
-            secs -= count * size;
-
-            if count == 0 {
-                continue;
-            }
-
-            if said == 2 {
-                break;
-            }
-
-            if said > 0 {
-                f.write_str(" ")?;
-            }
-
-            write!(f, "{count} {name}{}", plural(count))?;
-            said += 1;
-        }
-
-        // Only an age of nothing reaches this, which nothing calls [`age`] with today. It is here
-        // rather than left to write nothing, because a sentence with a hole in the middle of it is
-        // worse than one that says zero.
-        if said == 0 {
-            return f.write_str("0 seconds");
-        }
-
-        Ok(())
-    }
-}
-
-/// The `s` on the end of a unit of time, for the counts that need one.
-const fn plural(count: u64) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
-
-/// Everything the firmware knows about itself, right now, as the line it prints.
-///
-/// The order is the decision as much as the wording is: the time first, because a reader who came to
-/// see what time it is has their answer in the first field and can stop reading; then the address,
-/// which is the next thing they want; and the state of the two mechanisms last, because that is what
-/// they read when one of the first two is wrong, and by then they are looking for it.
-///
-/// A struct rather than three format arguments because these three come from three tasks, and three
-/// arguments assembled in the greeting is three places for the log and the state to disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Status {
-    /// Where the time came from, and whether it can still be believed.
-    pub time: Time,
-
-    /// What the radio is doing, and why.
-    pub link: Link,
-
-    /// The address, or `None` while DHCP has not produced one.
-    pub address: Option<Address>,
-}
-
-impl fmt::Display for Status {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, ", self.time)?;
-
-        match self.address {
-            Some(address) => write!(f, "{address}, ")?,
-            // Said rather than left out, because a missing clause reads as a formatting mistake and
-            // the state of the radio is the answer to it.
-            None => f.write_str("no address yet, ")?,
-        }
-
-        write!(f, "wifi: {}", self.link)
+        write!(f, "{}s", self.0)
     }
 }
 
@@ -1168,93 +686,53 @@ pub struct Event<'a> {
     /// What kind of event this is, which is [`EVENT_TELEMETRY`] for everything this firmware sends.
     pub event_type: &'a str,
 
-    /// The state line, as [`crate::Status`] renders it.
+    /// The state line, rendered by `src/status.rs`.
     ///
     /// The whole sentence rather than the three fields behind it, so that what is stored is what the
     /// chip would have printed at that moment. Three fields in a payload would be a second way of
     /// writing the same line, and the two would drift.
-    pub status: &'a Status,
+    pub payload: &'a str,
 }
 
 impl fmt::Display for Event<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Written through a helper because a JSON string has one rule — a quote ends it — and four
-        // places where getting it wrong produces something the server parses as a different document
-        // rather than as an error. The status line is the only field here that could contain one: it
-        // is a sentence this crate wrote, and a sentence that grows a quote is a bug worth a failing
-        // test rather than a corrupt row in somebody's database.
+        // Every field below stays inside plain printable text with no quotes in it, which is the
+        // one rule a JSON string has — a quote ends it. The id is hex from `src/report.rs`, the
+        // timestamp is digits and fixed punctuation, the event type is a constant, and the payload
+        // is a state line whose alphabet a test pins. A field that grows a quote fails that test
+        // rather than corrupting a row in somebody's database.
         write!(
             f,
             "{{\"device_id\":{},\"timestamp\":\"{}\",\"event_type\":{},\"payload\":{}}}",
             Quoted(&self.device_id),
             Timestamp::at(self.timestamp_secs),
             Quoted(&self.event_type),
-            Quoted(self.status),
+            Quoted(&self.payload),
         )
     }
 }
 
-/// A value inside a JSON string, quoted and with the characters that would end it escaped.
+/// A value inside a JSON string, quoted and nothing else.
 ///
-/// A `Display` rather than an `as_str`-and-paste so that escaping cannot be forgotten at one of the
-/// call sites: the places above call this, and nothing else in this crate builds a JSON string by
-/// hand. Over any `Display` rather than over `&str` because the payload is a [`Status`] — a sentence
+/// No escaping, because there is nothing to escape: every sentence this crate can put in a body is
+/// pinned by a test to hold no `"`, no `\` and nothing below `U+0020`, and the id and the event
+/// type are a hex string and a constant. Quoting stays a wrapper rather than an `as_str`-and-paste
+/// so that it cannot be forgotten at one of the call sites: the places above call this, and
+/// nothing else in this crate builds a JSON string by hand.
+///
+/// Over any `Display` rather than over `&str` because the payload is a [`Status`] — a sentence
 /// this crate formats — and there is no allocator here to turn a formatted value into a `&str`.
-///
-/// `\` before `"` because JSON strings are what an escape is *for*, and a body with an unescaped
-/// quote in it is a body the server rejects with a 400 rather than one it stores wrong. The control
-/// characters are escaped as `\uXXXX` rather than left alone: JSON forbids them raw, and a status
-/// line that grows one is a status line the API would refuse.
 struct Quoted<'a>(&'a dyn fmt::Display);
 
 impl fmt::Display for Quoted<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The two quotes go straight to the formatter rather than through the escaping below, which
-        // would escape them: they are the delimiters, and the thing being quoted is what goes
-        // between them.
+        // The two quotes are the delimiters, and the thing being quoted is what goes between them.
         //
         // Written this way rather than into a `String` that is then quoted, because this crate has no
-        // allocator: escaping has to happen as the characters are produced.
+        // allocator: the value is formatted straight into the body.
         f.write_char('"')?;
-
-        {
-            let mut escaping = Escaping { inner: f };
-
-            write!(escaping, "{}", self.0)?;
-        }
-
+        write!(f, "{}", self.0)?;
         f.write_char('"')
-    }
-}
-
-/// A [`fmt::Write`] that escapes what is written to it before it reaches the writer underneath.
-///
-/// There rather than as a `String` because the value being escaped is formatted, not borrowed: a
-/// [`Status`] becomes its sentence through `fmt`, and the only place the sentence exists before the
-/// bytes go out is here.
-struct Escaping<'a, 'b> {
-    /// Where the escaped characters go.
-    inner: &'a mut fmt::Formatter<'b>,
-}
-
-impl fmt::Write for Escaping<'_, '_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for character in text.chars() {
-            match character {
-                '"' => self.inner.write_str("\\\"")?,
-                '\\' => self.inner.write_str("\\\\")?,
-                '\n' => self.inner.write_str("\\n")?,
-                '\r' => self.inner.write_str("\\r")?,
-                '\t' => self.inner.write_str("\\t")?,
-                // The rest of the control characters, as JSON spells them: `\u0000` and a name for
-                // each of the twenty or so that are not printable. JSON has no name for a null or a
-                // bell, so the number is the only spelling available.
-                control if control < ' ' => write!(self.inner, "\\u{:04x}", u32::from(control))?,
-                other => self.inner.write_char(other)?,
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -1291,92 +769,6 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// What a reply from the API is: the number it said, what that means, and the body it said it in.
-///
-/// One type rather than a bare [`Verdict`] because the three are three answers to one parse and the
-/// caller wants all three. The status code is the most concrete fact a reply carries and a verdict
-/// alone throws it away for every case it has a name for; the body is the API's own explanation, and
-/// on a 400 it is the only thing that says *which* field was wrong.
-///
-/// The bytes are borrowed, not decoded: nothing here parses the body. Deciding is [`Verdict`]'s job
-/// and the status line is enough for it, but logging is a different question, and for logging the
-/// body is text a person reads. See [`logged`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reply<'a> {
-    /// The three digits of the status code, or `None` when the first line was not a status line.
-    status: Option<u16>,
-
-    /// What the status line means.
-    verdict: Verdict,
-
-    /// Everything after the first blank line, which is where a body is.
-    body: &'a [u8],
-}
-
-impl<'a> Reply<'a> {
-    /// A reply, from the bytes that have arrived.
-    ///
-    /// Takes the whole buffer rather than a line, because deciding where the status line ends is this
-    /// function's job: a reply arrives in as many reads as the network decides, and the caller cannot
-    /// pass it a line it has not finished collecting. See [`status_line_arrived`].
-    #[must_use]
-    pub fn from_bytes(bytes: &'a [u8]) -> Self {
-        let Some(line) = first_line(bytes) else {
-            return Self {
-                status: None,
-                verdict: Verdict::NothingCameBack,
-                body: &[],
-            };
-        };
-
-        let status = status_code(line);
-
-        // The body is what follows the first blank line, and an empty slice when there is not one —
-        // a 401 with no body and a 401 whose body has not arrived yet are the same thing to log, and
-        // both are better described by what the status line says than by a guess about the framing.
-        let body = bytes
-            .windows(4)
-            .position(|blank| blank == b"\r\n\r\n")
-            .map_or(&[][..], |blank| &bytes[blank + 4..]);
-
-        Self {
-            status,
-            verdict: match status {
-                Some(201) => Verdict::Stored,
-                Some(400) => Verdict::Malformed,
-                Some(401) => Verdict::Unauthorized,
-                Some(405) => Verdict::NotAllowed,
-                Some(other) => Verdict::Unexpected(other),
-                None => Verdict::NotTheApi,
-            },
-            body,
-        }
-    }
-
-    /// What the reply meant, in words.
-    #[must_use]
-    pub fn verdict(&self) -> Verdict {
-        self.verdict
-    }
-
-    /// The status code, or `None` when the first line was not a status line.
-    ///
-    /// `Option` and not a number, because a reply that is not HTTP has no status and inventing one —
-    /// a zero, say — is exactly the guess this module exists to refuse. A reader of a log that sees
-    /// no number is being told the truth; one that sees `0` would go and read the API's
-    /// documentation about status zero.
-    #[must_use]
-    pub fn status(&self) -> Option<u16> {
-        self.status
-    }
-
-    /// The bytes after the headers, for [`logged`].
-    #[must_use]
-    pub fn body(&self) -> &'a [u8] {
-        self.body
-    }
-}
-
 /// How many bytes of a body [`logged`] will write.
 ///
 /// 120, which is more than any message this API sends — its longest is `{"error":"Unauthorized"}` at
@@ -1387,19 +779,14 @@ pub const LOGGED_LEN: usize = 120;
 
 /// The bytes of a body as something safe to write into a serial log.
 ///
-/// Bytes off the network cannot go into a log as they are, and this is the reason:
-///
-/// - **They may not be text.** `{"error":"Unauthorized"}` is, and a truncated read in the middle of a
-///   multi-byte character is not. There is no `Display` or `defmt::Format` for `[u8]`, and guessing
-///   UTF-8 would mean either a lossy conversion nobody asked for or a panic on a network task.
-/// - **They may contain control characters.** A reply is untrusted input and a `0x00` or an escape
-///   sequence in a serial log garbles the terminal of whoever is reading it, which destroys the very
-///   output the line exists to produce. Anything unprintable is written as `·`.
-///
-/// Truncated at [`LOGGED_LEN`] and marked when it is, so that a cut-off body does not read as a
+/// Bytes off the network cannot go into a log as they are: they may not be text at all, and a
+/// `0x00` or an escape sequence in a serial log garbles the terminal of whoever is reading it,
+/// which destroys the very output the line exists to produce. So a body that is not UTF-8 is not
+/// rendered — it is counted — and one that is has its control characters blanked, is cut at
+/// [`LOGGED_LEN`], and is marked when it is cut, so that a truncated body does not read as a
 /// complete one.
 ///
-/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the escaping
+/// A `Display` rather than a `String` for the reason [`age`] gives: the truncation and the counting
 /// are decisions, and a decision made in a private function returning a `String` would be one this
 /// crate has no allocator to make.
 #[must_use]
@@ -1416,230 +803,27 @@ impl fmt::Display for Logged<'_> {
             return f.write_str("(no body)");
         }
 
-        let cut = self.0.len().min(LOGGED_LEN);
+        let Ok(text) = core::str::from_utf8(self.0) else {
+            return write!(f, "({} non-utf8 bytes)", self.0.len());
+        };
 
-        for byte in &self.0[..cut] {
-            match byte {
-                // Printable ASCII and nothing else. Above 0x7e is a decision too: a UTF-8 body would
-                // be valid text but there is no way to know that from one byte, and a byte rendered
-                // on its own is at best a replacement character. So this is honest about what it has.
-                0x20..=0x7e => f.write_char(char::from(*byte))?,
-                _ => f.write_str("·")?,
-            }
+        let mut cut = text.len().min(LOGGED_LEN);
+
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
         }
 
-        if self.0.len() > LOGGED_LEN {
+        for c in text[..cut].chars() {
+            // A newline in a body would split the log line it is printed on, and an escape would
+            // reach the reader's terminal. Bodies from this API are JSON without either, so
+            // blanking is a guard rather than a rendering.
+            f.write_char(if c.is_control() { ' ' } else { c })?;
+        }
+
+        if text.len() > LOGGED_LEN {
             f.write_str("…")?;
         }
 
         Ok(())
-    }
-}
-
-/// What a status line from the API means.
-///
-/// The number is not in here: it is in [`Reply`], because a name for a case and the code that named
-/// it are two different things and a reader of a log wants both. What is here is what to do about
-/// it — a 401 here means one specific thing, which is that the request went out with no credentials
-/// on it, and it is going to keep meaning that until a token is added.
-///
-/// Total rather than an `Option`: the caller prints this either way, and a value it has to handle
-/// before it can say anything is a place for the handling to be forgotten. Every variant has a
-/// sentence, because the sentence is what ends up in the serial log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// 201: the event was stored.
-    Stored,
-
-    /// 401: the API refused the event because the request carried no credentials it accepts.
-    ///
-    /// What this firmware gets today, on purpose. It sends no `Authorization` header at all, so
-    /// this is the answer that says the plumbing works and the authentication is missing, which is
-    /// two facts in one status line.
-    Unauthorized,
-
-    /// 400: the API could not read the event, which is a body this firmware built wrongly.
-    Malformed,
-
-    /// 405: the path was reached by a method the API does not take, which would be a bug here.
-    NotAllowed,
-
-    /// Any other status: reported as the number rather than guessed at.
-    ///
-    /// A named case for the ones that mean something specific to this exchange and `Unexpected` for
-    /// the rest, because an API that grows a status code should land somewhere a reader recognizes
-    /// as "the API said no, and here is which no" rather than in a sentence written for a case it
-    /// is not.
-    Unexpected(u16),
-
-    /// Something answered, and it was not the API: the reply's first line is not a status line.
-    ///
-    /// Its own case rather than folded into `Unexpected`, because it is a different problem: the
-    /// other means the API answered and this means whatever answered was not the API. A captive
-    /// portal is the usual one, and a board on a hotel network is exactly where that happens.
-    NotTheApi,
-
-    /// The connection produced no bytes at all.
-    ///
-    /// Separate from [`Self::NotTheApi`] because the two have nothing in common beyond "this did not
-    /// work". One means something answered and it was the wrong thing; this means nothing answered,
-    /// which is the network, the server going away, or a peer that closed without a word.
-    NothingCameBack,
-}
-
-/// Whether a reply has a whole first line in it yet.
-///
-/// The reader's question before it judges anything, and the reason [`Reply::from_bytes`] cannot be
-/// asked sooner: a first line that has half arrived cannot be told apart from one that is wrong.
-/// Measured on the real 401 this API sends, the first eleven bytes of it are `HTTP/1.1 40` — a
-/// truncated status line, a line with no status in it, and a line that looks like a nonsense reply.
-/// All three at once, and nothing in the bytes says which.
-///
-/// So a caller that judges a reply before this is true has to guess, and the guess is the expensive
-/// one: it blames something that was not the API for a reply the API had already sent, which is
-/// exactly what this firmware did until the read loop started asking.
-#[must_use]
-pub fn status_line_arrived(reply: &[u8]) -> bool {
-    reply.windows(2).any(|pair| pair == b"\r\n")
-}
-
-impl fmt::Display for Verdict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stored => f.write_str("the API stored the event"),
-            Self::Unauthorized => {
-                f.write_str("the API refused the event: no credentials were sent with it")
-            }
-            Self::Malformed => {
-                f.write_str("the API could not read the event: it rejected the body")
-            }
-            Self::NotAllowed => f.write_str("the API would not take a POST on this path"),
-            Self::Unexpected(status) => {
-                write!(
-                    f,
-                    "the API answered with a status this firmware does not name: {status}"
-                )
-            }
-            Self::NotTheApi => {
-                f.write_str("what answered was not the API: the first line was not a status line")
-            }
-            Self::NothingCameBack => {
-                f.write_str("nothing came back: the connection closed silently")
-            }
-        }
-    }
-}
-
-/// The first line of a reply, or `None` when there are no bytes at all.
-///
-/// `None` and not an empty slice, because "a line that arrived as nothing" and "a line that is not a
-/// status line" are different problems and this is where they are told apart. An empty read is a
-/// server that closed without answering; a portal's login page is a thousand bytes that do not start
-/// with a version number.
-///
-/// The line runs to the first `CRLF`, and a reply with no `CRLF` in it at all yields everything there
-/// is. That last case is the caller asking too early, which [`status_line_arrived`] exists to stop
-/// them doing; it yields the whole buffer rather than nothing, because a caller who got here anyway is
-/// better served by a sentence about a reply this firmware does not recognize than by one about
-/// silence.
-fn first_line(reply: &[u8]) -> Option<&[u8]> {
-    if reply.is_empty() {
-        return None;
-    }
-
-    let end = reply.windows(2).position(|pair| pair == b"\r\n");
-
-    Some(&reply[..end.unwrap_or(reply.len())])
-}
-
-/// The three digits of a status code, from the first line of a reply.
-///
-/// Reads the code rather than the reason phrase, because the phrase is prose that a server may
-/// change and the code is the part of the line that means something. Everything after the three
-/// digits is ignored, so a reason phrase that is missing or one this firmware has never seen does not
-/// change what the code was.
-///
-/// `None` for anything that is not `HTTP/x.y NNN`, which is what makes [`Verdict::NotTheApi`]
-/// reachable at all — a portal's login page is HTML, and the first fifteen bytes of it are a
-/// `<!DOCTYPE` that is not a version number.
-fn status_code(line: &[u8]) -> Option<u16> {
-    let after_version = line.strip_prefix(b"HTTP/")?;
-    // The version and its single digit, then the space. `strip_prefix` and a search for the space
-    // rather than `split_once`, which is still unstable for slices on the pinned toolchain — and a
-    // hand-rolled one would be the third spelling of the same two operations in this crate.
-    let space = after_version.iter().position(u8::is_ascii_whitespace)?;
-    let after_space = after_version.get(space + 1..)?;
-    let digits = after_space.get(..3)?;
-
-    if !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    // A space or the end of the buffer after the code, so that `HTTP/1.1 2011 Created` is not read
-    // as 201: a four-digit field is not a status code, and a parser that takes the first three
-    // digits of it is reading a length or a version that happens to be next door.
-    match after_space.get(3) {
-        None | Some(b' ') => {}
-        Some(_) => return None,
-    }
-
-    // The digits as text rather than accumulated as a number, so that a line saying `HTTP/1.1 20`
-    // or `HTTP/1.1 2011` is refused instead of read as 20 or 201: the code is three digits, and a
-    // parser that takes what it finds would make a length or a version out of the field next to it.
-    let digits = core::str::from_utf8(digits).ok()?;
-
-    digits.parse().ok()
-}
-
-/// The bytes of one HTTP request, head and body, as they go on the wire.
-///
-/// A `Display` rather than something that writes into a buffer this crate owns, because this crate
-/// does not know how big the request is: the body carries a [`Status`], whose length depends on the
-/// address DHCP handed out and on how long the sentence about the radio is. The firmware writes it
-/// into a buffer it sized, and if the buffer is too small that is a fact about the buffer rather than
-/// about the request.
-///
-/// `content_length` is a parameter rather than something derived, for the same reason: it is the
-/// number of bytes of body that were written, and the caller is the only thing that knows it. The
-/// head cannot be built without it, which is why the body goes first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Request<'a> {
-    /// The host to send to, which is what the `Host` header carries.
-    ///
-    /// The name and not the address: `embassy-net` resolves it, and an HTTP client that sent the
-    /// resolved address in this header would produce a request a server may refuse and a log that
-    /// cannot be read against the name somebody typed.
-    pub host: &'a str,
-
-    /// The path, which is [`EVENTS_PATH`] for this exchange.
-    pub path: &'a str,
-
-    /// How many bytes of body follow the head.
-    pub content_length: usize,
-}
-
-impl fmt::Display for Request<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // CRLF and not `\n`, because this is HTTP/1.1 and not a text file: a server is entitled to
-        // refuse a request whose lines end in a bare newline, and "entitled to" is the whole reason
-        // this is written down rather than left to whatever the format string felt like.
-        //
-        // `Content-Length` is here rather than a `Transfer-Encoding` because the body was written
-        // into a buffer before any of this was: its length is known without counting the bytes as
-        // they go past, which is what a chunked request would need.
-        //
-        // `Connection: close` because this client reads the answer and does nothing else with the
-        // connection. Without it the server may hold the socket open and the read above waits for
-        // bytes that are not coming, which is a timeout on every single report rather than once.
-        write!(
-            f,
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            self.path, self.host, self.content_length,
-        )
     }
 }
